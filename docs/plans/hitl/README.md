@@ -159,6 +159,57 @@ shared. The ConfigMap already sets `SESSION_BACKEND: alloydb`,
 them. Locally (`in_memory` defaults) resume only works in the same process — state
 that as a documented limitation rather than papering over it.
 
+### D8 — What a human may send back: approve/reject **plus feedback**, not edits
+
+The decision is not a bare boolean. The API accepts:
+
+```json
+{"decision": "approved" | "rejected", "note": "free text", "payload": { }}
+```
+
+stored in the `decision` jsonb column. How much of it reaches the agent depends on
+the gate mechanism, and ADK 2.6.1 is asymmetric here — worth knowing before building
+a UI that promises more than the runtime delivers.
+
+**With `require_confirmation` (D1):**
+
+- `ToolConfirmation` carries `hint`, `confirmed` and a free-form JSON `payload`
+  (`tools/tool_confirmation.py`), so structured feedback has a transport.
+- **On approval** the tool body runs with the **original arguments**
+  (`function_tool.py:316`) and can read the human's words via
+  `tool_context.tool_confirmation.payload` (`agents/context.py:268`) — a gated tool
+  that wants the note simply declares `tool_context` and reads it. The payload is
+  *not* merged into the arguments; nothing rewrites the call.
+- **On rejection** ADK returns a fixed `{'error': 'This tool call is rejected.'}`
+  (`function_tool.py:314`). The human's note does **not** reach the model. Plan
+  accordingly: after resuming with `confirmed=false`, append the note as a follow-up
+  user turn on the same session so the model can re-plan with the reason. (Verified
+  in the spike only for the free-form pattern below — treat as Phase 2 work.)
+- If inline rejection feedback turns out to matter, the escape hatch is to leave
+  `require_confirmation=False` and call `tool_context.request_confirmation(hint=…)`
+  from inside the tool body (`agents/context.py:847`). The tool then owns both
+  directions and can return a rich rejection, at the cost of hand-rolling the gate.
+
+**With the fallback long-running pattern**, the whole `FunctionResponse` is ours, so
+free text reaches the model directly — spike-verified (**F5**): rejecting with
+`note: "denied: value is confidential"` produced *"I have the answer, but I cannot
+share it with you. It is confidential."*
+
+**Revised arguments are out of scope for v1.** Neither mechanism re-writes the call
+the model proposed, and "human edits the arguments, tool executes the edited version"
+is a materially bigger feature: it needs per-tool validation of what may be edited,
+its own audit trail (the executed action no longer matches what the model asked for),
+and a UI that renders arguments as a form rather than a diff. Two cheaper approximations
+cover most of the need:
+
+1. **Reject with a reason** — the model re-plans and proposes a corrected call, which
+   is gated again. No schema change, and the human never authors the action.
+2. **A tool opts in** to honouring `payload["overrides"]` explicitly, validating each
+   field itself. Per-tool, deliberate, never implicit.
+
+Anything the human writes is untrusted input on its way to a model — see the security
+notes.
+
 ## Phases
 
 Each phase is independently shippable and ends green on
@@ -182,6 +233,10 @@ this phase exists to isolate that change from everything else.
   `adk_request_confirmation` call **and that the tool body did not run** (a sentinel
   the tool would have written).
 - Resume by sending the confirmation response; assert the body then runs once.
+- Check both feedback directions from D8: that a `payload` sent with the approval is
+  readable as `tool_context.tool_confirmation.payload` inside the tool, and what the
+  model actually receives on rejection (expected: the fixed
+  `'This tool call is rejected.'`, with the note lost).
 
 **Acceptance:** the gate holds without relying on the instruction text — the
 regression the spike could not get from `LongRunningFunctionTool` (F8).
@@ -195,7 +250,11 @@ regression the spike could not get from `LongRunningFunctionTool` (F8).
 - Register the plugin on the `App`; wire routes in `app/fast_api_app.py`:
   - `GET  /hitl/approvals?status=pending` — list
   - `GET  /hitl/approvals/{id}` — detail (tool, args, session, age)
-  - `POST /hitl/approvals/{id}/decision` — `{approved, note, decided_by}` → resume
+  - `POST /hitl/approvals/{id}/decision` — `{decision, note, payload, decided_by}`
+    (D8) → resume
+- Deliver the feedback per D8: `note`/`payload` into the `ToolConfirmation` payload on
+  approval; on rejection, follow the resume with the note as a user turn so the model
+  learns *why* and can propose a corrected call.
 - Idempotency: a decision on an already-decided approval returns the recorded
   outcome instead of re-running the invocation.
 
@@ -251,8 +310,9 @@ works (needs a database — run it against a local Postgres or in-cluster).
 ## Open questions
 
 1. **What actually gets gated?** The plan uses a demo tool. Real gates (payments,
-   writes, external calls) determine whether approve/reject is enough or humans need
-   to edit arguments.
+   writes, external calls) decide whether D8's approve/reject-plus-note is enough, or
+   whether humans must edit the arguments before the action runs — the one case that
+   needs more than v1 offers.
 2. **Through what surface?** CLI/curl for Phase 2, with a small per-user UI expected
    later (listing that user's pending approvals — see D4.1, which settles *who*
    approves: the requesting user, always).
