@@ -28,8 +28,8 @@ class _ModelConsumer:
     """Receives the three generative models via the `Models` bundle.
 
     Resolving a real class (rather than calling `injector.get(FastModel)` with a
-    `NewType`) both type-checks cleanly and mirrors how variant code depends on
-    these models.
+    `NewType`) both type-checks cleanly and mirrors how application code depends
+    on these models.
     """
 
     @inject

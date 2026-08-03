@@ -1,11 +1,11 @@
-"""Distributed-tracing propagation test for the GKE multi-agent variant.
+"""Distributed-tracing propagation test for the multi-agent cluster.
 
-Proves the behavior the whole variant hinges on: when one agent calls another
-over A2A, the callee **continues the caller's trace** instead of starting a new
-one. The serving overlay (``app/fast_api_app.py``) instruments the FastAPI app so
-the standard W3C ``traceparent`` header on an inbound request is extracted into a
-child span. This test exercises that instrumentation directly with a
-``TestClient`` (no cluster, no network).
+Proves the behavior cross-pod observability hinges on: when one agent calls
+another over A2A, the callee **continues the caller's trace** instead of starting
+a new one. ``app/fast_api_app.py`` instruments the FastAPI app so the standard
+W3C ``traceparent`` header on an inbound request is extracted into a child span.
+This test exercises that instrumentation directly with a ``TestClient`` (no
+cluster, no network).
 """
 
 from opentelemetry import trace

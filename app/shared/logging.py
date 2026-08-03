@@ -1,6 +1,6 @@
 """Structured logging via loguru, correlated with OpenTelemetry traces.
 
-This module makes every log line in a generated project consistent and
+This module makes every log line in the process consistent and
 trace-aware, with one function call (`configure_logging`, usually via
 `shared.observability.configure_observability`):
 

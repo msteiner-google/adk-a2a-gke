@@ -161,7 +161,7 @@ def instrument_fastapi_app(app: Any) -> None:
 
     Args:
         app: The FastAPI application instance to instrument. Typed ``Any`` so
-            ``shared`` need not import FastAPI (it is a base-template dependency).
+            ``shared`` need not import FastAPI, keeping this package portable.
     """
     # Best-effort (see `_instrument_http`): never let instrumentation break serving.
     try:

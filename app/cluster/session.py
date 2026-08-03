@@ -35,9 +35,9 @@ Memory backends (``MEMORY_BACKEND``)
     - ``vertex_ai``: ``VertexAiMemoryBankService`` (managed Memory Bank); uses
       the injected project/location and ``AGENT_ENGINE_ID``.
 
-Keep this consistent with the base serving layer: the generated project's
-``get_fast_api_app`` also honors ``SESSION_SERVICE_URI`` for serving-side
-persistence — set both from the same source of truth in your manifests.
+Keep this consistent with the serving layer: ADK's ``get_fast_api_app`` also
+honors ``SESSION_SERVICE_URI`` for serving-side persistence — set both from the
+same source of truth in your manifests.
 """
 
 from __future__ import annotations

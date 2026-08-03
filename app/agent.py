@@ -1,4 +1,4 @@
-"""Root agent definition for the GKE multi-agent variant.
+"""Root agent definition for the multi-agent cluster.
 
 The *same* container image runs every agent in the cluster; the ``AGENT_NAME``
 environment variable selects which one this process becomes at startup. Every
@@ -19,8 +19,8 @@ Dependency injection ties everything together (see ``app/cluster/di.py``):
   that connects this agent to the others in the cluster), and
 - ``SessionModule`` provides the pluggable session/memory/artifact services.
 
-Keep the ``app`` object exported — the base serving/deployment layer imports it,
-and ``App(name=...)`` must equal the agent directory (``app``).
+Keep the ``app`` object exported — the serving layer (``app/fast_api_app.py``)
+imports it, and ``App(name=...)`` must equal the agent directory (``app``).
 """
 
 import os
@@ -43,7 +43,7 @@ from .shared.observability import configure_observability
 # else. The service name is this pod's agent (orchestrator / research / math) so
 # each shows up distinctly in Cloud Trace; an explicit OTEL_SERVICE_NAME still
 # wins. Trace context propagates across A2A hops (httpx injects `traceparent`
-# outbound; the serving overlay extracts it inbound), so one trace spans the
+# outbound; the serving layer extracts it inbound), so one trace spans the
 # whole cluster. See app/shared/observability.py and app/fast_api_app.py.
 configure_observability(
     service_name=os.environ.get("OTEL_SERVICE_NAME") or os.environ.get("AGENT_NAME", "")

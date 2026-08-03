@@ -1,6 +1,6 @@
 """The uniform agent model: one spec, one builder for *every* agent.
 
-In this variant every agent is the same kind of thing — an ADK ``LlmAgent``
+Every agent is the same kind of thing — an ADK ``LlmAgent``
 described by a declarative :class:`AgentSpec` and constructed by the single
 :func:`build_agent` function. There is no special "orchestrator" class: an agent
 that coordinates others is simply one whose spec declares ``peers`` (and usually

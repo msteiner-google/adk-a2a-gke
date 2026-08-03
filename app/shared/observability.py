@@ -1,7 +1,7 @@
 """One-call observability bootstrap + DI wiring for logging and tracing.
 
-This ties `shared.logging` and `shared.telemetry` together so a variant's
-``app/agent.py`` can enable structured, trace-correlated logging and distributed
+This ties `shared.logging` and `shared.telemetry` together so ``app/agent.py``
+can enable structured, trace-correlated logging and distributed
 tracing with a single import at startup:
 
     from .shared.observability import configure_observability

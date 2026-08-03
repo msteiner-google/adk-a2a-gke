@@ -1,11 +1,11 @@
 """Resolve cluster peers into ADK ``RemoteA2aAgent`` instances.
 
 The ``AgentResolver`` is the injectable "service discovery" layer for the
-variant: given the ``ClusterConfig`` (which peers exist and where), it produces
+cluster: given the ``ClusterConfig`` (which peers exist and where), it produces
 ``RemoteA2aAgent`` children the orchestrator can delegate to over A2A.
 
 Discovery is **agent-card based**: for each peer we point ``RemoteA2aAgent`` at
-the peer's well-known agent-card URL. The base A2A serving mounts the JSON-RPC
+the peer's well-known agent-card URL. The A2A serving layer mounts the JSON-RPC
 endpoint and the agent card under ``/a2a/<app_name>`` (``/a2a/app`` by default,
 see ``ClusterConfig.rpc_path``), so the card lives at
 ``<base_url>/a2a/app/.well-known/agent-card.json`` — NOT at the service root.
@@ -59,7 +59,7 @@ class AgentResolver:
 
         Composes the peer's service-root base URL with the configured A2A RPC
         path (``/a2a/app`` by default) and the well-known card path, matching
-        where the base serving publishes the card
+        where the serving layer publishes the card
         (``<base_url>/a2a/app/.well-known/agent-card.json``).
 
         Args:

@@ -1,7 +1,7 @@
 # bnpp-gke
 
-Multi-agent system for GKE — an A2A orchestrator + specialist workers.
-Generated with `agents-cli` version `1.2.1` (the `gke` variant of `agentic-template`).
+Multi-agent system for GKE — an A2A orchestrator + specialist workers, built on
+Google [ADK](https://adk.dev/).
 
 A planner/orchestrator agent breaks a request into sub-tasks and delegates them
 to specialist worker agents, each running as its own Kubernetes Service and
@@ -52,13 +52,12 @@ bnpp-gke/
 │   │   └── bootstrap.py        #   creates the database (no Terraform resource exists)
 │   ├── migrations/             # Alembic. Under app/ so the image carries it.
 │   ├── shared/                 # Shared library (models, observability, secrets)
-│   └── app_utils/              # Base-template serving/A2A helpers
+│   └── app_utils/              # Low-level serving/A2A helpers
 ├── infra/
 │   ├── terraform/              # GKE Autopilot, per-agent Workload Identity, AlloyDB,
 │   │                           #   artifact bucket
 │   └── kustomize/              # Namespace, ServiceAccounts, ConfigMap, NetworkPolicy,
 │                               #   migration Job, Deployments
-├── deployment/                 # Base-template single-service CI/CD Terraform
 ├── scripts/                    # dbcheck, grant_readers, sql/ (request tracing)
 ├── tests/                      # unit / integration / eval
 ├── docs/                       # adding-an-agent, inspecting-the-database,
@@ -67,7 +66,8 @@ bnpp-gke/
 └── pyproject.toml              # Project dependencies
 ```
 
-> 💡 **Tip:** Use [Antigravity CLI](https://antigravity.google/) for AI-assisted development - project context is pre-configured in `AGENTS.md`.
+> 💡 **Tip:** For AI-assisted development, `AGENTS.md` carries the full project
+> context — architecture invariants, gotchas, and verified commands.
 
 ## Requirements
 
@@ -144,14 +144,6 @@ AGENT_NAME=orchestrator A2A_PEERS=math=http://127.0.0.1:8091 \
 >   uv run pytest tests/unit app/shared/tests -q
 > ```
 
-## 🛠️ Project Management
-
-| Command | What It Does |
-|---------|--------------|
-| `agents-cli scaffold enhance` | Add CI/CD pipelines and Terraform infrastructure |
-| `agents-cli infra cicd` | One-command setup of entire CI/CD pipeline + infrastructure |
-| `agents-cli scaffold upgrade` | Auto-upgrade to latest version while preserving customizations |
-
 ---
 
 ## Development
@@ -175,8 +167,7 @@ agent name for peer discovery to resolve.
 ## Deployment
 
 This project deploys as a **multi-agent cluster** via `infra/` (Terraform +
-Kustomize), not via `agents-cli deploy`. See **[GKE.md](GKE.md)** for the full
-walkthrough, and
+Kustomize). See **[GKE.md](GKE.md)** for the full walkthrough, and
 **[docs/deploy-to-another-project.md](docs/deploy-to-another-project.md)** to
 stand this repo up in a *different* Google Cloud project (prerequisites, the
 project-specific values to change, verification, teardown, troubleshooting).

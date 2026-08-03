@@ -1,4 +1,4 @@
-"""Dependency-injection wiring for the GKE multi-agent variant.
+"""Dependency-injection wiring for the multi-agent cluster.
 
 Two :mod:`injector` modules, installed alongside the shared ``ModelModule``:
 

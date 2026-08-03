@@ -50,7 +50,7 @@ _ADK_AGENT_EXECUTOR_EXTENSION_URI = (
 
 
 def _default_capabilities() -> AgentCapabilities:
-    """Returns the default A2A capabilities used by scaffolded projects."""
+    """Returns the default A2A capabilities advertised by every agent."""
     return AgentCapabilities(
         streaming=True,
         extensions=[

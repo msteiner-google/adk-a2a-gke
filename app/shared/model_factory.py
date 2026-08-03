@@ -1,6 +1,6 @@
 """Factory for configured ADK `Gemini` models.
 
-Centralizes model construction so every variant gets the same retry/backoff
+Centralizes model construction so every agent gets the same retry/backoff
 policy and (optionally) the same geofenced genai client.
 """
 
@@ -11,8 +11,8 @@ from google.genai import Client, types
 def build_model(model: str, client: Client | None = None) -> Gemini:
     """Build a Gemini model configured with our standard retry policy.
 
-    Centralizing this here means all variants get the same retry/backoff
-    behavior, and changing it once updates every variant. Pass a `client` to
+    Centralizing this here means every caller gets the same retry/backoff
+    behavior, and changing it once updates them all. Pass a `client` to
     pin the model to a specific Vertex AI project/location (see `ModelModule`).
 
     Args:

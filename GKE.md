@@ -225,8 +225,8 @@ otherwise call `create_all()` at startup, which races across replicas, needs DDL
 privileges the agents deliberately lack, and bypasses any migration history.
 
 Migrations live under `app/migrations/` rather than the repo root because the
-base-template-owned `Dockerfile` copies only `./app`; this way the migration Job
-runs the same image as the agents with no Dockerfile change.
+`Dockerfile` copies only `./app`; this way the migration Job runs the exact same
+image as the agents.
 
 ```bash
 # One schema at a time. Each schema keeps its own alembic_version table, so
@@ -265,12 +265,12 @@ trace `service.name` so `orchestrator`, `research`, and `math` appear as distinc
 services in Cloud Trace.
 
 **One trace across the whole cluster.** ADK already emits spans (`invoke_agent`,
-`execute_tool`, `generate_content`). This variant makes them span *pods*:
+`execute_tool`, `generate_content`). Here they are made to span *pods*:
 
 - **Outbound:** the httpx client is instrumented, so when the orchestrator calls
   a specialist over A2A it injects the W3C `traceparent` header.
-- **Inbound:** `app/fast_api_app.py` (a thin overlay of the base serving file)
-  calls `instrument_fastapi_app(app)`, so each agent **extracts** that header and
+- **Inbound:** `app/fast_api_app.py` calls `instrument_fastapi_app(app)` as part
+  of building the serving app, so each agent **extracts** that header and
   continues the caller's trace instead of starting a new one. (ADK's built-in
   middleware only handles Google-Agent-Engine headers, not the standard
   `traceparent`, so this explicit step is what makes cross-pod tracing work.)
@@ -293,8 +293,8 @@ Monitoring APIs. View traces in **Trace Explorer** (filter by span name, e.g.
 To use a vendor-neutral stack instead (Grafana Tempo, Jaeger, Datadog, ...), set
 `OTEL_EXPORTER_OTLP_ENDPOINT` in `infra/kustomize/base/configmap.yaml` to point at
 an in-cluster OpenTelemetry Collector — no code change. A Collector can fan out to
-Cloud Trace *and* your own backend. This template ships no visualization stack;
-it relies on Google Cloud's managed observability by default.
+Cloud Trace *and* your own backend. This project ships no visualization stack of
+its own; it relies on Google Cloud's managed observability by default.
 
 | Env | Default | Effect |
 | --- | --- | --- |
@@ -419,12 +419,12 @@ or front it with an Ingress/Gateway (the workers stay internal `ClusterIP`).
 ## Notes & knobs
 
 - **Container port:** the manifests use `8080` (`PORT` in the ConfigMap and
-  `containerPort`/`targetPort`). If the base image serves on a different port,
+  `containerPort`/`targetPort`). If the container serves on a different port,
   update those three together.
 - **Least privilege:** the workers use internal `ClusterIP` Services; only the
   orchestrator needs external exposure.
 - **Scaling:** bump `replicas` per role in the overlay; the resolver addresses
   Services (not pods), so load-balancing across replicas is automatic.
-- **`infra/` vs `deployment/`:** `infra/` (this variant) provisions and deploys
-  the *multi-agent cluster*. The base template's `deployment/` holds the standard
-  single-service CI/CD Terraform; use `infra/` for the multi-agent topology.
+- **Everything lives in `infra/`:** Terraform provisions the Google Cloud side
+  (cluster, registry, identities, AlloyDB, bucket) and Kustomize deploys the
+  Kubernetes side. There is no second deployment path.

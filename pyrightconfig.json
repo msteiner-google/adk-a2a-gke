@@ -1,18 +1,18 @@
 // basedpyright configuration — the editor LSP type checker for this project.
 //
 // WHY THIS FILE EXISTS AND NOT A [tool.basedpyright] SECTION:
-// pyproject.toml is base-template-owned (see AGENTS.md "Ownership"), so an
-// `agents-cli scaffold upgrade` would clobber a section in there. A standalone
-// pyrightconfig.json takes precedence over [tool.basedpyright] anyway, and it
-// matches how ruff.toml / ty.toml already own their policy in this repo.
+// A standalone pyrightconfig.json takes precedence over [tool.basedpyright] in
+// pyproject.toml, so keeping both would mean one of them silently loses. This
+// also matches how ruff.toml / ty.toml already own their policy in this repo:
+// pyproject.toml is for dependencies and packaging only.
 //
 // RELATIONSHIP TO ty:
-// `agents-cli lint` still runs ty; that remains the gate. basedpyright is the
-// nvim LSP and a second opinion. The rule choices below mirror ty.toml's intent
+// `agents-cli lint` runs ty; that remains the gate. basedpyright is the nvim
+// LSP and a second opinion. The rule choices below mirror ty.toml's intent
 // (silence third-party/dynamic noise, keep real type errors) — deviations are
 // called out inline.
 //
-// BASELINE: typeCheckingMode "standard" (upstream pyright's default), NOT
+// BASELINE: typeCheckingMode "standard" (stock pyright's default), NOT
 // basedpyright's default "recommended". "recommended" enables the based-only
 // Any-hunting rules, which produced 481 diagnostics here — ~85% of them
 // reportAny / reportUnknown* / reportUnusedCallResult against ADK, injector and
@@ -48,7 +48,7 @@
   "typeCheckingMode": "standard",
 
   // ---------------------------------------------------------------------------
-  // based-only rules: off. These have no upstream-pyright equivalent and no ty
+  // based-only rules: off. These have no stock-pyright equivalent and no ty
   // equivalent, and they all fire on untyped third-party surfaces rather than on
   // anything wrong in this codebase.
   // ---------------------------------------------------------------------------
@@ -106,19 +106,19 @@
 
   "executionEnvironments": [
     {
-      // Base-template-owned serving/A2A plumbing (AGENTS.md "Ownership"): we
-      // must not hand-edit it, so reporting on it is unactionable. Mirrors
-      // ruff.toml's per-file-ignores for the same paths.
+      // Low-level serving/A2A plumbing: stable boilerplate we rarely touch, so
+      // reporting on it is mostly noise. Mirrors ruff.toml's per-file-ignores
+      // for the same paths.
       "root": "app/app_utils",
       "reportAttributeAccessIssue": "none",
       "reportUnusedFunction": "none",
       "reportPrivateUsage": "none"
     },
     {
-      // Upstream shared library — real files here, but sourced from
-      // ../agentic-template/shared/ and clobbered by a scaffold upgrade, so
-      // local fixes do not survive. Keep type errors visible, drop the two
-      // categories that are upstream style choices.
+      // The shared library is kept portable (Python 3.11+) and free of
+      // project-specific logic, so a couple of its conventions differ from the
+      // rest of app/. Keep real type errors visible, drop the two categories
+      // that are just those style choices.
       "root": "app/shared",
       // __all__ lists submodules that __init__.py never imports. Valid at
       // runtime (`from pkg import *` imports submodules named in __all__) but

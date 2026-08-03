@@ -13,8 +13,8 @@ Vertex AI catalog (unless pinned via an env var or a constructor override):
 
 It constructs one shared `google.genai.Client` (pinned to an injectable project +
 location, e.g. for geofencing) and patches it onto every generative model, so
-every variant that installs the module gets consistent models, retry policy, and
-region.
+every consumer that installs the module gets consistent models, retry policy,
+and region.
 
 The heavy lifting lives in focused modules: `model_selection` (pure id parsing /
 "latest" selection), `model_catalog` (`ModelCatalog` live listing), and

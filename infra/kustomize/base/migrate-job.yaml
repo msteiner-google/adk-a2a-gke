@@ -1,7 +1,7 @@
 # Alembic schema migration Job.
 #
 # Runs the SAME image as the agents (that is why the migrations live under app/
-# -- the base-template Dockerfile copies only ./app). It runs as the migrator
+# -- the Dockerfile copies only ./app). It runs as the migrator
 # ServiceAccount, the only identity with DDL rights.
 #
 # What it does, in order:

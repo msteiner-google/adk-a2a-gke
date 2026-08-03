@@ -14,9 +14,7 @@
 
 # Must stay in lockstep with requires-python in pyproject.toml and the
 # python-version pins in ruff.toml / ty.toml / pyrightconfig.json.
-# tests/unit/test_python_version.py fails if they drift apart — which is what
-# catches an `agents-cli scaffold upgrade` reverting this base-template-owned
-# file to its default 3.12.
+# tests/unit/test_python_version.py fails if they drift apart.
 FROM python:3.14-slim
 
 RUN pip install --no-cache-dir uv==0.8.13

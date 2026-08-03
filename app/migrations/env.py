@@ -1,6 +1,6 @@
 """Alembic environment for the multi-agent system's per-agent schemas.
 
-This environment differs from the stock async template in three ways.
+This environment differs from a stock Alembic async ``env.py`` in three ways.
 
 **It reuses the application's connection code.** Rather than reading
 ``sqlalchemy.url`` from ``alembic.ini``, it builds the engine with

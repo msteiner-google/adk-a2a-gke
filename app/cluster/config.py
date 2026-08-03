@@ -25,8 +25,8 @@ Environment variables
                          the agent falls back to its declared default peers.
 - ``A2A_PEER_SCHEME``    Scheme for DNS-derived peer URLs. Default: ``http``.
 - ``A2A_PEER_PORT``      Port for DNS-derived peer URLs. Default: ``80``.
-- ``A2A_RPC_PATH``       Path segment the base A2A serving mounts the JSON-RPC
-                         endpoint + agent card under. The base serving uses
+- ``A2A_RPC_PATH``       Path segment the A2A serving layer mounts the JSON-RPC
+                         endpoint + agent card under. It uses
                          ``/a2a/<app_name>`` and the app name is ``app`` (see
                          ``app/agent.py``: ``App(name="app")``), so the default
                          is ``/a2a/app``. A bare peer name therefore resolves to

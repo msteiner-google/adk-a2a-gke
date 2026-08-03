@@ -1,12 +1,11 @@
-"""Shared agent library — single source of truth reused across variants.
+"""Shared agent library — cross-cutting utilities used across the codebase.
 
-This package lives once at the repo root (`shared/`) and is symlinked into each
-variant's agent directory (e.g. `template/app/shared -> ../../shared`). At
-scaffold time the CLI dereferences the symlink and copies these files verbatim
-into the generated project, so every variant ships identical, up-to-date shared
-code without duplicating it in the repo.
-
-Edit the logic here once; every variant picks it up.
+Models (tier selection and construction), observability (logging + tracing),
+secrets, and artifact storage live here. This package sits at the bottom of the
+dependency graph: it must not import from ``app.agents`` or ``app.cluster``, and
+it stays free of project-specific logic so it can be reused as-is by other
+services. It is also kept portable to Python 3.11, which is why it imports
+``override`` from ``typing_extensions`` rather than ``typing``.
 """
 
 __all__ = [

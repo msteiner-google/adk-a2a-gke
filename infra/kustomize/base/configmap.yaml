@@ -110,7 +110,7 @@ data:
   #   ("Resource is missing required attribute \"gcp.project_id\"")
   # app/shared/telemetry.py builds the Resource with Resource.create(), which
   # merges OTEL_RESOURCE_ATTRIBUTES, so setting it here supplies the attribute
-  # without patching the upstream-owned shared library. Update the project id
+  # without any change to app/shared/telemetry.py itself. Update the project id
   # if you deploy this overlay to a different project.
   OTEL_RESOURCE_ATTRIBUTES: "gcp.project_id=msteiner"
   # To send traces to a vendor-neutral stack (Grafana Tempo, Jaeger, Datadog,

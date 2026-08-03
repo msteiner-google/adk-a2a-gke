@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# GKE variant: this file overlays the base template's app/fast_api_app.py. It
-# differs from the base in exactly three places, all deliberate:
+# The serving app. This looks like boilerplate, but three things here are
+# load-bearing and easy to "simplify" away by mistake:
 #
 #   1. `instrument_fastapi_app(app)` after the app is built (see below).
 #   2. The Runner is built with the injector's session service instead of
@@ -64,7 +64,7 @@ allow_origins = (
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-# When a durable database is configured, override the base template's
+# When a durable database is configured, override app_utils/services.py's
 # "shared://session" registration so the ADK web routes resolve to the SAME
 # DB-backed session service the Runner and the A2A path use. app/__init__.py
 # imports app.agent, so the injector is already built by the time the factory
@@ -72,8 +72,8 @@ AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # module importable in isolation.
 #
 # This is intentionally conditional: with no database configured (the default,
-# and every test run) the base template's registration is left completely
-# untouched, so local `adk web` behaviour is unchanged.
+# and every test run) the original registration is left completely untouched,
+# so local `adk web` behaviour is unchanged.
 if get_database().enabled:
 
     def _shared_session_service(uri: str, **kwargs: Any) -> BaseSessionService:
@@ -87,14 +87,14 @@ if get_database().enabled:
 
 
 # Same treatment for artifacts: when a storage location is configured, override
-# the base template's "shared://artifact" registration so the ADK web routes
-# (upload/download) hit the SAME cloudpathlib-backed service the Runner and the
-# A2A path use, instead of services.get_artifact_service() -- which only knows
-# about a GCS bucket in LOGS_BUCKET_NAME and otherwise silently hands back a
-# per-pod in-memory store.
+# the "shared://artifact" registration so the ADK web routes (upload/download)
+# hit the SAME cloudpathlib-backed service the Runner and the A2A path use,
+# instead of services.get_artifact_service() -- which only knows about a GCS
+# bucket in LOGS_BUCKET_NAME and otherwise silently hands back a per-pod
+# in-memory store.
 #
 # Conditional for the same reason as above: with ARTIFACT_STORAGE_URI unset (the
-# default, and every test run) the base registration is left untouched.
+# default, and every test run) the original registration is left untouched.
 if os.environ.get(ARTIFACT_STORAGE_URI_ENV, "").strip():
 
     def _shared_artifact_service(uri: str, **kwargs: Any) -> BaseArtifactService:

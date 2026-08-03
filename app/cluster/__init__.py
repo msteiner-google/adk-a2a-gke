@@ -1,4 +1,4 @@
-"""Multi-agent cluster runtime for the GKE variant.
+"""Multi-agent cluster runtime.
 
 This subpackage holds the **plumbing** for running a team of ADK agents on
 Kubernetes and connecting them over A2A. The agents themselves live in

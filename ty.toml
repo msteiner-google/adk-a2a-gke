@@ -1,15 +1,15 @@
-# Team ty (Astral type checker) config for projects scaffolded from this
-# template.
+# ty (Astral type checker) config for this repo.
 #
-# A standalone ty.toml takes precedence over the base template's [tool.ty]
-# section in pyproject.toml (per https://docs.astral.sh/ty/configuration/), so
-# this file owns the type-checking policy. Run it with `agents-cli lint`
-# (or `agents-cli lint --skip-ty` to skip).
+# It lives here rather than in a [tool.ty] section of pyproject.toml because a
+# standalone ty.toml takes precedence over that section (per
+# https://docs.astral.sh/ty/configuration/), so keeping both would mean one of
+# them silently loses. Run it with `agents-cli lint` (or `agents-cli lint
+# --skip-ty` to skip).
 #
-# Stricter than the scaffolder's defaults: we keep only the noise-reduction
-# needed for third-party/dynamic code (unresolved imports/attributes) and let
-# ty flag real type errors (bad arguments, returns, assignments) instead of
-# ignoring everything.
+# The policy is deliberately strict: we keep only the noise-reduction needed for
+# third-party/dynamic code (unresolved imports/attributes) and let ty flag real
+# type errors (bad arguments, returns, assignments) instead of ignoring
+# everything.
 
 [environment]
 # This project pins ONE Python version rather than supporting a range:

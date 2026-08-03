@@ -1,10 +1,7 @@
 [project]
 name = "bnpp-gke"
 version = "0.1.0"
-description = ""
-authors = [
-    {name = "Your Name", email = "your@email.com"},
-]
+description = "Multi-agent system for GKE — an A2A orchestrator + specialist workers"
 
 dependencies = [
     "injector>=0.22",
@@ -49,19 +46,19 @@ lint = [
     "ty>=0.0.1a0",
     "codespell>=2.2.0,<3.0.0",
     # Editor LSP (nvim) + a second opinion alongside ty. NOT run by
-    # `agents-cli lint`. Policy lives in the root pyrightconfig.json, which
-    # takes precedence over any [tool.basedpyright] section here.
-    # NOTE: this file is base-template-owned; if `agents-cli scaffold upgrade`
-    # drops this entry, re-add it (pyrightconfig.json will survive).
+    # `agents-cli lint`, but it must be installed for the LSP to start, so keep
+    # it here with the other linters. Policy lives in the root
+    # pyrightconfig.json, which takes precedence over any [tool.basedpyright]
+    # section here.
     "basedpyright>=1.31",
 ]
 
 # NOTE: there are deliberately no [tool.ruff] or [tool.ty] sections here.
 # The standalone ruff.toml and ty.toml at the repo root take precedence over
 # them, so anything written here would be dead config that silently contradicts
-# the real policy — and ty additionally warned on every run about ignoring it.
-# Lint/type-check settings belong in those two files (and pyrightconfig.json for
-# basedpyright). See AGENTS.md "Code style".
+# the real policy — and ty warns on every run when it has to ignore such a
+# section. Lint/type-check settings belong in those two files (and
+# pyrightconfig.json for basedpyright). See AGENTS.md "Code style".
 
 [tool.codespell]
 # "notin" is the Kubernetes label-selector operator `NotIn`

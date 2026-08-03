@@ -10,15 +10,13 @@ other:
 * ``ty.toml``             -- ``python-version``   (the lint gate)
 * ``pyrightconfig.json``  -- ``pythonVersion``    (the editor LSP)
 
-Two of those files -- ``pyproject.toml`` and ``Dockerfile`` -- are
-base-template-owned (see AGENTS.md "Ownership"), so ``agents-cli scaffold
-upgrade`` can silently revert them to the template's default 3.12 while the
-three checker configs still claim 3.14. That failure mode is nasty precisely
-because it is quiet: the checkers keep happily accepting 3.14-only syntax, and
-the first symptom is a container that dies at import time in the cluster.
+Nothing cross-checks them, so they drift silently -- bump one and forget the
+rest and the failure mode is nasty precisely because it is quiet: the checkers
+keep happily accepting 3.14-only syntax while the image runs an older
+interpreter, and the first symptom is a container that dies at import time in
+the cluster.
 
-This test makes that divergence loud and local. It is the version-pin analogue
-of ``test_a2a_tracing.py``, which guards the other deliberate overlay.
+This test makes that divergence loud and local.
 
 Deliberately parses the raw text rather than importing tomllib and a JSON
 parser for the Dockerfile's sake: one uniform mechanism, and it keeps working
@@ -92,8 +90,8 @@ def test_dockerfile_base_image_matches() -> None:
     found = (int(match.group(1)), int(match.group(2)))
     assert found == EXPECTED_MAJOR_MINOR, (
         f"Dockerfile builds on Python {found[0]}.{found[1]} but the project "
-        f"targets {_EXPECTED_DOTTED}. The Dockerfile is base-template-owned, so "
-        "a scaffold upgrade may have reverted it."
+        f"targets {_EXPECTED_DOTTED}. Update the FROM line and the other four "
+        "pins together."
     )
 
 

@@ -1,7 +1,7 @@
-"""Reusable tools shared across agent variants.
+"""Reusable tools available to every agent.
 
-Mocked example logic — put tools here that every variant should expose. Anything
-variant-specific stays in that variant's own `app/tools.py`.
+Mocked example logic — put tools here that all agents should expose. Anything
+agent-specific stays in that agent's own `tools.py`.
 """
 
 

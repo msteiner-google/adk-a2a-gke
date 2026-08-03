@@ -1,7 +1,7 @@
 """Secret Manager access wired through dependency injection.
 
 `SecretModule` provides two injectables for reading Google Cloud Secret Manager
-secrets, keeping secret access consistent across variants the same way
+secrets, keeping secret access consistent across the codebase the same way
 `ModelModule` does for models:
 
 - `Secrets` — a small service with `get(name)` / `get_as(type, name)` that

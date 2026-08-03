@@ -1,7 +1,7 @@
 # Deploying this repo to a different Google Cloud project
 
-How to take **this repository** (not the upstream template) and stand it up in a
-Google Cloud project of your own.
+How to take this repository and stand it up in a Google Cloud project of your
+own.
 
 The repo currently contains a working deployment targeting project `msteiner` in
 `europe-west4`. Five values are specific to that project; everything else is
@@ -98,7 +98,6 @@ breaks, so it's easy to ship without noticing.
   Required for **all** deployments. Without it, ADK reports Developer-API mode
   while the client is Vertex, and every A2A delegation fails with
   `ValueError: part_metadata parameter is only supported in Gemini Developer API mode`.
-  Filed upstream as `personal/adk-template#11`.
 - `GOOGLE_CLOUD_LOCATION: "global"` is the **Vertex AI** endpoint and is
   independent of your cluster region. Changing the cluster region does not
   require changing this.
@@ -106,13 +105,6 @@ breaks, so it's easy to ship without noticing.
   resolve it from Workload Identity (ADC), so Vertex calls bill to the cluster's
   project automatically. Only set it if you want Vertex in a *different* project
   from the cluster.
-
-### Unrelated leftover
-
-`deployment/terraform/single-project/vars/env.tfvars` contains
-`project_id = "msteiner-kubeflow"`. That is the **base template's Cloud Run
-CI/CD** path and is *not used* by this GKE deployment. Ignore it, or update it if
-you intend to use that path. `infra/` and `deployment/` are separate on purpose.
 
 ---
 

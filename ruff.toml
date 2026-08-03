@@ -1,12 +1,12 @@
-# Team ruff config for projects scaffolded from this template.
+# Ruff config for this repo — the single source of truth for lint/format rules.
 #
-# A standalone ruff.toml takes precedence over the base template's
-# [tool.ruff] section in pyproject.toml (verified), so this file is the single
-# source of truth for lint/format rules. Run it with `agents-cli lint`.
+# It lives here rather than in a [tool.ruff] section of pyproject.toml because a
+# standalone ruff.toml takes precedence over that section (verified), so keeping
+# both would mean one of them silently loses. Run it with `agents-cli lint`.
 #
-# This is intentionally STRICTER than the scaffolder's defaults: line length is
-# enforced, mutable-default-arg bugs are caught, and docstrings are required on
-# the code you write. Generated infrastructure we don't own is exempted below.
+# The policy is deliberately strict: line length is enforced, mutable-default-arg
+# bugs are caught, and docstrings are required on the code we write. The
+# low-level serving plumbing is exempted below.
 
 line-length = 88
 # This project pins ONE Python version rather than supporting a range:
@@ -51,19 +51,18 @@ convention = "google"
 known-first-party = ["app", "frontend"]
 
 [lint.per-file-ignores]
-# Generated serving/A2A infrastructure is owned by the base template, not by
-# app authors — don't hold it to the strict docstring/style/pathlib rules.
+# Low-level serving/A2A plumbing: stable boilerplate we rarely touch, so it is
+# not held to the strict docstring/style/pathlib rules.
 "app/app_utils/**" = ["D", "ARG", "N", "PTH"]
-# The upstream shared library still supports Python 3.11 (this project pins
-# 3.14), so it imports `override` from typing_extensions rather than typing.
-# That is correct for upstream and wrong by UP035's reckoning here. Exempting
-# the rule is deliberate: "fixing" it locally would be reverted by the next
-# `agents-cli scaffold upgrade` and break lint again on every upgrade.
+# app/shared is deliberately kept portable to Python 3.11 so it can be reused by
+# other services, so it imports `override` from typing_extensions rather than
+# typing. UP035 would "fix" that and break the portability guarantee, so the
+# rule is off for that package only.
 "app/shared/**" = ["UP035"]
 "app/fast_api_app.py" = ["D", "PTH"]
 # Tests favor readability over docstring coverage and unused-arg purity.
-# Match at any depth so both the base-template tests (tests/**) and the tests
-# shipped inside the shared library (app/shared/tests/**) are covered.
-# TID252: the shipped shared tests use parent-relative imports on purpose so
-# they resolve as `app.shared.tests` here and `shared.tests` in the dev harness.
+# Match at any depth so both tests/** and the tests that live inside the shared
+# library (app/shared/tests/**) are covered.
+# TID252: the shared library's tests use parent-relative imports on purpose so
+# they resolve the same way wherever the package is dropped in.
 "**/tests/**" = ["D", "ARG", "TID252"]
