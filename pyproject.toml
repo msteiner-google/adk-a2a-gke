@@ -20,11 +20,14 @@ dependencies = [
     "asyncpg>=0.30.0,<1.0.0",
     "sqlalchemy>=2,<3",
     "python-multipart>=0.0.20,<1.0.0",
-    "google-adk[gcp,otel-gcp]>=2.2.0,<3.0.0",
+    "google-adk[db,gcp,otel-gcp]>=2.2.0,<3.0.0",
     "opentelemetry-resourcedetector-gcp<=1.12.0a0",
     "gcsfs>=2024.11.0",
     "a2a-sdk[http-server]~=0.3.22",
     "aiohttp>=3.13.4",
+    "alembic>=1.18.5",
+    "google-cloud-alloydb-connector[asyncpg]>=1.13.1",
+    "greenlet>=3.5.4",
 ]
 requires-python = ">=3.11,<3.14"
 
@@ -89,7 +92,9 @@ not-subscriptable = "ignore"
 deprecated = "ignore"
 
 [tool.codespell]
-ignore-words-list = "rouge"
+# "notin" is the Kubernetes label-selector operator `NotIn`
+# (infra/kustomize/base/networkpolicy.yaml), not a typo.
+ignore-words-list = "rouge,notin"
 skip = "./locust_env/*,uv.lock,.venv,./frontend,**/package-lock.json"
 
 

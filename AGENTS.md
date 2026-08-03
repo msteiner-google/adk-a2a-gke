@@ -36,7 +36,7 @@ code path.
 All of these were run in this repo and pass as of the last update to this file.
 
 ```bash
-# Unit tests — 144 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
+# Unit tests — 180 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
 # (see "Importing app hits the network" below).
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite \
 GEMINI_BALANCED_MODEL=gemini-2.5-flash \
@@ -83,8 +83,12 @@ Read the module docstrings; they are thorough. This is the index.
 | `app/agents/math/agent.py` + `tools.py` | Leaf agent, `tier="fast"`, tool `calculate` (AST-based, rejects non-arithmetic). |
 | `app/cluster/config.py` | **Pure stdlib** (no ADK/genai imports). `PeerSpec`, `ClusterConfig.from_env()`, `service_dns_url()`. Parses `AGENT_NAME` / `A2A_*`. |
 | `app/cluster/resolver.py` | `AgentResolver` — turns peers into `RemoteA2aAgent`s pointed at their well-known agent cards. No network I/O at construction (ADK resolves cards lazily). |
-| `app/cluster/di.py` | `ClusterModule` (config + resolver) and `SessionModule` (session + memory services). |
+| `app/cluster/di.py` | `ClusterModule` (config + resolver) and `SessionModule` (`Database`, session + memory services, A2A `TaskStore`). |
 | `app/cluster/session.py` | `build_session_service()` / `build_memory_service()` — backend selected by env. |
+| `app/cluster/db.py` | `DatabaseConfig` + `Database`: the one `AsyncEngine` per pod. AlloyDB via the connector (IAM auth) or a plain DSN. `get_database()` is the process-wide singleton so every consumer shares one pool. |
+| `app/cluster/tasks.py` | `build_task_store()` — A2A `TaskStore`: in-memory, or the a2a SDK's `DatabaseTaskStore` on the shared engine. |
+| `app/cluster/bootstrap.py` | `python -m app.cluster.bootstrap` — creates the database. Exists because the Terraform provider has no `google_alloydb_database` resource. |
+| `app/migrations/` | Alembic (`alembic.ini`, `env.py`, `versions/`). Lives under `app/` on purpose — see gotchas. |
 | `app/fast_api_app.py` | Serving app. **Overlaid, not stock base infra** — it adds `instrument_fastapi_app(app)` (see gotchas). |
 | `app/app_utils/` | Base-template-owned serving/A2A plumbing (`a2a.py`, `services.py`, `typing.py`). Don't hand-edit. |
 | `app/shared/` | Upstream shared library, copied in as real files (see "Ownership"). |
@@ -107,7 +111,11 @@ Read the module docstrings; they are thorough. This is the index.
 ### Tests — `tests/`
 
 - `tests/unit/` — `test_agents.py`, `test_cluster_config.py`, `test_cluster_resolver.py`,
-  `test_cluster_session.py`, `test_a2a_tracing.py`, `test_dummy.py`. Hermetic.
+  `test_cluster_session.py`, `test_cluster_db.py`, `test_cluster_tasks.py`,
+  `test_migrations.py`, `test_a2a_tracing.py`, `test_dummy.py`. Hermetic.
+  `test_migrations.py` renders the Alembic migrations **offline** (no database)
+  and diffs them against ADK's and the a2a SDK's own metadata — it is the guard
+  that catches a library adding a column.
 - `tests/integration/` — `test_agent.py`, `test_server_e2e.py`. Needs a server.
 - `tests/eval/` — `eval_config.yaml`, `response_quality.py`, `datasets/`. Needs GCP creds.
 
@@ -122,15 +130,34 @@ don't merge them.
 
 | Path | Contents |
 | --- | --- |
-| `infra/terraform/` | GKE Autopilot cluster, Workload Identity, Artifact Registry, GSA + IAM roles. Vars in `variables.tf` (`project_id` required; region defaults `us-central1`, cluster `agents-cluster`, ns `agents`, KSA `agent`, GSA `agents-runtime`). |
-| `infra/kustomize/base/` | `namespace.yaml`, `serviceaccount.yaml`, `configmap.yaml`, `orchestrator.yaml`, `workers.yaml`. |
+| `infra/terraform/main.tf` | GKE Autopilot cluster, Artifact Registry, APIs, **one GSA per agent** + a migrator GSA, IAM roles, Workload Identity bindings. |
+| `infra/terraform/alloydb.tf` | AlloyDB cluster + instance (`c4a-highmem-1`, 1 vCPU / 8 GB), private-services-access peering, IAM database users. |
+| `infra/kustomize/base/` | `namespace.yaml`, `serviceaccounts.yaml`, `configmap.yaml`, `networkpolicy.yaml`, `migrate-job.yaml`, `orchestrator.yaml`, `workers.yaml`. |
 | `infra/kustomize/overlays/dev/` | Image name/tag overlay. |
 | `deployment/terraform/single-project/` | Base-template CI/CD Terraform (Cloud Run-shaped). |
 | `Dockerfile` | Base-template-owned. |
 
-**Two placeholders must be filled before `kubectl apply`:**
-1. `infra/kustomize/base/serviceaccount.yaml:10` → `agents-runtime@PROJECT_ID.iam.gserviceaccount.com`
-2. `infra/kustomize/overlays/dev/kustomization.yaml:12` → `REGION-docker.pkg.dev/PROJECT_ID/agents/agent`
+Key vars in `variables.tf`: `project_id` (required), `region` (default
+`us-central1`), `agents` (default `["orchestrator","research","math"]` — must
+match `app/agents/`), `service_account_prefix` (`agent`), `alloydb_machine_type`
+(`c4a-highmem-1`), `alloydb_database` (`agents`).
+
+**Placeholders to fill before `kubectl apply`** (all from
+`terraform output -json kustomize_values`):
+1. `infra/kustomize/base/serviceaccounts.yaml` → the
+   `iam.gke.io/gcp-service-account` annotation on each of the 4 ServiceAccounts.
+2. `infra/kustomize/base/configmap.yaml` → `ALLOYDB_INSTANCE_URI`.
+3. `orchestrator.yaml` / `workers.yaml` → `ALLOYDB_IAM_USER` per agent.
+4. `migrate-job.yaml` → `ALLOYDB_IAM_USER`, `AGENT_ROLE_SUFFIX`, `MIGRATE_AGENTS`.
+5. `infra/kustomize/overlays/dev/kustomization.yaml` → image `newName`.
+
+**Run the migration Job before the agents settle.** They have no `CREATE`
+privilege by design, so they crash-loop until the schema exists:
+```bash
+kubectl -n agents delete job/agent-migrate --ignore-not-found  # spec is immutable
+kubectl apply -k infra/kustomize/overlays/dev
+kubectl -n agents wait --for=condition=complete job/agent-migrate --timeout=10m
+```
 
 All Services listen on port **80** → `targetPort` **8080**. Four places must
 agree if you change the port: the `Dockerfile` `CMD` (which hardcodes
@@ -208,13 +235,51 @@ These are real traps that have bitten this codebase.
 - **`RemoteA2aAgent` is experimental** and emits a `UserWarning` on every
   construction. Expected noise in test output.
 
-- **`SESSION_BACKEND=database` needs an extra**: `uv add "google-adk[db]"`
-  (SQLAlchemy) plus `SESSION_DB_URL`. Deliberately not installed by default.
-  `vertex_ai` backends need `AGENT_ENGINE_ID`.
+- **`SESSION_BACKEND=database` needs `SESSION_DB_URL`**; `vertex_ai` backends
+  need `AGENT_ENGINE_ID`. Prefer `SESSION_BACKEND=alloydb` in the cluster, which
+  reuses the shared engine from `app/cluster/db.py` instead of opening a second
+  pool from a DSN.
 
-- **Serving-side persistence is separate.** `get_fast_api_app` honors
-  `SESSION_SERVICE_URI` independently of `SESSION_BACKEND`. Set both from the
-  same source of truth in manifests.
+- **There are TWO session services, and only one of them is wired.** The
+  injector provides one (`app/agent.py`); `app/app_utils/services.py` provides
+  another via `SESSION_SERVICE_URI = "shared://session"`. The Runner in
+  `app/fast_api_app.py` is what actually matters — it now takes the injector's.
+  When a database is configured, `fast_api_app.py` also re-registers the
+  `shared` scheme so the ADK web routes resolve to the *same* instance.
+  **If you change the serving layer, make sure it does not go back to
+  `services.get_session_service()`** — that helper only understands a plain DSN,
+  so agents would silently run on per-pod in-memory state while
+  `SESSION_BACKEND=alloydb` suggests otherwise.
+
+- **Alembic lives under `app/migrations/`, not the repo root.** The
+  base-template-owned `Dockerfile` copies only `./app`; putting migrations
+  anywhere else means the migration Job cannot see them, and editing the
+  Dockerfile would be clobbered by a scaffold upgrade. Run it with
+  `-c app/migrations/alembic.ini`.
+
+- **Never let ADK or a2a create their own tables.** Both would call
+  `create_all()` at startup — that races across replicas, needs DDL privileges
+  the agent roles deliberately lack, and bypasses the migration history. ADK's
+  `prepare_tables()` is safe *because* the tables already exist (it degrades to
+  a reflection pass, verified against real Postgres); `DatabaseTaskStore` is
+  constructed with `create_table=False`.
+
+- **`adk_internal_metadata` must contain `schema_version='1'`.** ADK reads it at
+  startup; if the table exists but the row is missing it raises "Schema version
+  not found ... The database might be malformed." Migration `0001` seeds it.
+
+- **JSONB for ADK, plain JSON for a2a.** ADK's `DynamicJSON` resolves to `JSONB`
+  on PostgreSQL; a2a's `PydanticType` uses SQLAlchemy's generic `JSON`, which
+  renders as `json`. The migrations differ accordingly — that is intentional,
+  and matching each library exactly is what keeps the ORM's binding correct.
+
+- **Alembic autogenerate is off.** The tables belong to two third-party
+  libraries, so autogenerate would let a library upgrade rewrite production DDL
+  unreviewed. `tests/unit/test_migrations.py` is the drift guard instead.
+
+- **Offline mode cannot bind parameters.** `alembic upgrade --sql` renders
+  statements without binding, so a `:param` placeholder ends up verbatim in the
+  generated script. Inline controlled constants in migrations (see `0001`).
 
 - **`agents-cli` uses `uv`.** Run Python as `uv run python ...`, never bare
   `python`.
@@ -282,12 +347,27 @@ scaffolder defaults.
 | `GEMINI_CAPABLE_MODEL` | latest `pro` |
 | `GEMINI_EMBEDDING_MODEL` | best embedding model |
 
-### Session / memory (`app/cluster/session.py`)
+### Session / memory / tasks (`app/cluster/session.py`, `app/cluster/tasks.py`)
 
 | Var | Default | Options |
 | --- | --- | --- |
-| `SESSION_BACKEND` | `in_memory` | `database` (+`SESSION_DB_URL`, +`google-adk[db]`), `vertex_ai` (+`AGENT_ENGINE_ID`) |
+| `SESSION_BACKEND` | `in_memory` | `alloydb` (shared engine), `database` (+`SESSION_DB_URL`), `vertex_ai` (+`AGENT_ENGINE_ID`) |
 | `MEMORY_BACKEND` | `in_memory` | `vertex_ai` (+`AGENT_ENGINE_ID`) |
+| `TASK_STORE_BACKEND` | `in_memory` | `database` (shared engine). In-memory is per-pod, so `tasks/get` breaks past 1 replica. |
+
+### Database (`app/cluster/db.py`)
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `DB_BACKEND` | `none` | `alloydb` (IAM auth via the connector) or `url` (plain DSN) |
+| `ALLOYDB_INSTANCE_URI` | — | `projects/P/locations/L/clusters/C/instances/I` |
+| `ALLOYDB_IAM_USER` | — | GSA email **minus** `.gserviceaccount.com` |
+| `ALLOYDB_IP_TYPE` | `PRIVATE` | `PRIVATE`, `PUBLIC`, or `PSC` |
+| `DB_NAME` | `agents` | Database holding every agent's schema |
+| `DB_SCHEMA` | *(`AGENT_NAME`)* | Per-agent schema, applied as `search_path`. Leave unset. |
+| `DB_URL` | — | SQLAlchemy async URL for the `url` backend |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `5` / `2` | Per-pod pool; small because the instance has 1 vCPU |
+| `DB_AGENT_ROLE` | — | Migration-time only: the role revision `0003` grants on the schema |
 
 ### Observability (`app/shared/`)
 
@@ -305,15 +385,31 @@ Local `.env` currently sets `GOOGLE_GENAI_USE_VERTEXAI=true`,
 
 ### Add an agent
 
-1. `app/agents/<name>/agent.py` exposing `SPEC = AgentSpec(...)`. Agent-specific
-   tools go in `app/agents/<name>/tools.py`; cross-agent tools in
-   `app/agents/common.py`.
-2. Register it in `app/agents/__init__.py` (`AGENTS` tuple).
-3. Copy a Deployment/Service pair in `infra/kustomize/base/workers.yaml`, setting
-   `AGENT_NAME` and `APP_URL`.
-4. If an existing agent should delegate to it, add the name to that agent's
+Full walkthrough, checklist, and troubleshooting table:
+[`docs/adding-an-agent.md`](docs/adding-an-agent.md). The short version:
+
+1. `app/agents/<name>/` with `__init__.py` (**needs a docstring** — `D104`),
+   `tools.py`, and `agent.py` exposing `SPEC = AgentSpec(...)`. Cross-agent tools
+   go in `app/agents/common.py`.
+2. Register it in `app/agents/__init__.py` (`AGENTS`).
+3. If an existing agent should delegate to it, add the name to that agent's
    `AgentSpec.peers`.
-5. Update `tests/unit/test_agents.py::test_registry_lists_expected_agents`.
+4. Update **two** tests in `tests/unit/test_agents.py`:
+   `test_registry_lists_expected_agents` and
+   `test_orchestrator_declares_peers_others_do_not`.
+5. Cluster only — five files:
+   - `infra/terraform/variables.tf` → add to `var.agents`, then `terraform apply`
+     (creates the GSA, IAM roles, WI binding, and AlloyDB user via `for_each`).
+   - `serviceaccounts.yaml` → KSA `agent-<name>` + its GSA annotation.
+   - `workers.yaml` → copy a Deployment/Service pair; set `AGENT_NAME`,
+     `APP_URL`, `ALLOYDB_IAM_USER`, `serviceAccountName`.
+   - `networkpolicy.yaml` → add to the workers allow-list. **Easy to miss:**
+     omitting it leaves the agent with no ingress at all, and delegation fails
+     as a timeout rather than an error.
+   - `migrate-job.yaml` → add to `MIGRATE_AGENTS`.
+
+No new migration and no new database are needed: every agent gets the same
+tables in its own schema, and `DB_SCHEMA` defaults to `AGENT_NAME`.
 
 Name it a single lowercase word (invariant 5).
 
@@ -423,7 +519,7 @@ Install the CLI (one-time): `uv tool install google-agents-cli`
 | --- | --- | --- |
 | Base template | `Dockerfile`, `deployment/`, `pyproject.toml`, `app/app_utils/**` | Don't hand-edit; a scaffold upgrade will overwrite |
 | Upstream shared lib | `app/shared/**` | Real files here, but sourced from `../agentic-template/shared/`. Edits are **local-only and will be clobbered by `agents-cli scaffold upgrade`.** Put project-specific logic in `app/`, not here. |
-| The gke variant | `app/agents/**`, `app/cluster/**`, `infra/**`, `GKE.md`, `ruff.toml`, `ty.toml` | Yours to change |
+| The gke variant | `app/agents/**`, `app/cluster/**`, `app/migrations/**`, `infra/**`, `GKE.md`, `ruff.toml`, `ty.toml` | Yours to change |
 | Deliberate overlay | `app/fast_api_app.py` | Yours, despite looking like base infra — see gotchas |
 
 Upstream template: `../agentic-template` (variant `variants/gke`). Its own

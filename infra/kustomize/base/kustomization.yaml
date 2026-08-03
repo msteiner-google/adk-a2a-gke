@@ -7,8 +7,17 @@ namespace: agents
 
 resources:
   - namespace.yaml
-  - serviceaccount.yaml
+  # One ServiceAccount per agent, plus the migrator. Replaces the former single
+  # `agent` ServiceAccount -- see the IDENTITY MODEL note in
+  # ../../terraform/main.tf.
+  - serviceaccounts.yaml
   - configmap.yaml
+  # Restricts A2A traffic to the delegation graph declared in AgentSpec.peers.
+  # Enforced natively by GKE Autopilot (Dataplane V2).
+  - networkpolicy.yaml
+  # Alembic Job. Let it complete before the agents come up; see the ORDERING
+  # note in migrate-job.yaml.
+  - migrate-job.yaml
   - orchestrator.yaml
   - workers.yaml
 

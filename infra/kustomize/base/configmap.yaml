@@ -33,12 +33,48 @@ data:
   # containerPort in the Deployments (and the base image's serve command).
   PORT: "8080"
 
-  # Session / memory backends (see app/cluster/session.py). Defaults are
-  # in-memory (per-pod, ephemeral). For durable, shared state switch to:
-  #   SESSION_BACKEND: "vertex_ai"  (+ AGENT_ENGINE_ID) or "database" (+ SESSION_DB_URL)
-  #   MEMORY_BACKEND:  "vertex_ai"  (+ AGENT_ENGINE_ID)
-  SESSION_BACKEND: "in_memory"
+  # --- Durable storage (AlloyDB) ---------------------------------------------
+  #
+  # DB_BACKEND=alloydb makes app/cluster/db.py build one AsyncEngine per pod via
+  # the AlloyDB Python connector, authenticating with the pod's Workload
+  # Identity service account. No password exists anywhere: the connector mints a
+  # short-lived token per connection and wraps the socket in mTLS.
+  #
+  # Fill ALLOYDB_INSTANCE_URI from `terraform output alloydb_instance_uri`.
+  DB_BACKEND: "alloydb"
+  ALLOYDB_INSTANCE_URI: "projects/msteiner/locations/europe-west4/clusters/agents-db/instances/primary"
+  DB_NAME: "agents"
+  # The instance has no public IP; pods reach it over the VPC peering created in
+  # infra/terraform/alloydb.tf.
+  ALLOYDB_IP_TYPE: "PRIVATE"
+  #
+  # DB_SCHEMA is deliberately NOT set here: it defaults to this pod's
+  # AGENT_NAME, so each agent lands in its own PostgreSQL schema with no
+  # per-agent configuration. ALLOYDB_IAM_USER *is* per-agent and is set in each
+  # Deployment, because each agent authenticates as its own service account.
+  #
+  # Connection budget: the prototype instance is c4a-highmem-1, a single vCPU,
+  # so the pools are deliberately small. These give at most 7 connections per
+  # pod; 3 agents at 1 replica is ~21, plus the migration Job. Raise them only
+  # when you raise the machine type.
+  DB_POOL_SIZE: "5"
+  DB_MAX_OVERFLOW: "2"
+
+  # Session backend (see app/cluster/session.py).
+  #   alloydb   -> ADK DatabaseSessionService on the shared engine above.
+  #   in_memory -> per-pod and ephemeral (the previous default).
+  #   vertex_ai -> managed Agent Engine sessions (+ AGENT_ENGINE_ID).
+  SESSION_BACKEND: "alloydb"
+  # Long-term memory has no AlloyDB implementation here; it stays in-memory
+  # unless pointed at Vertex AI Memory Bank. Session state -- the part that
+  # actually needs to survive a restart -- is durable via SESSION_BACKEND.
   MEMORY_BACKEND: "in_memory"
+
+  # A2A task store (see app/cluster/tasks.py). This matters for more than
+  # durability: with the in-memory store a task created by one pod is invisible
+  # to another, so tasks/get and tasks/resubscribe break as soon as an agent has
+  # more than one replica.
+  TASK_STORE_BACKEND: "database"
 
   # Observability (structured logging + distributed tracing). See GKE.md.
   # Traces + logs go to Google Cloud (Cloud Trace / Cloud Logging) by default,

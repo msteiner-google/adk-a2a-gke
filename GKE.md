@@ -59,11 +59,18 @@ Add an agent by:
    agent-specific tools in `app/agents/<name>/tools.py`; shared context tools
    live in `app/agents/common.py`).
 2. Registering it in `app/agents/__init__.py`.
-3. Copying a Deployment/Service pair in `infra/kustomize/base/workers.yaml`.
+3. Adding it to the delegating agent's `AgentSpec.peers`.
+4. For the cluster: five files under `infra/` — `var.agents`,
+   `serviceaccounts.yaml`, `workers.yaml`, `networkpolicy.yaml`, and
+   `migrate-job.yaml`. No new migration or database is needed; the agent gets
+   the same tables in its own schema.
 
 Use a single-word name valid as **both** a Python identifier and a Kubernetes DNS
 label (no hyphens/underscores). The Service name **must equal** the agent name so
 peers can resolve it by DNS.
+
+> **[`docs/adding-an-agent.md`](docs/adding-an-agent.md)** has the full
+> walkthrough: worked example, checklist, and a troubleshooting table.
 
 ## Service discovery (the resolver)
 
@@ -103,14 +110,113 @@ classes; the backend is a deployment concern (`app/cluster/session.py`):
 
 | Env | Default | Options |
 | --- | --- | --- |
-| `SESSION_BACKEND` | `in_memory` | `database` (`+ SESSION_DB_URL`, needs `google-adk[db]`), `vertex_ai` (`+ AGENT_ENGINE_ID`) |
+| `SESSION_BACKEND` | `in_memory` | `alloydb` (shared engine, see below), `database` (`+ SESSION_DB_URL`), `vertex_ai` (`+ AGENT_ENGINE_ID`) |
 | `MEMORY_BACKEND` | `in_memory` | `vertex_ai` (`+ AGENT_ENGINE_ID`) |
+| `TASK_STORE_BACKEND` | `in_memory` | `database` (shared engine) |
 
 In-memory keeps local runs and tests hermetic. For a real cluster choose a
 durable backend so state survives pod restarts and is shared across replicas —
-set the same values in `infra/kustomize/base/configmap.yaml`.
+the deployed values live in `infra/kustomize/base/configmap.yaml`.
 
-> For the `database` backend, add the extra first: `uv add "google-adk[db]"`.
+## Durable storage on AlloyDB
+
+The cluster manifests default to AlloyDB for both session state and A2A tasks.
+
+**Why the task store matters too.** The default `InMemoryTaskStore` is per-pod,
+so a task created by the pod that answered `message/send` is invisible to the
+pod that later receives `tasks/get`. That silently breaks task polling and
+resubscription the moment an agent has more than one replica — it is a
+correctness bug, not just a durability gap.
+
+### One database, one schema per agent
+
+Not a database per agent: PostgreSQL cannot query across databases without
+FDW/dblink, so separate databases make any cross-agent question ("trace this
+request through orchestrator → research → math") impossible, while multiplying
+connection pools against a single-vCPU instance.
+
+Not one flat schema either. Every agent runs `App(name="app")` (invariant 6), so
+in a shared schema every `sessions` row carries `app_name='app'` and is
+unattributable. Each agent therefore gets its own PostgreSQL schema, selected by
+`DB_SCHEMA` (defaulting to `AGENT_NAME`) and applied as the connection's
+`search_path`. ADK and the a2a SDK both emit **unqualified** table names, so
+`search_path` does the routing with no library patching.
+
+The isolation is enforced by `GRANT`, which maps one-to-one onto the per-agent
+service account:
+
+```
+KSA agent-research ──WI──▶ GSA agent-research@PROJECT
+                              │
+                              ▼  (IAM DB auth, no password)
+                    role "agent-research@PROJECT.iam"
+                              │
+                              ▼  USAGE + SELECT/INSERT/UPDATE/DELETE
+                         schema "research"        ← and nothing else
+```
+
+`CREATE` is deliberately withheld, so a compromised agent cannot add or drop
+tables. The only identity with DDL rights is the migration Job's `agent-migrator`.
+
+### Authentication: IAM, no passwords
+
+`app/cluster/db.py` builds one `AsyncEngine` per pod through the AlloyDB Python
+connector. It mints a short-lived OAuth token per connection from the pod's
+Workload Identity credentials and wraps the socket in mTLS — no password exists
+anywhere, and nothing sensitive lands in Terraform state. No Auth Proxy sidecar
+is needed: the Autopilot cluster is VPC-native, so pod IPs route to the
+instance's private IP across the private-services-access peering.
+
+| Env | Meaning |
+| --- | --- |
+| `DB_BACKEND` | `none` (default), `alloydb`, or `url` (plain DSN, for local/dev) |
+| `ALLOYDB_INSTANCE_URI` | `projects/P/locations/L/clusters/C/instances/I` |
+| `ALLOYDB_IAM_USER` | GSA email **minus** `.gserviceaccount.com` |
+| `DB_NAME` | Database holding every agent's schema (`agents`) |
+| `DB_SCHEMA` | Defaults to `AGENT_NAME` — leave unset |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | Per-pod pool. Small: the prototype instance has 1 vCPU |
+
+> To look at the data: **[`docs/inspecting-the-database.md`](docs/inspecting-the-database.md)**.
+> AlloyDB Studio in the Cloud console works despite the private IP — it goes
+> through the Admin API, not the network.
+
+### Migrations (Alembic)
+
+Schema is owned by Alembic, never by the application — both libraries would
+otherwise call `create_all()` at startup, which races across replicas, needs DDL
+privileges the agents deliberately lack, and bypasses any migration history.
+
+Migrations live under `app/migrations/` rather than the repo root because the
+base-template-owned `Dockerfile` copies only `./app`; this way the migration Job
+runs the same image as the agents with no Dockerfile change.
+
+```bash
+# One schema at a time. Each schema keeps its own alembic_version table, so
+# agents are versioned independently.
+DB_SCHEMA=research DB_AGENT_ROLE='agent-research@PROJECT.iam' \
+  uv run alembic -c app/migrations/alembic.ini upgrade head
+
+# Review the DDL without a database (works for any schema):
+DB_BACKEND=url DB_URL=postgresql://u@h/d \
+  uv run alembic -c app/migrations/alembic.ini -x schema=research upgrade head --sql
+```
+
+Autogenerate is switched **off**. The tables belong to ADK's session schema and
+the a2a SDK's task schema, not to models in this repo, so autogenerate would let
+a library upgrade rewrite production DDL unreviewed. Instead
+`tests/unit/test_migrations.py` renders the migrations offline and compares them
+column-by-column against what those two libraries would generate themselves, so
+drift fails the build rather than a live request.
+
+Two deliberate additions beyond what the libraries declare:
+
+- `created_at` / `updated_at` on `tasks`, with a trigger. `TaskMixin` has no
+  timestamps at all, so tasks would accumulate with no way to identify old rows.
+  A trigger is required because PostgreSQL has no `ON UPDATE` clause and
+  `DatabaseTaskStore` writes through `session.merge()`, which touches only its
+  own columns. The columns stay invisible to the ORM.
+- Indexes on `sessions.update_time` and `tasks.updated_at`, so a retention sweep
+  is a range scan rather than a full table scan.
 
 ## Observability: logs + distributed tracing across A2A
 
@@ -204,9 +310,25 @@ cp terraform.tfvars.example terraform.tfvars   # set project_id
 terraform init && terraform apply
 
 eval "$(terraform output -raw get_credentials_command)"   # wire kubectl
-terraform output google_service_account_email             # for step 3
 terraform output artifact_registry_repo                   # for step 2
+terraform output -json kustomize_values                   # everything for step 3
 ```
+
+This also provisions AlloyDB (`c4a-highmem-1`, 1 vCPU / 8 GB), the
+private-services-access peering it needs, one Google Service Account **per
+agent**, and a migrator account. Provisioning AlloyDB takes several minutes.
+
+> **Upgrading an existing deployment:** this replaces the former single
+> `agents-runtime` service account with one per agent, so `terraform apply` will
+> destroy it. Any IAM grant made to `agents-runtime` outside this config must be
+> re-applied to the new accounts.
+
+> **Region:** the `c4a-highmem-1` machine type is Arm (Axion) and is not
+> available everywhere. `europe-west4` and `us-central1` are covered; check
+> <https://cloud.google.com/alloydb/docs/choose-machine-type> before changing
+> `var.region`. The shape has no uptime SLA — it is Google's documented
+> sandbox/dev size. Move to `c4a-highmem-2-lssd` and `REGIONAL` before
+> production.
 
 ### 2. Build and push the image
 
@@ -219,17 +341,32 @@ docker push "$REPO/agent:latest"
 
 ### 3. Deploy the agents (Kustomize)
 
-Edit two placeholders first:
+Fill in the placeholders first, from `terraform output -json kustomize_values`:
 
-- `infra/kustomize/base/serviceaccount.yaml` → set the
-  `iam.gke.io/gcp-service-account` annotation to the GSA email from step 1.
-- `infra/kustomize/overlays/dev/kustomization.yaml` → set `images[].newName` to
-  `$REPO/agent`.
+- `infra/kustomize/base/serviceaccounts.yaml` → the
+  `iam.gke.io/gcp-service-account` annotation on **each** ServiceAccount.
+- `infra/kustomize/base/configmap.yaml` → `ALLOYDB_INSTANCE_URI`.
+- `infra/kustomize/base/orchestrator.yaml` and `workers.yaml` →
+  `ALLOYDB_IAM_USER` per agent (the GSA email minus `.gserviceaccount.com`).
+- `infra/kustomize/base/migrate-job.yaml` → `ALLOYDB_IAM_USER`,
+  `AGENT_ROLE_SUFFIX`, and `MIGRATE_AGENTS`.
+- `infra/kustomize/overlays/dev/kustomization.yaml` → `images[].newName`.
 
 ```bash
+# A Job's spec is immutable, so clear any previous run before re-applying.
+kubectl -n agents delete job/agent-migrate --ignore-not-found
+
 kubectl apply -k infra/kustomize/overlays/dev
+
+# Let the schema land before the agents settle: they have no CREATE privilege
+# by design, so they crash-loop until the migration completes.
+kubectl -n agents wait --for=condition=complete job/agent-migrate --timeout=10m
 kubectl -n agents get pods,svc
 ```
+
+The Job creates the `agents` database (the Terraform provider has no
+`google_alloydb_database` resource), then per agent creates its schema, runs
+every migration, and grants that agent's IAM role access to it.
 
 ### 4. Try it
 

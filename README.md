@@ -45,14 +45,22 @@ bnpp-gke/
 │   │   ├── config.py           #   env -> ClusterConfig / peers
 │   │   ├── resolver.py         #   peers -> RemoteA2aAgent (agent-card discovery)
 │   │   ├── di.py               #   injector modules
-│   │   └── session.py          #   pluggable session + memory backends
+│   │   ├── session.py          #   pluggable session + memory backends
+│   │   ├── tasks.py            #   pluggable A2A task store
+│   │   ├── db.py               #   the one AsyncEngine per pod (AlloyDB, IAM auth)
+│   │   └── bootstrap.py        #   creates the database (no Terraform resource exists)
+│   ├── migrations/             # Alembic. Under app/ so the image carries it.
 │   ├── shared/                 # Shared library (models, observability, secrets)
 │   └── app_utils/              # Base-template serving/A2A helpers
 ├── infra/
-│   ├── terraform/              # GKE Autopilot + Workload Identity + Artifact Registry
-│   └── kustomize/              # Namespace, ServiceAccount, ConfigMap, Deployments
+│   ├── terraform/              # GKE Autopilot, per-agent Workload Identity, AlloyDB
+│   └── kustomize/              # Namespace, ServiceAccounts, ConfigMap, NetworkPolicy,
+│                               #   migration Job, Deployments
 ├── deployment/                 # Base-template single-service CI/CD Terraform
+├── scripts/                    # dbcheck, grant_readers, sql/ (request tracing)
 ├── tests/                      # unit / integration / eval
+├── docs/                       # adding-an-agent, inspecting-the-database,
+│                               #   deploy-to-another-project
 ├── AGENTS.md                   # AI-assisted development guide
 └── pyproject.toml              # Project dependencies
 ```
@@ -186,8 +194,12 @@ podman login -u oauth2accesstoken -p "$(gcloud auth print-access-token)" "${REPO
 podman build --platform linux/amd64 -t "$REPO/agent:latest" .
 podman push "$REPO/agent:latest"
 
-# 3. Fill the two placeholders, then deploy
+# 3. Fill the placeholders below, then deploy. Let the Alembic Job finish first:
+#    the agents have no CREATE privilege by design and crash-loop until the
+#    schema exists.
+kubectl -n agents delete job/agent-migrate --ignore-not-found  # spec is immutable
 kubectl apply -k infra/kustomize/overlays/dev
+kubectl -n agents wait --for=condition=complete job/agent-migrate --timeout=10m
 kubectl -n agents get pods,svc
 kubectl -n agents port-forward svc/orchestrator 8080:80
 ```
@@ -196,10 +208,14 @@ kubectl -n agents port-forward svc/orchestrator 8080:80
 > Autopilot nodes these manifests target are amd64, and an arm64 image fails
 > there with `exec format error`.
 
-The project-specific values to fill before step 3:
+The project-specific values to fill before step 3 — all of them come from
+`terraform output -json kustomize_values`:
 
-- `infra/kustomize/base/serviceaccount.yaml` → the GSA email
-  (`terraform output google_service_account_email`)
+- `infra/kustomize/base/serviceaccounts.yaml` → the per-agent GSA emails (one
+  ServiceAccount per agent, plus the migrator)
+- `infra/kustomize/base/configmap.yaml` → `ALLOYDB_INSTANCE_URI`
+- `orchestrator.yaml` / `workers.yaml` / `migrate-job.yaml` → `ALLOYDB_IAM_USER`
+  (each agent's GSA email minus `.gserviceaccount.com`)
 - `infra/kustomize/overlays/dev/kustomization.yaml` → the image repo
   (`terraform output artifact_registry_repo`)
 - `infra/kustomize/base/configmap.yaml` → `OTEL_RESOURCE_ATTRIBUTES:

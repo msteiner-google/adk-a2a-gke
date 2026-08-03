@@ -1,0 +1,105 @@
+# Alembic schema migration Job.
+#
+# Runs the SAME image as the agents (that is why the migrations live under app/
+# -- the base-template Dockerfile copies only ./app). It runs as the migrator
+# ServiceAccount, the only identity with DDL rights.
+#
+# What it does, in order:
+#   1. Creates the `agents` database if missing. The Terraform Google provider
+#      has no google_alloydb_database resource, so this cannot be done in
+#      Terraform -- see app/cluster/bootstrap.py.
+#   2. For each agent, creates that agent's schema, runs every migration in it,
+#      and grants the agent's AlloyDB IAM role USAGE + DML on it (and nothing
+#      else, and nothing anywhere else).
+#
+# Each schema carries its own alembic_version table, so the agents are versioned
+# independently and re-running is a no-op for schemas already at head.
+#
+# ORDERING. Apply this and let it finish BEFORE the agent Deployments come up;
+# an agent that starts against an empty schema cannot create its own tables (by
+# design -- it has no CREATE privilege) and will crash-loop until the Job lands.
+#
+#   kubectl -n agents delete job/agent-migrate --ignore-not-found
+#   kubectl apply -k infra/kustomize/overlays/dev
+#   kubectl -n agents wait --for=condition=complete job/agent-migrate --timeout=5m
+#
+# The delete is needed because a Job's spec is immutable: re-applying a changed
+# Job over a completed one is rejected. ttlSecondsAfterFinished cleans it up
+# automatically an hour after success, so routine re-applies usually just work.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: agent-migrate
+  labels:
+    app: agent-migrate
+    app.kubernetes.io/component: migration
+spec:
+  backoffLimit: 3
+  # Self-clean an hour after completion so the next `kubectl apply -k` is not
+  # rejected by the immutable-spec rule above.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: agent-migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: agent-migrator
+      containers:
+        - name: migrate
+          image: agent-image
+          envFrom:
+            - configMapRef:
+                name: agent-config
+          env:
+            # Connect as the migrator's AlloyDB IAM role: the service account
+            # email with the ".gserviceaccount.com" suffix stripped. Overrides
+            # the ConfigMap's per-agent default.
+            #   terraform output migrator_service_account_email
+            - name: ALLOYDB_IAM_USER
+              value: agent-migrator@msteiner.iam
+            # The migrator holds only the three AlloyDB roles -- deliberately no
+            # telemetry.tracesWriter -- so the OTel exporter 403s on every span
+            # batch and floods this Job's logs, which is exactly where you look
+            # when a migration fails. Disable the SDK rather than widening the
+            # migrator's IAM: a short-lived Job needs no distributed tracing,
+            # and its stdout still reaches Cloud Logging via the node agent.
+            - name: OTEL_SDK_DISABLED
+              value: "true"
+            # The agents to migrate. Must match var.agents in Terraform and the
+            # registry in app/agents/__init__.py.
+            - name: MIGRATE_AGENTS
+              value: "orchestrator research math"
+            # Used to derive each agent's database role below. Must match
+            # var.service_account_prefix and the project the GSAs live in.
+            - name: AGENT_ROLE_PREFIX
+              value: agent
+            - name: AGENT_ROLE_SUFFIX
+              value: msteiner.iam
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              echo "==> ensuring database '${DB_NAME}' exists"
+              uv run python -m app.cluster.bootstrap
+
+              for agent in ${MIGRATE_AGENTS}; do
+                echo "==> migrating schema '${agent}'"
+                # DB_SCHEMA selects the schema (env.py creates it if absent and
+                # keeps alembic_version inside it). DB_AGENT_ROLE is the role
+                # that revision 0003 grants USAGE + DML to; unset, it would skip
+                # the grant and the agent could not read its own tables.
+                DB_SCHEMA="${agent}" \
+                DB_AGENT_ROLE="${AGENT_ROLE_PREFIX}-${agent}@${AGENT_ROLE_SUFFIX}" \
+                  uv run alembic -c app/migrations/alembic.ini upgrade head
+              done
+
+              echo "==> all schemas at head"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi

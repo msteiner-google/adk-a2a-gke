@@ -21,7 +21,10 @@ spec:
       labels:
         app: research
     spec:
-      serviceAccountName: agent
+      # Its own ServiceAccount -> its own GSA -> its own AlloyDB role -> its own
+      # schema. This is the agent that ingests untrusted web content via
+      # web_search, so it is the one that most needs an identity of its own.
+      serviceAccountName: agent-research
       containers:
         - name: agent
           image: agent-image
@@ -33,6 +36,10 @@ spec:
           env:
             - name: AGENT_NAME
               value: research
+            # AlloyDB IAM database role: this pod's GSA email minus the
+            # ".gserviceaccount.com" suffix. DB_SCHEMA defaults to AGENT_NAME.
+            - name: ALLOYDB_IAM_USER
+              value: agent-research@msteiner.iam
             # Base URL advertised in this agent's A2A card (see orchestrator.yaml
             # for details). MUST equal how peers address this Service:
             # http://<service-name>.<A2A_NAMESPACE>.<A2A_CLUSTER_DOMAIN>.
@@ -88,7 +95,7 @@ spec:
       labels:
         app: math
     spec:
-      serviceAccountName: agent
+      serviceAccountName: agent-math
       containers:
         - name: agent
           image: agent-image
@@ -100,6 +107,10 @@ spec:
           env:
             - name: AGENT_NAME
               value: math
+            # AlloyDB IAM database role: this pod's GSA email minus the
+            # ".gserviceaccount.com" suffix. DB_SCHEMA defaults to AGENT_NAME.
+            - name: ALLOYDB_IAM_USER
+              value: agent-math@msteiner.iam
             # Base URL advertised in this agent's A2A card (see orchestrator.yaml
             # for details). MUST equal how peers address this Service:
             # http://<service-name>.<A2A_NAMESPACE>.<A2A_CLUSTER_DOMAIN>.

@@ -12,10 +12,23 @@ across replicas:
 
 Session backends (``SESSION_BACKEND``)
     - ``in_memory`` (default): ``InMemorySessionService`` — ephemeral.
+    - ``alloydb``: ``DatabaseSessionService`` bound to the shared AlloyDB engine
+      from ``app/cluster/db.py``. This is the durable backend for the cluster:
+      it authenticates with IAM (no password), writes into this agent's own
+      PostgreSQL schema, and shares one connection pool with the A2A task
+      store. Schema creation is Alembic's job, not the service's.
     - ``database``: ``DatabaseSessionService`` from ``SESSION_DB_URL`` (e.g. a
-      Cloud SQL / Postgres URL). Requires the ``google-adk[db]`` extra.
+      Cloud SQL / Postgres URL). Requires the ``google-adk[db]`` extra. Kept for
+      a plain DSN; prefer ``alloydb`` in the cluster so the pool is shared.
     - ``vertex_ai``: ``VertexAiSessionService`` (managed Agent Engine sessions);
       uses the injected project/location and ``AGENT_ENGINE_ID``.
+
+Why ADK's ``DatabaseSessionService`` is reused rather than reimplemented: it
+already carries optimistic concurrency on ``update_time``, per-session in-process
+locking, ``SELECT ... FOR UPDATE`` row locking on PostgreSQL, and app/user/session
+state merging. Re-deriving that correctly would be a large amount of subtle code
+for no gain. What this module adds is the *engine* — the connector, the pool,
+and the per-agent schema — which is exactly the part ADK leaves to the caller.
 
 Memory backends (``MEMORY_BACKEND``)
     - ``in_memory`` (default): ``InMemoryMemoryService`` — ephemeral.
@@ -30,9 +43,13 @@ persistence — set both from the same source of truth in your manifests.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 from google.adk.memory import BaseMemoryService, InMemoryMemoryService
 from google.adk.sessions import BaseSessionService, InMemorySessionService
+
+if TYPE_CHECKING:
+    from app.cluster.db import Database
 
 SESSION_BACKEND_ENV = "SESSION_BACKEND"
 MEMORY_BACKEND_ENV = "MEMORY_BACKEND"
@@ -40,12 +57,16 @@ SESSION_DB_URL_ENV = "SESSION_DB_URL"
 AGENT_ENGINE_ID_ENV = "AGENT_ENGINE_ID"
 
 IN_MEMORY = "in_memory"
+ALLOYDB = "alloydb"
 DATABASE = "database"
 VERTEX_AI = "vertex_ai"
 
 
 def build_session_service(
-    *, project: str = "", location: str = ""
+    *,
+    project: str = "",
+    location: str = "",
+    database: Database | None = None,
 ) -> BaseSessionService:
     """Construct the session service selected by ``SESSION_BACKEND``.
 
@@ -53,6 +74,7 @@ def build_session_service(
         project: GCP project for the ``vertex_ai`` backend (empty -> resolved
             from ADC by the underlying client).
         location: GCP location for the ``vertex_ai`` backend.
+        database: Shared engine holder, required by the ``alloydb`` backend.
 
     Returns:
         A concrete ``BaseSessionService`` implementation.
@@ -65,6 +87,20 @@ def build_session_service(
 
     if backend == IN_MEMORY:
         return InMemorySessionService()
+
+    if backend == ALLOYDB:
+        if database is None or not database.enabled:
+            raise ValueError(
+                f"{SESSION_BACKEND_ENV}={ALLOYDB} requires a configured "
+                "database; set DB_BACKEND=alloydb (see app/cluster/db.py)."
+            )
+        from google.adk.sessions import DatabaseSessionService
+
+        # The tables are owned by Alembic, so nothing here creates them. ADK's
+        # prepare_tables() still runs on first use, but with the schema already
+        # present it degrades to a reflection pass that issues no DDL -- which
+        # is why the agent roles need no CREATE privilege.
+        return DatabaseSessionService(db_engine=database.engine())
 
     if backend == DATABASE:
         db_url = os.environ.get(SESSION_DB_URL_ENV, "").strip()
@@ -89,7 +125,7 @@ def build_session_service(
 
     raise ValueError(
         f"Unknown {SESSION_BACKEND_ENV}={backend!r}; expected one of "
-        f"{IN_MEMORY!r}, {DATABASE!r}, {VERTEX_AI!r}."
+        f"{IN_MEMORY!r}, {ALLOYDB!r}, {DATABASE!r}, {VERTEX_AI!r}."
     )
 
 

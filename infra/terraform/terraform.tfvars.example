@@ -5,11 +5,30 @@ project_id = "my-gcp-project"
 region     = "us-central1"
 
 # Optional overrides (defaults shown):
-# cluster_name               = "agents-cluster"
-# artifact_repo_id           = "agents"
-# namespace                  = "agents"
-# kubernetes_service_account = "agent"
-# google_service_account_id  = "agents-runtime"
+# cluster_name                = "agents-cluster"
+# artifact_repo_id            = "agents"
+# namespace                   = "agents"
+# service_account_prefix      = "agent"            # -> GSA/KSA "agent-<name>"
+# migrator_service_account_id = "agent-migrator"
+
+# The agents in the system. Must match app/agents/<name>/, the Kubernetes
+# Service names, and each agent's PostgreSQL schema.
+# agents = ["orchestrator", "research", "math"]
+
+# Per-agent extra IAM roles. The point of separate identities: widen one agent
+# without widening the rest.
+# agent_extra_iam_roles = { research = ["roles/..."] }
+
+# --- AlloyDB ---
+# network                   = "default"        # must match the GKE cluster's VPC
+# alloydb_cluster_id        = "agents-db"
+# alloydb_instance_id       = "primary"
+# alloydb_database          = "agents"
+# alloydb_machine_type      = "c4a-highmem-1"  # 1 vCPU / 8 GB, sandbox shape (no SLA)
+# alloydb_cpu_count         = 1                # must agree with machine_type
+# alloydb_psa_prefix_length = 16
 
 # Set to false for a throwaway/dev cluster you want to be able to `destroy`.
 # deletion_protection = true
+# Allow `terraform destroy` to remove an AlloyDB cluster that still has instances.
+# alloydb_deletion_policy = "FORCE"

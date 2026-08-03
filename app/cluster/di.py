@@ -6,10 +6,13 @@ Two :mod:`injector` modules, installed alongside the shared ``ModelModule``:
   environment) and the :class:`AgentResolver` — the injectable service-discovery
   layer that turns configured peers into ``RemoteA2aAgent`` children. This is the
   "resolver so an agent can connect to the other agents in the cluster."
-- :class:`SessionModule` provides the pluggable ``BaseSessionService`` and
-  ``BaseMemoryService`` (in-memory by default, durable backends via env — see
-  ``app/cluster/session.py``), reusing the injected GCP project/location from
-  the shared module for the managed Vertex AI backends.
+- :class:`SessionModule` provides the pluggable ``BaseSessionService``,
+  ``BaseMemoryService``, and A2A ``TaskStore`` (in-memory by default, durable
+  backends via env — see ``app/cluster/session.py``, ``app/cluster/tasks.py``),
+  reusing the injected GCP project/location from the shared module for the
+  managed Vertex AI backends. It also provides the shared
+  :class:`~app.cluster.db.Database`, so the session store and the task store
+  hand out one connection pool between them rather than one each.
 
 Build the injector once in ``app/agent.py``::
 
@@ -30,14 +33,17 @@ from __future__ import annotations
 
 import os
 
+from a2a.server.tasks import TaskStore
 from google.adk.memory import BaseMemoryService
 from google.adk.sessions import BaseSessionService
 from injector import Module, provider, singleton
 
 from app.agents import AGENTS, DEFAULT_AGENT
 from app.cluster.config import AGENT_NAME_ENV, ClusterConfig
+from app.cluster.db import Database, get_database
 from app.cluster.resolver import AgentResolver
 from app.cluster.session import build_memory_service, build_session_service
+from app.cluster.tasks import build_task_store
 from app.shared.project_types import GoogleCloudLocation, GoogleCloudProject
 
 
@@ -77,7 +83,22 @@ class ClusterModule(Module):
 
 
 class SessionModule(Module):
-    """Provides the pluggable session and memory services."""
+    """Provides the pluggable session, memory, and A2A task services."""
+
+    @singleton
+    @provider
+    def provide_database(self) -> Database:
+        """Provide the (singleton) shared database engine holder.
+
+        Delegates to :func:`app.cluster.db.get_database` rather than
+        constructing one, so that consumers reached outside the injector — ADK's
+        service registry in particular — resolve the *same* instance and share
+        its connection pool.
+
+        Returns:
+            The process-wide :class:`Database`.
+        """
+        return get_database()
 
     @singleton
     @provider
@@ -85,17 +106,34 @@ class SessionModule(Module):
         self,
         project: GoogleCloudProject,
         location: GoogleCloudLocation,
+        database: Database,
     ) -> BaseSessionService:
         """Provide the (singleton) session service selected by env.
 
         Args:
             project: The injected GCP project (for managed backends).
             location: The injected GCP location (for managed backends).
+            database: The injected shared engine holder (for ``alloydb``).
 
         Returns:
             The configured :class:`BaseSessionService`.
         """
-        return build_session_service(project=project, location=location)
+        return build_session_service(
+            project=project, location=location, database=database
+        )
+
+    @singleton
+    @provider
+    def provide_task_store(self, database: Database) -> TaskStore:
+        """Provide the (singleton) A2A task store selected by env.
+
+        Args:
+            database: The injected shared engine holder (for ``database``).
+
+        Returns:
+            The configured :class:`~a2a.server.tasks.TaskStore`.
+        """
+        return build_task_store(database=database)
 
     @singleton
     @provider

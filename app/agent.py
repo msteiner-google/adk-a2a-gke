@@ -25,12 +25,14 @@ and ``App(name=...)`` must equal the agent directory (``app``).
 
 import os
 
+from a2a.server.tasks import TaskStore
 from google.adk.apps import App
 from google.adk.memory import BaseMemoryService
 from google.adk.sessions import BaseSessionService
 from injector import Injector
 
 from .agents import AGENTS, build_agent
+from .cluster.db import Database
 from .cluster.di import ClusterModule, SessionModule
 from .cluster.resolver import AgentResolver
 from .shared.config import ModelModule, Models
@@ -53,11 +55,21 @@ _injector = Injector([ModelModule(), ClusterModule(), SessionModule()])
 models = _injector.get(Models)
 resolver = _injector.get(AgentResolver)
 
-# Pluggable session + memory services (in-memory by default; durable backends
-# via SESSION_BACKEND / MEMORY_BACKEND). Resolved here so misconfiguration fails
-# fast at startup; exported for custom serving layers or memory-aware tools.
+# Pluggable session + memory services and the A2A task store (in-memory by
+# default; durable backends via SESSION_BACKEND / MEMORY_BACKEND /
+# TASK_STORE_BACKEND). Resolved here so misconfiguration fails fast at startup.
+#
+# These are the instances the serving layer actually uses: app/fast_api_app.py
+# imports them for the Runner and the A2A routes. Do not let a refactor reduce
+# them to unused exports -- if the serving layer builds its own, agents will
+# quietly run on per-pod in-memory state while this module reports otherwise.
 session_service = _injector.get(BaseSessionService)
 memory_service = _injector.get(BaseMemoryService)
+task_store = _injector.get(TaskStore)
+
+# The shared engine holder, exported so the serving layer can dispose of the
+# pool and stop the AlloyDB connector's background refresh tasks on shutdown.
+database = _injector.get(Database)
 
 # Select this process's agent from the registry by name. Every agent is built by
 # the same `build_agent`; peers (if any) are attached uniformly by the resolver.

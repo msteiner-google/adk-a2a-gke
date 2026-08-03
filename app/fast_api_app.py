@@ -26,18 +26,21 @@
 import contextlib
 import os
 from collections.abc import AsyncIterator
+from typing import Any
 
 import google.auth
-from a2a.server.tasks import InMemoryTaskStore
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from google.adk.cli.fast_api import get_fast_api_app
+from google.adk.cli.service_registry import get_service_registry
 from google.adk.runners import Runner
+from google.adk.sessions import BaseSessionService
 from google.cloud import logging as google_cloud_logging
 
 from app.app_utils import services
 from app.app_utils.a2a import attach_a2a_routes
 from app.app_utils.typing import Feedback
+from app.cluster.db import get_database
 from app.shared.telemetry import instrument_fastapi_app
 
 load_dotenv()
@@ -51,14 +54,40 @@ allow_origins = (
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# When a durable database is configured, override the base template's
+# "shared://session" registration so the ADK web routes resolve to the SAME
+# DB-backed session service the Runner and the A2A path use. app/__init__.py
+# imports app.agent, so the injector is already built by the time the factory
+# below is called; the import stays inside the function only to keep this
+# module importable in isolation.
+#
+# This is intentionally conditional: with no database configured (the default,
+# and every test run) the base template's registration is left completely
+# untouched, so local `adk web` behaviour is unchanged.
+if get_database().enabled:
+
+    def _shared_session_service(uri: str, **kwargs: Any) -> BaseSessionService:
+        """Resolve `shared://session` to the injector's session service."""
+        del uri, kwargs  # The scheme carries no configuration of its own.
+        from app.agent import session_service
+
+        return session_service
+
+    get_service_registry().register_session_service("shared", _shared_session_service)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.agent import app as adk_app
-    from app.agent import root_agent
+    from app.agent import database, root_agent, session_service, task_store
 
     runner = Runner(
         app=adk_app,
-        session_service=services.get_session_service(),
+        # Use the injector's session service rather than
+        # services.get_session_service(): that helper only understands a plain
+        # DSN, and the AlloyDB path authenticates per connection with IAM. When
+        # no database is configured both resolve to the same in-memory service.
+        session_service=session_service,
         artifact_service=services.get_artifact_service(),
         auto_create_session=True,
     )
@@ -68,10 +97,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app,
         agent=root_agent,
         runner=runner,
-        task_store=InMemoryTaskStore(),
+        # Durable when TASK_STORE_BACKEND=database; otherwise per-pod
+        # in-memory, exactly as before.
+        task_store=task_store,
         rpc_path=f"/a2a/{adk_app.name}",
     )
     yield
+    # Dispose the pool and stop the AlloyDB connector's background certificate
+    # refresh, which would otherwise keep the event loop alive on shutdown.
+    await database.aclose()
 
 
 app: FastAPI = get_fast_api_app(

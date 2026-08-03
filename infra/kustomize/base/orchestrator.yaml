@@ -15,7 +15,10 @@ spec:
       labels:
         app: orchestrator
     spec:
-      serviceAccountName: agent
+      # This agent's own ServiceAccount (see serviceaccounts.yaml). Bound by
+      # Workload Identity to its own GSA, which maps to its own AlloyDB IAM
+      # role, which is granted on its own PostgreSQL schema.
+      serviceAccountName: agent-orchestrator
       containers:
         - name: agent
           # Placeholder image name; the overlay rewrites it to your Artifact
@@ -29,6 +32,14 @@ spec:
           env:
             - name: AGENT_NAME
               value: orchestrator
+            # The AlloyDB IAM database role this pod authenticates as: its GSA
+            # email minus the ".gserviceaccount.com" suffix, the form AlloyDB
+            # uses for service-account IAM users. Must match the ServiceAccount
+            # annotation above.
+            #   terraform output -json agent_database_roles
+            # DB_SCHEMA is intentionally unset; it defaults to AGENT_NAME.
+            - name: ALLOYDB_IAM_USER
+              value: agent-orchestrator@msteiner.iam
             # APP_URL is the base URL this agent advertises in its A2A agent
             # card (the card's `url`, which peers use to reach its JSON-RPC
             # endpoint at APP_URL + /a2a/app). Without it the card defaults to

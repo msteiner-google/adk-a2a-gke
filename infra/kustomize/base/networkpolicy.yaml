@@ -1,0 +1,95 @@
+# Network topology enforcement inside the single `agents` namespace.
+#
+# This is the piece that makes "one namespace" a defensible choice. A namespace
+# does not restrict pod-to-pod traffic on its own -- by default every pod in the
+# cluster can reach every other pod, in any namespace. So splitting agents into
+# separate namespaces would NOT have bought network isolation either; it would
+# have required these same policies, plus fully-qualified A2A peer URLs and a
+# ConfigMap and Workload Identity binding per namespace.
+#
+# The delegation graph is declared in code (AgentSpec.peers, see
+# app/agents/orchestrator/agent.py) and resolved via DNS. These policies make
+# the network enforce the same shape:
+#
+#     orchestrator ---> research
+#                  \--> math
+#     research  -X-> math          (workers cannot reach each other)
+#     research  -X-> orchestrator  (no callbacks upstream)
+#
+# Keep these in sync with AgentSpec.peers. If you add a delegation edge in code
+# without adding it here, the call fails with a connection timeout rather than a
+# clear error -- that is the usual symptom of a missing rule below.
+#
+# GKE Autopilot enforces NetworkPolicy natively (GKE Dataplane V2); no add-on
+# needed.
+---
+# Baseline: deny all ingress to every pod in the namespace. Later policies are
+# purely additive -- NetworkPolicy is deny-by-default once any policy selects a
+# pod, and the rules below re-open only what the topology needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# The orchestrator is the system's entrypoint. It accepts traffic from outside
+# the namespace (an Ingress/Gateway controller, or `kubectl port-forward`), but
+# explicitly NOT from the worker agents.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orchestrator-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: orchestrator
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Anything outside this namespace (ingress controllers, port-forward).
+        # Tighten to a specific namespaceSelector once a Gateway is in place.
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: NotIn
+                values: ["agents"]
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Workers accept A2A calls from the orchestrator and from nothing else. In
+# particular `research` -- the agent that ingests untrusted web content -- has no
+# network path to `math` or back to the orchestrator, so a prompt-injected
+# research agent cannot pivot to another agent over A2A.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: workers-ingress-from-orchestrator
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["research", "math"]
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Egress is left unrestricted on purpose, and that is a deliberate, limited
+# choice rather than an oversight: every agent needs DNS, the Vertex AI
+# endpoint, AlloyDB, and Cloud Trace, and `research` additionally needs the open
+# internet to do its job. Locking egress down to a useful degree needs an
+# egress-aware proxy (or Cloud NAT plus FQDN policies), which is a larger piece
+# of work than this file. The ingress rules above are what constrain the
+# agent-to-agent topology.
