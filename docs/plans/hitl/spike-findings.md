@@ -17,7 +17,7 @@ keep them together, because most of them contradict the older ADK 2.5.0 notes.
 | F5 | The human's decision content is honoured downstream | approving → `"The result of 44 * 13 is 572."`; rejecting → `"I have the answer, but I cannot share it with you. It is confidential."` |
 | F6 | **The first resume call after an A2A pause is a silent no-op** | `status: resumed`, empty trace, B sees no request. Instrumented: `_find_agent_to_run -> 'orchestrator'` |
 | F7 | Two workarounds for F6, both reproduced | (a) call resume twice — #1 empty, #2 succeeds; (b) append the `FunctionResponse` to the session first, then `run_async(invocation_id=…, new_message=None)` — succeeds on the first call |
-| F8 | A `LongRunningFunctionTool` does **not** structurally stop the turn | its `{"status":"pending"}` return is fed back to the model, which keeps generating; only a strict instruction stopped it leaking the answer |
+| F8 | The spike's long-running tool did **not** structurally stop the turn | its `{"status":"pending"}` return is fed back to the model, which keeps generating; only a strict instruction stopped it leaking the answer. **Superseded — see C1: this was the spike's bug, not the pattern's** |
 
 ### Root cause of F6
 
@@ -34,13 +34,34 @@ identical second call then routes correctly.
 comment: *"a remote a2a agent may surface a credential request as a special
 long-running function tool call"*). It just runs one step too early.
 
+## Corrections from reading ADK 2.6.1 source (not run)
+
+**C1 — F8 blames the wrong thing.** A long-running tool returning a *falsy* value
+produces **no function response at all**: `functions.py:648-657` skips the auto-built
+response when `tool.is_long_running` and the tool returned nothing. The spike returned
+a truthy `{"status":"pending"}` dict, which is why the model got something to continue
+from and leaked the answer. The pattern pauses cleanly when the tool returns `None` —
+which is exactly what ADK's own `_request_input_func` does.
+
+**C2 — there is a supported free-form input primitive.** `google.adk.events.RequestInput`
+(`message` / `payload` / `response_schema`) is the graph-workflow HITL node, and
+`google.adk.tools.request_input` is its LLM-agent bridge: a `LongRunningFunctionTool`
+named `adk_request_input` that returns `None` (per C1). Publicly exported
+(`tools/__init__.py:86`). Unlike tool-confirmation's yes/no, the human's reply is an
+ordinary `FunctionResponse`, so arbitrary feedback reaches the model. `response_schema`
+is advisory — ADK does not coerce the reply to it.
+
+**C3 — a `Workflow` root may sidestep F6.** `runners.py:1763` returns the root agent
+directly when it is a `Workflow` ("Workflow will figure which node is interrupted and
+should be resumed"), bypassing the `_find_agent_to_run` path that misroutes the first
+resume. Only relevant if this project ever adopts graph workflows; untested.
+
 ## Not tested in the spike
 
-- **`FunctionTool(require_confirmation=…)`** — discovered afterwards while reading
-  ADK 2.6.1 (`tools/function_tool.py:82`, `tools/base_tool.py:171`,
-  `flows/llm_flows/functions.py:374`). It is the supported, *structural* gate and
-  the plan prefers it over F8's leaky pattern, but nothing below the "Verified"
-  line above has been run — Phase 1 exists to prove it.
+- **`FunctionTool(require_confirmation=…)`** (`tools/function_tool.py:82`,
+  `tools/base_tool.py:171`, `flows/llm_flows/functions.py:374`) — the structural
+  yes/no gate the plan uses for actions.
+- **`request_input`** (C2) — the free-form question path.
 - Behaviour with >1 replica, with AlloyDB sessions, or with a restart mid-pause.
 - Multi-hop (A → B → C) pauses.
 

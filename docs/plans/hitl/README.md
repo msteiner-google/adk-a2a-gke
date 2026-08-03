@@ -16,19 +16,19 @@ and an operator can approve/reject via an HTTP endpoint on the orchestrator. The
 answer resumes on the same session, whichever agent paused.
 
 **Non-goals for now.** An approval UI; multi-approver / quorum; approval routing by
-role; approvals initiated by anything other than a tool call; human *edits* to tool
-arguments (approve-or-reject only, at first).
+role; graph-workflow HITL nodes (D1c); and direct human *editing* of a pending call's
+arguments — the human can approve, reject, or reply with feedback the model re-plans
+on (D8), but never authors the executed action itself.
 
 ## Design decisions
 
-### D1 — Gate with `require_confirmation`, not a "pending" long-running tool
+### D1 — Two mechanisms, chosen per intent: gate an action vs ask a question
 
-The spike used `LongRunningFunctionTool` returning `{"status":"pending"}`. That is
-**not a gate** (F8): the return value goes back to the model, which happily keeps
-talking. Only a stern instruction stopped it leaking the answer, and a prompt is
-not a security control.
+ADK 2.6.1 ships two HITL mechanisms usable from an `LlmAgent`, plus a third that
+belongs to graph workflows. They are not competing options — they answer different
+questions, and this project needs both.
 
-ADK 2.6.1 has a first-class mechanism instead:
+**(a) Gate an action — `require_confirmation`:**
 
 ```python
 FunctionTool(func=transfer_funds, require_confirmation=True)
@@ -37,17 +37,47 @@ FunctionTool(func=transfer_funds, require_confirmation=lambda amount, **_: amoun
 ```
 
 The flow (`flows/llm_flows/functions.py:374`) synthesizes a long-running
-`adk_request_confirmation` function call carrying the original call plus a
-`ToolConfirmation`, and **the tool body does not execute** until the confirmation
-response arrives. That is structural: the gated effect cannot happen early, and
-there is no result for the model to leak.
+`adk_request_confirmation` call carrying the original call plus a `ToolConfirmation`,
+and **the tool body does not execute** until a confirmation arrives. Structural: the
+gated effect cannot happen early. Yes/no only — see D8 for what the human may say.
 
-Because the synthesized call is an ordinary long-running function call, F2/F4
-(propagation up over A2A, relay down on resume) should apply unchanged — *should*,
-because this specific path was not in the spike. **Phase 1 must prove it.** If it
-does not propagate, fall back to `LongRunningFunctionTool` with the gated action
-placed *behind* the tool (so the model never holds the result), accepting the
-weaker guarantee.
+**(b) Ask a question — `request_input`:**
+
+```python
+from google.adk.tools import request_input   # public, tools/__init__.py:86
+```
+
+`request_input` is a `LongRunningFunctionTool` named `adk_request_input` taking
+`message` and `response_schema`. It is the LLM-agent-level bridge to the same
+`RequestInput` concept the graph runtime exposes as a node
+(`google.adk.events.RequestInput`, with `message` / `payload` / `response_schema`).
+The model calls it when it needs the human; the human's reply is an ordinary
+`FunctionResponse`, so **arbitrary content flows back to the model** — free text,
+structured data, corrections. That is what makes "give feedback" and "revise the
+instructions" possible at all (D8).
+
+Note `response_schema` is advisory: ADK does not coerce or validate the human's
+reply against it (the upstream docs say so explicitly). Validate at our API boundary.
+
+**Why its pause does not leak, unlike the spike's.** `_request_input_func` returns
+`None`, and `functions.py:648-657` skips building a function response when a
+long-running tool returns nothing. No response, nothing for the model to continue
+from. The spike's F8 leak came from returning a truthy `{"status":"pending"}` dict —
+that was our bug, not an inherent property of long-running tools. **Correcting the
+spike's conclusion here matters:** the pattern is sound if the tool returns `None`.
+
+**(c) Graph `Workflow` + `RequestInput` node — deferred.** ADK's own docs position
+this as the graph-workflow mechanism and tool-confirmation as the LLM-agent one.
+Adopting it means restructuring the orchestrator from an `LlmAgent` with A2A peers
+into a node graph, which collides with this repo's invariant that every agent is the
+same `AgentSpec` built by one `build_agent`. One intriguing property if we ever
+revisit: `runners.py:1763` returns the root directly for a `Workflow`
+("Workflow will figure which node is interrupted and should be resumed"), which
+suggests a graph root may sidestep the F6 resume-routing bug entirely — untested.
+
+**Both (a) and (b) ride the long-running function-call path** that the spike verified
+propagates up over A2A and relays back down on resume (F2/F4) — but neither specific
+call was in the spike. **Phase 1 proves both.**
 
 ### D2 — The human decision is owned at the top (orchestrator), not per worker
 
@@ -195,17 +225,25 @@ free text reaches the model directly — spike-verified (**F5**): rejecting with
 `note: "denied: value is confidential"` produced *"I have the answer, but I cannot
 share it with you. It is confidential."*
 
-**Revised arguments are out of scope for v1.** Neither mechanism re-writes the call
-the model proposed, and "human edits the arguments, tool executes the edited version"
-is a materially bigger feature: it needs per-tool validation of what may be edited,
-its own audit trail (the executed action no longer matches what the model asked for),
-and a UI that renders arguments as a form rather than a diff. Two cheaper approximations
-cover most of the need:
+**With `request_input` (D1b)** the human's reply is an ordinary `FunctionResponse`
+whose content we choose, so free text, structured data and corrections all reach the
+model directly — this is the mechanism to use when the point is *feedback*, not
+permission. The reply becomes ordinary conversation context the model plans against.
 
-1. **Reject with a reason** — the model re-plans and proposes a corrected call, which
-   is gated again. No schema change, and the human never authors the action.
-2. **A tool opts in** to honouring `payload["overrides"]` explicitly, validating each
-   field itself. Per-tool, deliberate, never implicit.
+**Revised arguments — supported by re-planning, not by rewriting the call.** No
+mechanism substitutes the human's values into the pending call: `require_confirmation`
+re-invokes with the original arguments, and `request_input` never had a pending action
+to begin with. What works today:
+
+1. **Reject (or answer) with a reason** — the model proposes a corrected call, which is
+   gated again. The human steers; the model still authors the action. Nothing to build.
+2. **A tool opts in** to honouring `payload["overrides"]`, validating each field itself.
+   Per-tool, deliberate, never implicit.
+
+Direct argument editing — the human's values executed verbatim — stays out of v1: it
+needs per-tool rules for what may be edited, its own audit trail (the executed action
+no longer matches what the model asked for), and a form-style UI. Option 1 reaches the
+same outcome for most cases and keeps the model accountable for the call.
 
 Anything the human writes is untrusted input on its way to a model — see the security
 notes.
@@ -225,10 +263,14 @@ before. **Risk:** resumability changes runner routing semantics
 (`_find_agent_to_run` only consults past function responses when it is enabled) —
 this phase exists to isolate that change from everything else.
 
-### Phase 1 — Prove `require_confirmation` end to end, single agent
+### Phase 1 — Prove both mechanisms end to end, single agent
 
 - Add a gated demo tool to the math agent (e.g. `calculate` stays open; a new
-  `publish_result` requires confirmation), declared per D1.
+  `publish_result` requires confirmation), declared per D1a.
+- Separately, add `request_input` (D1b) to an agent's tools and confirm the model
+  calls it when it needs the human, that the pause carries **no** function response
+  (the anti-leak property at `functions.py:648-657`), and that a free-text reply lands
+  in the model's context and changes the outcome.
 - Drive it in-process from a test/script: assert the pause surfaces as a long-running
   `adk_request_confirmation` call **and that the tool body did not run** (a sentinel
   the tool would have written).
@@ -264,7 +306,9 @@ works (needs a database — run it against a local Postgres or in-cluster).
 ### Phase 3 — A2A end to end
 
 - Two-process local run (the recipe in AGENTS.md) with the gated tool on `math` and
-  the API on `orchestrator`.
+  the API on `orchestrator`. Cover **both** D1 mechanisms: `adk_request_confirmation`
+  and `adk_request_input` are both long-running calls, so both should propagate and
+  relay — verify rather than assume.
 - Assert: orchestrator pauses with no final answer (F2); one `POST` to the decision
   endpoint produces a real inbound A2A call on the worker and a final answer (F4/F7b);
   rejection changes the outcome (F5).
@@ -303,7 +347,8 @@ works (needs a database — run it against a local Postgres or in-cluster).
 | --- | --- |
 | Every API here is EXPERIMENTAL in ADK (`RemoteA2aAgent`, `A2aAgentExecutor`, `ResumabilityConfig`) | Pin the ADK version deliberately when this ships; the guard test in Phase 3 makes an upstream behaviour change loud |
 | F6 workaround silently becomes wrong | Same guard test; D5 keeps it in one function |
-| `require_confirmation` may not propagate over A2A | Phase 1 checks it in isolation before anything is built on it |
+| `require_confirmation` / `request_input` may not propagate over A2A | Phase 1 checks each in isolation before anything is built on it |
+| `response_schema` on `request_input` is advisory — ADK does not coerce the reply | Validate at the API boundary, never trust the shape downstream |
 | Resumption is at-least-once — a tool may run twice | Gated tools must be idempotent; the unique constraint in D4 dedupes the *approval*, not the effect |
 | In-memory task store past 1 replica | Already documented; `TASK_STORE_BACKEND: database` is set in the cluster |
 
