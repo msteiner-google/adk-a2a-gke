@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-config
+data:
+  # Cluster / A2A discovery. A2A_NAMESPACE must match the namespace these run in
+  # so the orchestrator resolves peers at <name>.<namespace>.svc.cluster.local.
+  A2A_NAMESPACE: "agents"
+  A2A_CLUSTER_DOMAIN: "svc.cluster.local"
+  A2A_PEER_SCHEME: "http"
+  A2A_PEER_PORT: "80"
+
+  # Vertex AI region for the genai client. "global" targets the global endpoint;
+  # set a region for data residency / geofencing. GOOGLE_CLOUD_PROJECT is left
+  # to Workload Identity (ADC) but can be set explicitly if you prefer.
+  GOOGLE_CLOUD_LOCATION: "global"
+
+  # Port the container serves on; Services target this. Keep in sync with the
+  # containerPort in the Deployments (and the base image's serve command).
+  PORT: "8080"
+
+  # Session / memory backends (see app/cluster/session.py). Defaults are
+  # in-memory (per-pod, ephemeral). For durable, shared state switch to:
+  #   SESSION_BACKEND: "vertex_ai"  (+ AGENT_ENGINE_ID) or "database" (+ SESSION_DB_URL)
+  #   MEMORY_BACKEND:  "vertex_ai"  (+ AGENT_ENGINE_ID)
+  SESSION_BACKEND: "in_memory"
+  MEMORY_BACKEND: "in_memory"
+
+  # Observability (structured logging + distributed tracing). See GKE.md.
+  # Traces + logs go to Google Cloud (Cloud Trace / Cloud Logging) by default,
+  # correlated by trace id. Each agent's trace `service.name` is its AGENT_NAME
+  # (set per Deployment), so orchestrator / research / math appear distinctly in
+  # Trace Explorer -- no OTEL_SERVICE_NAME needed here.
+  LOG_LEVEL: "INFO"
+  LOG_FORMAT: "json"
+  # To send traces to a vendor-neutral stack (Grafana Tempo, Jaeger, Datadog,
+  # ...) instead of Cloud Trace, point this at an in-cluster OpenTelemetry
+  # Collector; leaving it unset uses Cloud Trace directly. A Collector can also
+  # dual-export to Cloud Trace AND your own backend.
+  # OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4318"

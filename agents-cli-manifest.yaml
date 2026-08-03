@@ -1,0 +1,84 @@
+# agents-cli remote template manifest — GKE multi-agent variant
+# ---------------------------------------------------------------------------
+# This variant overlays a cloud-native, multi-agent system designed to run on
+# GKE. A planner/orchestrator agent delegates sub-tasks to specialist worker
+# agents, each deployed as its own Service and reached over A2A. It ships:
+#   - a dependency-injected AgentResolver that turns cluster peers into ADK
+#     RemoteA2aAgent children by fetching their well-known agent cards (the
+#     "resolver so an agent can connect to the other agents in the cluster"),
+#   - a name-driven entry point (AGENT_NAME) so one image runs as any agent in
+#     the registry (the orchestrator or any specialist),
+#   - pluggable, env-selectable session + memory backends (in-memory by
+#     default; Cloud SQL / Vertex AI managed backends for production),
+#   - an agent registry (app/agents/) with one folder per agent and shared-state
+#     tools for context propagation across A2A hops,
+#   - Terraform to provision a GKE Autopilot cluster (Workload Identity +
+#     Artifact Registry) and Kustomize manifests for the namespace, service
+#     accounts, and the orchestrator + worker Deployments/Services.
+#
+# Scaffold it with:
+#   agents-cli scaffold create my-cluster-agent \
+#     --agent https://depot.code.corp.goog/personal/adk-template/variants/gke@main \
+#     --deployment-target gke
+#
+# See GKE.md (shipped into the generated project) for how to build, provision,
+# and deploy everything.
+
+# Inherit the standard ADK base template (Dockerfile, deployment/, serving +
+# A2A wiring, pyproject.toml, tests). The base A2A surface already publishes each
+# agent's well-known card + RPC endpoint, which is exactly what the resolver
+# consumes — so this variant needs no serving overlay.
+base_template: adk
+
+name: agentic-template-gke
+description: "Multi-agent system for GKE — an A2A orchestrator + specialist workers"
+
+# Example prompt used by generated eval/test scaffolding.
+example_question: "Research the population of France and multiply it by 2."
+
+settings:
+  # Agent code lives in `app/` (the default). If you rename this, you MUST also
+  # update `App(name=...)` in app/agent.py to match.
+  agent_directory: app
+
+  # Agents keep conversational + shared context state, so session management is
+  # required. The concrete backend is pluggable (see app/cluster/session.py).
+  requires_session: true
+
+  # This variant targets GKE first; other targets still work for single-agent
+  # deployments of the same image.
+  deployment_targets: ["gke", "cloud_run", "agent_runtime", "none"]
+
+  # `adk` enables the ADK code paths; `a2a` enables the built-in A2A surface that
+  # this variant relies on for inter-agent communication.
+  tags: ["adk", "a2a"]
+
+  # No bundled web frontend.
+  frontend_type: "None"
+
+  # Extra pip dependencies for this variant. The base template's own deps
+  # (google-adk, a2a-sdk, ...) are added automatically.
+  #   - injector: the shared + cluster dependency-injection wiring (ModelModule,
+  #     ClusterModule/AgentResolver, SessionModule). Keep in sync with the dev
+  #     harness pyproject.toml.
+  #   - loguru + the OpenTelemetry packages: shared/logging.py + shared/telemetry.py
+  #     (structured logging + distributed tracing). The FastAPI instrumentation is
+  #     what lets each agent EXTRACT the W3C `traceparent` from inbound A2A calls
+  #     and the httpx instrumentation INJECTS it outbound, so one trace spans the
+  #     whole cluster. The OTLP-HTTP exporter backs both Cloud Trace and generic
+  #     OTLP. Keep in sync with the dev harness pyproject.toml.
+  #   - cloudpathlib[gs,s3]: shared/artifacts.py (CloudPathArtifactService) — a
+  #     cloud-agnostic ADK artifact service. Required because the shipped shared
+  #     tests import it. Add `azure` (or use `[all]`) for Azure Blob Storage.
+  #
+  # NOTE: the `database` session backend additionally needs the google-adk[db]
+  # extra (SQLAlchemy). It is intentionally NOT added here to keep the default
+  # (in-memory) footprint small; run `uv add "google-adk[db]"` if you set
+  # SESSION_BACKEND=database. See GKE.md.
+  extra_dependencies:
+    - "injector>=0.22"
+    - "loguru>=0.7"
+    - "opentelemetry-exporter-otlp-proto-http>=1.20"
+    - "opentelemetry-instrumentation-fastapi>=0.40b0"
+    - "opentelemetry-instrumentation-httpx>=0.40b0"
+    - "cloudpathlib[gs,s3]>=0.20"

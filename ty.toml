@@ -1,0 +1,33 @@
+# Team ty (Astral type checker) config for projects scaffolded from this
+# template.
+#
+# A standalone ty.toml takes precedence over the base template's [tool.ty]
+# section in pyproject.toml (per https://docs.astral.sh/ty/configuration/), so
+# this file owns the type-checking policy. Run it with `agents-cli lint`
+# (or `agents-cli lint --skip-ty` to skip).
+#
+# Stricter than the scaffolder's defaults: we keep only the noise-reduction
+# needed for third-party/dynamic code (unresolved imports/attributes) and let
+# ty flag real type errors (bad arguments, returns, assignments) instead of
+# ignoring everything.
+
+[environment]
+# Match the base template's requires-python FLOOR (>=3.11). ty treats this as the
+# minimum supported interpreter, so setting it to the floor makes ty flag use of
+# stdlib/syntax newer than 3.11 (e.g. `typing.override`, PEP 695) that would
+# crash on a permitted 3.11 install. Prod runs 3.12 (base Dockerfile); installs
+# go down to 3.11. Raise this only when the base template raises its floor.
+python-version = "3.11"
+
+[src]
+exclude = [".venv/**", "**/node_modules/**", "frontend/**"]
+
+[rules]
+# Third-party libs without stubs and ADK's dynamic surfaces produce a lot of
+# these; keep them quiet so signal isn't drowned out.
+unresolved-import = "ignore"
+unresolved-attribute = "ignore"
+possibly-missing-attribute = "ignore"
+# Everything else (invalid-argument-type, invalid-return-type,
+# invalid-assignment, etc.) stays at ty's default severity so genuine type
+# errors surface.

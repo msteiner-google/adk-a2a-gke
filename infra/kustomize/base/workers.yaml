@@ -1,0 +1,139 @@
+# Specialist worker agents. Each runs the SAME image as the orchestrator; only
+# AGENT_NAME differs. The Service name MUST equal the agent name in
+# app/agents/<name>/ (and its registry entry) so the orchestrator resolves it at
+# <name>.<namespace>.svc.cluster.local. Add an agent by adding app/agents/<name>/
+# + a registry entry and copying one of these Deployment/Service pairs.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: research
+  labels:
+    app: research
+    app.kubernetes.io/component: specialist
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: research
+  template:
+    metadata:
+      labels:
+        app: research
+    spec:
+      serviceAccountName: agent
+      containers:
+        - name: agent
+          image: agent-image
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: agent-config
+          env:
+            - name: AGENT_NAME
+              value: research
+            # Base URL advertised in this agent's A2A card (see orchestrator.yaml
+            # for details). MUST equal how peers address this Service:
+            # http://<service-name>.<A2A_NAMESPACE>.<A2A_CLUSTER_DOMAIN>.
+            - name: APP_URL
+              value: http://research.agents.svc.cluster.local
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: research
+  labels:
+    app: research
+spec:
+  type: ClusterIP
+  selector:
+    app: research
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: math
+  labels:
+    app: math
+    app.kubernetes.io/component: specialist
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: math
+  template:
+    metadata:
+      labels:
+        app: math
+    spec:
+      serviceAccountName: agent
+      containers:
+        - name: agent
+          image: agent-image
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: agent-config
+          env:
+            - name: AGENT_NAME
+              value: math
+            # Base URL advertised in this agent's A2A card (see orchestrator.yaml
+            # for details). MUST equal how peers address this Service:
+            # http://<service-name>.<A2A_NAMESPACE>.<A2A_CLUSTER_DOMAIN>.
+            - name: APP_URL
+              value: http://math.agents.svc.cluster.local
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: math
+  labels:
+    app: math
+spec:
+  type: ClusterIP
+  selector:
+    app: math
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

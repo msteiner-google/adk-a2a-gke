@@ -1,0 +1,15 @@
+# Copy to terraform.tfvars and edit. `terraform.tfvars` is gitignored by default
+# in the generated project; do not commit real project IDs.
+
+project_id = "my-gcp-project"
+region     = "us-central1"
+
+# Optional overrides (defaults shown):
+# cluster_name               = "agents-cluster"
+# artifact_repo_id           = "agents"
+# namespace                  = "agents"
+# kubernetes_service_account = "agent"
+# google_service_account_id  = "agents-runtime"
+
+# Set to false for a throwaway/dev cluster you want to be able to `destroy`.
+# deletion_protection = true

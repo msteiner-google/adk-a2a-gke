@@ -1,0 +1,62 @@
+# Team ruff config for projects scaffolded from this template.
+#
+# A standalone ruff.toml takes precedence over the base template's
+# [tool.ruff] section in pyproject.toml (verified), so this file is the single
+# source of truth for lint/format rules. Run it with `agents-cli lint`.
+#
+# This is intentionally STRICTER than the scaffolder's defaults: line length is
+# enforced, mutable-default-arg bugs are caught, and docstrings are required on
+# the code you write. Generated infrastructure we don't own is exempted below.
+
+line-length = 88
+# Match the base template's requires-python FLOOR (>=3.11,<3.14). ruff's
+# `target-version` is the *minimum* interpreter to support: pyupgrade will not
+# rewrite to syntax newer than this. It must therefore be the LOWEST version a
+# generated project can install on (3.11) — NOT the newest — or ruff may produce
+# code that breaks there (e.g. `typing.override`, PEP 695 type params). Prod runs
+# 3.12 (base Dockerfile), but installs are permitted down to 3.11. Raise this
+# only when the base template raises its requires-python floor.
+target-version = "py311"
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort (import sorting)
+    "B",    # flake8-bugbear (likely bugs, e.g. mutable defaults)
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade (modern syntax)
+    "RUF",  # ruff-specific rules
+    "SIM",  # flake8-simplify
+    "N",    # pep8-naming
+    "D",    # pydocstyle (docstrings)
+    "PTH",  # prefer pathlib over os.path
+    "RET",  # flake8-return
+    "ARG",  # unused arguments
+    "TID",  # tidy imports
+]
+ignore = [
+    # These two D rules are mutually exclusive with the ones we keep; picking a
+    # side avoids ruff warning about the conflict.
+    "D203",  # one-blank-line-before-class (conflicts with D211)
+    "D213",  # multi-line-summary-second-line (conflicts with D212)
+]
+
+[lint.pydocstyle]
+convention = "google"
+
+[lint.isort]
+known-first-party = ["app", "frontend"]
+
+[lint.per-file-ignores]
+# Generated serving/A2A infrastructure is owned by the base template, not by
+# app authors — don't hold it to the strict docstring/style/pathlib rules.
+"app/app_utils/**" = ["D", "ARG", "N", "PTH"]
+"app/fast_api_app.py" = ["D", "PTH"]
+# Tests favor readability over docstring coverage and unused-arg purity.
+# Match at any depth so both the base-template tests (tests/**) and the tests
+# shipped inside the shared library (app/shared/tests/**) are covered.
+# TID252: the shipped shared tests use parent-relative imports on purpose so
+# they resolve as `app.shared.tests` here and `shared.tests` in the dev harness.
+"**/tests/**" = ["D", "ARG", "TID252"]

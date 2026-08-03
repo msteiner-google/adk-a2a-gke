@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  labels:
+    app: orchestrator
+    app.kubernetes.io/component: orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      serviceAccountName: agent
+      containers:
+        - name: agent
+          # Placeholder image name; the overlay rewrites it to your Artifact
+          # Registry path via the kustomize `images:` transformer.
+          image: agent-image
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: agent-config
+          env:
+            - name: AGENT_NAME
+              value: orchestrator
+            # APP_URL is the base URL this agent advertises in its A2A agent
+            # card (the card's `url`, which peers use to reach its JSON-RPC
+            # endpoint at APP_URL + /a2a/app). Without it the card defaults to
+            # http://0.0.0.0:8000, which is unreachable from other pods. It MUST
+            # equal how peers address this Service, i.e.
+            # http://<service-name>.<A2A_NAMESPACE>.<A2A_CLUSTER_DOMAIN>.
+            - name: APP_URL
+              value: http://orchestrator.agents.svc.cluster.local
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  labels:
+    app: orchestrator
+spec:
+  # ClusterIP by default. To reach the orchestrator externally, switch to
+  # type: LoadBalancer or front it with an Ingress/Gateway. For a quick test:
+  #   kubectl -n agents port-forward svc/orchestrator 8080:80
+  type: ClusterIP
+  selector:
+    app: orchestrator
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

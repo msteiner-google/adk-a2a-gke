@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# All resources land in the `agents` namespace (matches A2A_NAMESPACE and the
+# Terraform Workload Identity binding).
+namespace: agents
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - orchestrator.yaml
+  - workers.yaml
+
+# Apply a shared label to all resources WITHOUT mutating (immutable) selectors.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: multi-agent-system

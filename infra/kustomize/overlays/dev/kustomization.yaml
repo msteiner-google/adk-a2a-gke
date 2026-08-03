@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# Point every Deployment at your built image. Replace with the value of
+# `terraform output artifact_registry_repo` plus your image name, e.g.
+#   REGION-docker.pkg.dev/PROJECT_ID/agents/agent
+images:
+  - name: agent-image
+    newName: REGION-docker.pkg.dev/PROJECT_ID/agents/agent
+    newTag: latest
+
+# Dev override: keep a single replica per agent.
+replicas:
+  - name: orchestrator
+    count: 1
+  - name: research
+    count: 1
+  - name: math
+    count: 1
