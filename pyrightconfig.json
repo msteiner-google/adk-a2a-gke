@@ -1,0 +1,146 @@
+// basedpyright configuration — the editor LSP type checker for this project.
+//
+// WHY THIS FILE EXISTS AND NOT A [tool.basedpyright] SECTION:
+// pyproject.toml is base-template-owned (see AGENTS.md "Ownership"), so an
+// `agents-cli scaffold upgrade` would clobber a section in there. A standalone
+// pyrightconfig.json takes precedence over [tool.basedpyright] anyway, and it
+// matches how ruff.toml / ty.toml already own their policy in this repo.
+//
+// RELATIONSHIP TO ty:
+// `agents-cli lint` still runs ty; that remains the gate. basedpyright is the
+// nvim LSP and a second opinion. The rule choices below mirror ty.toml's intent
+// (silence third-party/dynamic noise, keep real type errors) — deviations are
+// called out inline.
+//
+// BASELINE: typeCheckingMode "standard" (upstream pyright's default), NOT
+// basedpyright's default "recommended". "recommended" enables the based-only
+// Any-hunting rules, which produced 481 diagnostics here — ~85% of them
+// reportAny / reportUnknown* / reportUnusedCallResult against ADK, injector and
+// the a2a SDK, none of which are meaningfully typed. Those are muted below with
+// a reason each.
+{
+  "$schema": "https://raw.githubusercontent.com/DetachHead/basedpyright/main/packages/vscode-pyright/schemas/pyrightconfig.schema.json",
+
+  "include": ["app", "tests", "scripts"],
+  "exclude": [
+    ".venv",
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*_cache",
+    "frontend"
+  ],
+
+  // Resolve third-party types from the project venv, so nvim gets the same view
+  // as `uv run basedpyright` regardless of how the server is launched.
+  "venvPath": ".",
+  "venv": ".venv",
+
+  // Match ruff's target-version and ty's python-version: the requires-python
+  // FLOOR, not the runtime. Prod is 3.12 and the local venv is 3.13, but installs
+  // are permitted down to 3.11, so this makes basedpyright flag 3.12+ syntax
+  // (typing.override, PEP 695 type params) that would crash there. See AGENTS.md
+  // "Code style". Raise only when the base template raises its floor.
+  "pythonVersion": "3.11",
+
+  "typeCheckingMode": "standard",
+
+  // ---------------------------------------------------------------------------
+  // based-only rules: off. These have no upstream-pyright equivalent and no ty
+  // equivalent, and they all fire on untyped third-party surfaces rather than on
+  // anything wrong in this codebase.
+  // ---------------------------------------------------------------------------
+
+  // The Any-hunting family. ADK, injector and the a2a SDK return Any nearly
+  // everywhere; flagging each use reports their lack of stubs, not our bugs.
+  "reportAny": "none",
+  "reportExplicitAny": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownParameterType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownLambdaType": "none",
+  "reportMissingTypeArgument": "none",
+  "reportMissingTypeStubs": "none",
+
+  // Would require annotating every parameter in every test helper and callback.
+  // ruff does not ask for this and neither does ty.
+  "reportMissingParameterType": "none",
+  "reportUnannotatedClassAttribute": "none",
+
+  // Demands `_ = f()` for any call whose result is discarded. Wrong shape for a
+  // codebase full of register/configure/instrument side-effect calls.
+  "reportUnusedCallResult": "none",
+
+  // ruff owns unused code (F, ARG) and is the CI gate for it; double-reporting
+  // in the editor is just duplicate squiggles.
+  "reportUnusedParameter": "none",
+
+  // ruff's flake8-implicit-str-concat is not enabled and this is a formatting
+  // opinion, not a type error.
+  "reportImplicitStringConcatenation": "none",
+
+  // The repo uses typing_extensions.override where it matters; it is not a
+  // blanket requirement.
+  "reportImplicitOverride": "none",
+
+  // False positives on classes that are abstract only in a base's stub:
+  // ADK's LlmAgent (app/agents/base.py) and cloudpathlib's AnyPath
+  // (app/shared/artifacts.py) are both instantiated exactly as their libraries
+  // intend.
+  "reportEmptyAbstractUsage": "none",
+
+  // ---------------------------------------------------------------------------
+  // Deviations from ty.toml — deliberately STRICTER, because they produce zero
+  // noise here and catch real mistakes:
+  //   - ty sets unresolved-import = "ignore"; every import in this repo resolves
+  //     against the venv, so reportMissingImports stays at its "standard"
+  //     severity and will catch a genuinely misspelled module path.
+  //   - ty sets unresolved-attribute / possibly-missing-attribute = "ignore";
+  //     reportAttributeAccessIssue and reportOptionalMemberAccess stay on for
+  //     app/ and are relaxed only for tests/ below, where the hits are all
+  //     narrowing on a2a SDK response unions in assertions.
+  // ---------------------------------------------------------------------------
+
+  "executionEnvironments": [
+    {
+      // Base-template-owned serving/A2A plumbing (AGENTS.md "Ownership"): we
+      // must not hand-edit it, so reporting on it is unactionable. Mirrors
+      // ruff.toml's per-file-ignores for the same paths.
+      "root": "app/app_utils",
+      "reportAttributeAccessIssue": "none",
+      "reportUnusedFunction": "none",
+      "reportPrivateUsage": "none"
+    },
+    {
+      // Upstream shared library — real files here, but sourced from
+      // ../agentic-template/shared/ and clobbered by a scaffold upgrade, so
+      // local fixes do not survive. Keep type errors visible, drop the two
+      // categories that are upstream style choices.
+      "root": "app/shared",
+      // __all__ lists submodules that __init__.py never imports. Valid at
+      // runtime (`from pkg import *` imports submodules named in __all__) but
+      // unresolvable statically.
+      "reportUnsupportedDunderAll": "none",
+      "reportPrivateUsage": "none"
+    },
+    {
+      // Tests poke at internals and hand fakes to typed parameters on purpose.
+      // Mirrors ruff.toml exempting **/tests/** from D/ARG/TID252.
+      "root": "tests",
+      "reportPrivateUsage": "none",
+      "reportInvalidCast": "none",
+      "reportAttributeAccessIssue": "none",
+      "reportOptionalMemberAccess": "none",
+      "reportUnusedFunction": "none"
+    },
+    {
+      "root": "app/shared/tests",
+      "reportPrivateUsage": "none",
+      "reportInvalidCast": "none",
+      "reportAttributeAccessIssue": "none",
+      "reportOptionalMemberAccess": "none",
+      "reportUnusedFunction": "none",
+      "reportUnsupportedDunderAll": "none"
+    }
+  ]
+}

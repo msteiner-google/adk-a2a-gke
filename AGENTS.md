@@ -50,6 +50,13 @@ agents-cli lint        # ruff check + ruff format --check + codespell + ty check
 agents-cli lint --skip-ty
 ```
 
+```bash
+# basedpyright — the editor LSP type checker, and a second opinion to ty.
+# Clean (0 diagnostics) as of the last update to this file. NOT part of
+# `agents-cli lint`; ty remains the gate.
+uv run basedpyright
+```
+
 Other commands (require a server / GCP creds, not part of the fast loop):
 
 | Command | Purpose |
@@ -316,6 +323,22 @@ over the `[tool.ruff]` / `[tool.ty]` sections in `pyproject.toml` (`ty` prints a
 warning saying so — that is expected, not a problem). They are stricter than the
 scaffolder defaults.
 
+`pyrightconfig.json` follows the same pattern for **basedpyright** (the nvim LSP;
+it also beats any `[tool.basedpyright]` section). Three things to know:
+
+- It sets `typeCheckingMode = "standard"`, **not** basedpyright's default
+  `"recommended"`. `"recommended"` turns on the based-only Any-hunting rules
+  (`reportAny`, `reportUnknown*`, `reportUnusedCallResult`,
+  `reportImplicitStringConcatenation`) which produced **481 diagnostics**, ~85%
+  of them against ADK / injector / a2a-SDK surfaces that simply are not typed.
+  Each mute in the file carries its reason — read those before re-enabling one.
+- It is **stricter than ty in two places**, on purpose: imports and attribute
+  access stay checked in `app/` (ty ignores `unresolved-import` and
+  `unresolved-attribute` globally) because they produce zero noise here.
+- Per-directory relaxations live in `executionEnvironments`, mirroring
+  `ruff.toml`'s per-file-ignores: `app/app_utils` and `app/shared` (not ours to
+  fix) and `tests` (fakes cast to real types, internals poked deliberately).
+
 - **Line length 88.** `target-version = "py311"` / ty `python-version = "3.11"`
   — the *floor*, not the runtime (prod is 3.12). So **no 3.12+ syntax**: use
   `typing_extensions.override`, not `typing.override`; no PEP 695 type params.
@@ -543,8 +566,14 @@ Install the CLI (one-time): `uv tool install google-agents-cli`
 | --- | --- | --- |
 | Base template | `Dockerfile`, `deployment/`, `pyproject.toml`, `app/app_utils/**` | Don't hand-edit; a scaffold upgrade will overwrite |
 | Upstream shared lib | `app/shared/**` | Real files here, but sourced from `../agentic-template/shared/`. Edits are **local-only and will be clobbered by `agents-cli scaffold upgrade`.** Put project-specific logic in `app/`, not here. |
-| The gke variant | `app/agents/**`, `app/cluster/**`, `app/migrations/**`, `infra/**`, `GKE.md`, `ruff.toml`, `ty.toml` | Yours to change |
+| The gke variant | `app/agents/**`, `app/cluster/**`, `app/migrations/**`, `infra/**`, `GKE.md`, `ruff.toml`, `ty.toml`, `pyrightconfig.json` | Yours to change |
 | Deliberate overlay | `app/fast_api_app.py` | Yours, despite looking like base infra — see gotchas |
+
+**One deliberate exception to the base-template rule:** `basedpyright` was added
+to the `lint` extra in `pyproject.toml`, because that is where the other linters
+live and it must be installed for the nvim LSP to start. It is the *only* local
+edit to that file. If `agents-cli scaffold upgrade` drops it, re-add it —
+`pyrightconfig.json` itself survives, so only the dependency line is at risk.
 
 Upstream template: `../agentic-template` (variant `variants/gke`). Its own
 `AGENTS.md` is about authoring the template and mostly does **not** apply here.

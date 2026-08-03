@@ -48,6 +48,12 @@ lint = [
     "ruff>=0.4.6,<1.0.0",
     "ty>=0.0.1a0",
     "codespell>=2.2.0,<3.0.0",
+    # Editor LSP (nvim) + a second opinion alongside ty. NOT run by
+    # `agents-cli lint`. Policy lives in the root pyrightconfig.json, which
+    # takes precedence over any [tool.basedpyright] section here.
+    # NOTE: this file is base-template-owned; if `agents-cli scaffold upgrade`
+    # drops this entry, re-add it (pyrightconfig.json will survive).
+    "basedpyright>=1.31",
 ]
 
 [tool.ruff]
