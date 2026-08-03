@@ -46,6 +46,7 @@ bnpp-gke/
 │   │   ├── resolver.py         #   peers -> RemoteA2aAgent (agent-card discovery)
 │   │   ├── di.py               #   injector modules
 │   │   ├── session.py          #   pluggable session + memory backends
+│   │   ├── artifacts.py        #   blob-store-agnostic artifact storage (cloudpathlib)
 │   │   ├── tasks.py            #   pluggable A2A task store
 │   │   ├── db.py               #   the one AsyncEngine per pod (AlloyDB, IAM auth)
 │   │   └── bootstrap.py        #   creates the database (no Terraform resource exists)
@@ -53,7 +54,8 @@ bnpp-gke/
 │   ├── shared/                 # Shared library (models, observability, secrets)
 │   └── app_utils/              # Base-template serving/A2A helpers
 ├── infra/
-│   ├── terraform/              # GKE Autopilot, per-agent Workload Identity, AlloyDB
+│   ├── terraform/              # GKE Autopilot, per-agent Workload Identity, AlloyDB,
+│   │                           #   artifact bucket
 │   └── kustomize/              # Namespace, ServiceAccounts, ConfigMap, NetworkPolicy,
 │                               #   migration Job, Deployments
 ├── deployment/                 # Base-template single-service CI/CD Terraform

@@ -113,6 +113,56 @@ variable "agent_iam_roles" {
   ]
 }
 
+# --- Artifact storage ---------------------------------------------------------
+
+variable "enable_artifact_storage" {
+  description = <<-EOT
+    Create the GCS bucket agents store artifacts in (see artifacts.tf).
+
+    Set false to skip it — e.g. when pointing ARTIFACT_STORAGE_URI at an
+    existing bucket, at S3/Azure (cloudpathlib speaks both), or when running
+    with the in-memory default. Leaving ARTIFACT_STORAGE_URI unset in the
+    ConfigMap is what actually makes the agents ignore the bucket.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "artifact_bucket_name" {
+  description = <<-EOT
+    Name of the artifact bucket. GCS names are globally unique, so this defaults
+    to "<project_id>-agent-artifacts" when null.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "artifact_storage_prefix" {
+  description = <<-EOT
+    Object prefix under the bucket that holds the artifact tree, giving
+    ARTIFACT_STORAGE_URI = "gs://<bucket>/<prefix>". Keeps artifacts from
+    colliding with anything else stored in the same bucket.
+  EOT
+  type        = string
+  default     = "artifacts"
+}
+
+variable "artifact_retention_days" {
+  description = <<-EOT
+    Delete artifact objects older than this many days. Artifacts are
+    conversation-scoped working data, so an unbounded bucket is usually not what
+    you want; null disables the lifecycle rule.
+  EOT
+  type        = number
+  default     = 30
+}
+
+variable "artifact_bucket_force_destroy" {
+  description = "Allow `terraform destroy` to delete the artifact bucket while it still holds objects."
+  type        = bool
+  default     = false
+}
+
 # --- AlloyDB -----------------------------------------------------------------
 
 variable "network" {

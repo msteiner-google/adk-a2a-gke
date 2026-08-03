@@ -29,6 +29,7 @@ Kubernetes Service and reached over the **A2A** protocol.
 | Agent-to-agent communication | `app/cluster/resolver.py` builds `RemoteA2aAgent`s from peer agent cards |
 | Context sharing & propagation | `remember`/`recall` tools write session state that travels across A2A hops — `app/agents/common.py` |
 | Session & memory persistence | Pluggable, env-selectable backends — `app/cluster/session.py` + `SessionModule` |
+| Artifact (blob) storage | Blob-store-agnostic via `cloudpathlib` — `app/cluster/artifacts.py` + `app/shared/artifacts.py` |
 | Cloud-native reference architecture | `infra/terraform` (GKE Autopilot + WI + Artifact Registry) and `infra/kustomize` |
 | ADK / DI best practices | `injector` modules (`ModelModule`, `ClusterModule`, `SessionModule`) resolved in `app/agent.py` |
 | Observability across the MAS | Trace context propagates over A2A (httpx inject + `instrument_fastapi_app` extract) → one Cloud Trace per request; trace-correlated loguru logs — see "Observability" below |
@@ -117,6 +118,43 @@ classes; the backend is a deployment concern (`app/cluster/session.py`):
 In-memory keeps local runs and tests hermetic. For a real cluster choose a
 durable backend so state survives pod restarts and is shared across replicas —
 the deployed values live in `infra/kustomize/base/configmap.yaml`.
+
+## Artifact storage (blobs)
+
+Session state answers "what was said"; an **artifact** is the file that came out
+of it — a generated report, a fetched page, an image — kept out of the
+conversation history and referenced by filename and version.
+
+The service is `CloudPathArtifactService` (`app/shared/artifacts.py`): an ADK
+`BaseArtifactService` implemented on `cloudpathlib`, so the storage backend is a
+URI scheme rather than a code path. `app/cluster/artifacts.py` selects it and
+`SessionModule` provides it, the same way the session service is wired.
+
+| Env | Default | Effect |
+| --- | --- | --- |
+| `ARTIFACT_STORAGE_URI` | *(unset)* | Unset → `InMemoryArtifactService` (per-pod, ephemeral). Set → `CloudPathArtifactService` at that location: `gs://bucket/prefix`, `s3://bucket/prefix`, `az://container/prefix`, or a local path. |
+
+There is no separate `ARTIFACT_BACKEND` switch: the scheme already names the
+backend, so a second selector could only contradict it. Credentials follow each
+provider's normal discovery — in the cluster that is ADC via Workload Identity,
+with no key material anywhere.
+
+**Every agent shares one artifact namespace, on purpose.** Artifacts are keyed by
+`{app_name}/{user_id}/{session_id}/{filename}/{version}`, and `app_name` is the
+ADK `App` name (`"app"`) for every agent — not `AGENT_NAME`. Pointing all agents
+at the same URI is therefore what lets `research` save a document that the
+orchestrator loads back on the same session: the artifact counterpart of the
+`shared:` session state written by `remember`/`recall`. This deliberately does
+*not* mirror the schema-per-agent split used for AlloyDB; the trade-off is that
+bucket-level IAM lets any agent read any artifact, which
+`infra/terraform/artifacts.tf` documents along with how to tighten it.
+
+The bucket is provisioned by `infra/terraform/artifacts.tf` (uniform bucket-level
+access, public access prevention, a 30-day lifecycle rule by default, and
+`roles/storage.objectUser` for each agent's GSA on that bucket only). Take the
+value for the ConfigMap from `terraform output artifact_storage_uri`. Leaving
+`ARTIFACT_STORAGE_URI` out of the ConfigMap is what keeps the old per-pod
+in-memory behaviour.
 
 ## Durable storage on AlloyDB
 

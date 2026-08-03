@@ -12,9 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# GKE variant: this file overlays the base template's app/fast_api_app.py. The
-# ONLY difference from the base is the single `instrument_fastapi_app(app)` call
-# after the app is built. That gives the serving app standard OpenTelemetry
+# GKE variant: this file overlays the base template's app/fast_api_app.py. It
+# differs from the base in exactly three places, all deliberate:
+#
+#   1. `instrument_fastapi_app(app)` after the app is built (see below).
+#   2. The Runner is built with the injector's session service instead of
+#      services.get_session_service() (see the note at the call site).
+#   3. The Runner is built with the injector's artifact service instead of
+#      services.get_artifact_service(), and `shared://artifact` is re-registered
+#      to the same instance when a storage URI is configured.
+#
+# On (1): that call gives the serving app standard OpenTelemetry
 # FastAPI instrumentation, which EXTRACTS the W3C `traceparent` header from
 # inbound A2A requests so each agent continues the caller's trace instead of
 # starting a new one. Combined with the httpx client instrumentation set up in
@@ -31,6 +39,7 @@ from typing import Any
 import google.auth
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from google.adk.artifacts.base_artifact_service import BaseArtifactService
 from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.cli.service_registry import get_service_registry
 from google.adk.runners import Runner
@@ -40,6 +49,7 @@ from google.cloud import logging as google_cloud_logging
 from app.app_utils import services
 from app.app_utils.a2a import attach_a2a_routes
 from app.app_utils.typing import Feedback
+from app.cluster.artifacts import ARTIFACT_STORAGE_URI_ENV
 from app.cluster.db import get_database
 from app.shared.telemetry import instrument_fastapi_app
 
@@ -76,10 +86,37 @@ if get_database().enabled:
     get_service_registry().register_session_service("shared", _shared_session_service)
 
 
+# Same treatment for artifacts: when a storage location is configured, override
+# the base template's "shared://artifact" registration so the ADK web routes
+# (upload/download) hit the SAME cloudpathlib-backed service the Runner and the
+# A2A path use, instead of services.get_artifact_service() -- which only knows
+# about a GCS bucket in LOGS_BUCKET_NAME and otherwise silently hands back a
+# per-pod in-memory store.
+#
+# Conditional for the same reason as above: with ARTIFACT_STORAGE_URI unset (the
+# default, and every test run) the base registration is left untouched.
+if os.environ.get(ARTIFACT_STORAGE_URI_ENV, "").strip():
+
+    def _shared_artifact_service(uri: str, **kwargs: Any) -> BaseArtifactService:
+        """Resolve `shared://artifact` to the injector's artifact service."""
+        del uri, kwargs  # The scheme carries no configuration of its own.
+        from app.agent import artifact_service
+
+        return artifact_service
+
+    get_service_registry().register_artifact_service("shared", _shared_artifact_service)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.agent import app as adk_app
-    from app.agent import database, root_agent, session_service, task_store
+    from app.agent import (
+        artifact_service,
+        database,
+        root_agent,
+        session_service,
+        task_store,
+    )
 
     runner = Runner(
         app=adk_app,
@@ -88,7 +125,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # DSN, and the AlloyDB path authenticates per connection with IAM. When
         # no database is configured both resolve to the same in-memory service.
         session_service=session_service,
-        artifact_service=services.get_artifact_service(),
+        # Likewise the injector's artifact service rather than
+        # services.get_artifact_service(): the cloudpathlib-backed store follows
+        # ARTIFACT_STORAGE_URI (gs:// / s3:// / az:// / local path), while that
+        # helper only understands a GCS bucket in LOGS_BUCKET_NAME. With no URI
+        # configured both resolve to an in-memory service.
+        artifact_service=artifact_service,
         auto_create_session=True,
     )
     app.state.runner = runner

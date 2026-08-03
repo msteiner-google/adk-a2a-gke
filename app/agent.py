@@ -17,7 +17,7 @@ Dependency injection ties everything together (see ``app/cluster/di.py``):
 - the shared ``ModelModule`` provides the Gemini model tiers,
 - ``ClusterModule`` provides the config + the ``AgentResolver`` (the resolver
   that connects this agent to the others in the cluster), and
-- ``SessionModule`` provides the pluggable session/memory services.
+- ``SessionModule`` provides the pluggable session/memory/artifact services.
 
 Keep the ``app`` object exported — the base serving/deployment layer imports it,
 and ``App(name=...)`` must equal the agent directory (``app``).
@@ -27,6 +27,7 @@ import os
 
 from a2a.server.tasks import TaskStore
 from google.adk.apps import App
+from google.adk.artifacts.base_artifact_service import BaseArtifactService
 from google.adk.memory import BaseMemoryService
 from google.adk.sessions import BaseSessionService
 from injector import Injector
@@ -55,9 +56,10 @@ _injector = Injector([ModelModule(), ClusterModule(), SessionModule()])
 models = _injector.get(Models)
 resolver = _injector.get(AgentResolver)
 
-# Pluggable session + memory services and the A2A task store (in-memory by
-# default; durable backends via SESSION_BACKEND / MEMORY_BACKEND /
-# TASK_STORE_BACKEND). Resolved here so misconfiguration fails fast at startup.
+# Pluggable session, memory and artifact services plus the A2A task store
+# (in-memory by default; durable backends via SESSION_BACKEND / MEMORY_BACKEND /
+# ARTIFACT_STORAGE_URI / TASK_STORE_BACKEND). Resolved here so misconfiguration
+# fails fast at startup.
 #
 # These are the instances the serving layer actually uses: app/fast_api_app.py
 # imports them for the Runner and the A2A routes. Do not let a refactor reduce
@@ -65,6 +67,10 @@ resolver = _injector.get(AgentResolver)
 # quietly run on per-pod in-memory state while this module reports otherwise.
 session_service = _injector.get(BaseSessionService)
 memory_service = _injector.get(BaseMemoryService)
+# Blob-store-agnostic artifact storage (app/cluster/artifacts.py ->
+# app/shared/artifacts.py). Shared by every agent so a file saved by a worker is
+# loadable by the orchestrator on the same session.
+artifact_service = _injector.get(BaseArtifactService)
 task_store = _injector.get(TaskStore)
 
 # The shared engine holder, exported so the serving layer can dispose of the

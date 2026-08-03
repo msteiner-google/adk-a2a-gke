@@ -70,6 +70,26 @@ data:
   # actually needs to survive a restart -- is durable via SESSION_BACKEND.
   MEMORY_BACKEND: "in_memory"
 
+  # --- Artifact storage --------------------------------------------------------
+  #
+  # Where ADK artifacts (blobs an agent produces or consumes: reports, fetched
+  # pages, images) are stored. app/cluster/artifacts.py binds
+  # app/shared/artifacts.py's cloudpathlib-backed service to this URI, so the
+  # scheme picks the backend -- gs://, s3://, az://, or a plain path -- with no
+  # image change. Leave it UNSET to keep the previous behaviour: a per-pod
+  # in-memory store that loses every artifact on restart.
+  #
+  # Deliberately the SAME value for every agent: artifacts are keyed by the ADK
+  # App name ("app" for all of them), the user and the session -- not by
+  # AGENT_NAME -- so one location is what lets a worker save a file the
+  # orchestrator can load back on the same session. That is the artifact
+  # counterpart of the `shared:` session state in app/agents/common.py.
+  #
+  # Fill from `terraform output artifact_storage_uri`. The pods authenticate to
+  # GCS with their Workload Identity service account; infra/terraform/artifacts.tf
+  # grants each agent roles/storage.objectUser on this bucket only.
+  ARTIFACT_STORAGE_URI: "gs://msteiner-agent-artifacts/artifacts"
+
   # A2A task store (see app/cluster/tasks.py). This matters for more than
   # durability: with the in-memory store a task created by one pod is invisible
   # to another, so tasks/get and tasks/resubscribe break as soon as an agent has

@@ -7,10 +7,11 @@ Two :mod:`injector` modules, installed alongside the shared ``ModelModule``:
   layer that turns configured peers into ``RemoteA2aAgent`` children. This is the
   "resolver so an agent can connect to the other agents in the cluster."
 - :class:`SessionModule` provides the pluggable ``BaseSessionService``,
-  ``BaseMemoryService``, and A2A ``TaskStore`` (in-memory by default, durable
-  backends via env — see ``app/cluster/session.py``, ``app/cluster/tasks.py``),
-  reusing the injected GCP project/location from the shared module for the
-  managed Vertex AI backends. It also provides the shared
+  ``BaseMemoryService``, ``BaseArtifactService``, and A2A ``TaskStore``
+  (in-memory by default, durable backends via env — see
+  ``app/cluster/session.py``, ``app/cluster/artifacts.py``,
+  ``app/cluster/tasks.py``), reusing the injected GCP project/location from the
+  shared module for the managed Vertex AI backends. It also provides the shared
   :class:`~app.cluster.db.Database`, so the session store and the task store
   hand out one connection pool between them rather than one each.
 
@@ -34,11 +35,13 @@ from __future__ import annotations
 import os
 
 from a2a.server.tasks import TaskStore
+from google.adk.artifacts.base_artifact_service import BaseArtifactService
 from google.adk.memory import BaseMemoryService
 from google.adk.sessions import BaseSessionService
 from injector import Module, provider, singleton
 
 from app.agents import AGENTS, DEFAULT_AGENT
+from app.cluster.artifacts import build_artifact_service
 from app.cluster.config import AGENT_NAME_ENV, ClusterConfig
 from app.cluster.db import Database, get_database
 from app.cluster.resolver import AgentResolver
@@ -83,7 +86,7 @@ class ClusterModule(Module):
 
 
 class SessionModule(Module):
-    """Provides the pluggable session, memory, and A2A task services."""
+    """Provides the pluggable session, memory, artifact, and A2A task services."""
 
     @singleton
     @provider
@@ -152,3 +155,19 @@ class SessionModule(Module):
             The configured :class:`BaseMemoryService`.
         """
         return build_memory_service(project=project, location=location)
+
+    @singleton
+    @provider
+    def provide_artifact_service(self) -> BaseArtifactService:
+        """Provide the (singleton) artifact service selected by env.
+
+        Backed by ``cloudpathlib`` when ``ARTIFACT_STORAGE_URI`` is set, so the
+        blob store is a deployment choice (``gs://``, ``s3://``, ``az://``, or a
+        local path); in-memory otherwise. No project/location is injected: the
+        URI carries the location and the backend authenticates with its own
+        credential discovery (ADC for GCS, under Workload Identity here).
+
+        Returns:
+            The configured :class:`BaseArtifactService`.
+        """
+        return build_artifact_service()

@@ -55,6 +55,16 @@ output "alloydb_database" {
   value       = var.alloydb_database
 }
 
+output "artifact_storage_uri" {
+  description = "ARTIFACT_STORAGE_URI for the agent ConfigMap: where app/shared/artifacts.py's cloudpathlib-backed service stores artifacts. Null when var.enable_artifact_storage is false."
+  value       = var.enable_artifact_storage ? local.artifact_storage_uri : null
+}
+
+output "artifact_bucket_name" {
+  description = "Name of the GCS bucket holding agent artifacts."
+  value       = var.enable_artifact_storage ? google_storage_bucket.artifacts[0].name : null
+}
+
 output "kustomize_values" {
   description = "Everything the kustomize manifests need after an apply. Fill these into infra/kustomize/base/configmap.yaml, serviceaccounts.yaml and migrate-job.yaml."
   value = {
@@ -64,6 +74,7 @@ output "kustomize_values" {
       DB_BACKEND           = "alloydb"
       SESSION_BACKEND      = "alloydb"
       TASK_STORE_BACKEND   = "database"
+      ARTIFACT_STORAGE_URI = var.enable_artifact_storage ? local.artifact_storage_uri : null
     }
     service_account_annotations = merge(
       { for name, sa in google_service_account.agents : "${var.service_account_prefix}-${name}" => sa.email },

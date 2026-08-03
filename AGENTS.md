@@ -83,8 +83,9 @@ Read the module docstrings; they are thorough. This is the index.
 | `app/agents/math/agent.py` + `tools.py` | Leaf agent, `tier="fast"`, tool `calculate` (AST-based, rejects non-arithmetic). |
 | `app/cluster/config.py` | **Pure stdlib** (no ADK/genai imports). `PeerSpec`, `ClusterConfig.from_env()`, `service_dns_url()`. Parses `AGENT_NAME` / `A2A_*`. |
 | `app/cluster/resolver.py` | `AgentResolver` — turns peers into `RemoteA2aAgent`s pointed at their well-known agent cards. No network I/O at construction (ADK resolves cards lazily). |
-| `app/cluster/di.py` | `ClusterModule` (config + resolver) and `SessionModule` (`Database`, session + memory services, A2A `TaskStore`). |
+| `app/cluster/di.py` | `ClusterModule` (config + resolver) and `SessionModule` (`Database`, session + memory + artifact services, A2A `TaskStore`). |
 | `app/cluster/session.py` | `build_session_service()` / `build_memory_service()` — backend selected by env. |
+| `app/cluster/artifacts.py` | `build_artifact_service()` — the shared `CloudPathArtifactService` when `ARTIFACT_STORAGE_URI` is set, else in-memory. Same URI for every agent on purpose (artifacts are keyed by the ADK app name `app`, not `AGENT_NAME`). |
 | `app/cluster/db.py` | `DatabaseConfig` + `Database`: the one `AsyncEngine` per pod. AlloyDB via the connector (IAM auth) or a plain DSN. `get_database()` is the process-wide singleton so every consumer shares one pool. |
 | `app/cluster/tasks.py` | `build_task_store()` — A2A `TaskStore`: in-memory, or the a2a SDK's `DatabaseTaskStore` on the shared engine. |
 | `app/cluster/bootstrap.py` | `python -m app.cluster.bootstrap` — creates the database. Exists because the Terraform provider has no `google_alloydb_database` resource. |
@@ -111,8 +112,11 @@ Read the module docstrings; they are thorough. This is the index.
 ### Tests — `tests/`
 
 - `tests/unit/` — `test_agents.py`, `test_cluster_config.py`, `test_cluster_resolver.py`,
-  `test_cluster_session.py`, `test_cluster_db.py`, `test_cluster_tasks.py`,
-  `test_migrations.py`, `test_a2a_tracing.py`, `test_dummy.py`. Hermetic.
+  `test_cluster_session.py`, `test_cluster_artifacts.py`, `test_cluster_db.py`,
+  `test_cluster_tasks.py`, `test_migrations.py`, `test_a2a_tracing.py`,
+  `test_dummy.py`. Hermetic. `test_cluster_artifacts.py` exercises the
+  cloudpathlib service against a `tmp_path` (a non-URI path yields a local
+  `pathlib.Path`), so no bucket or credentials are involved.
   `test_migrations.py` renders the Alembic migrations **offline** (no database)
   and diffs them against ADK's and the a2a SDK's own metadata — it is the guard
   that catches a library adding a column.
@@ -132,6 +136,7 @@ don't merge them.
 | --- | --- |
 | `infra/terraform/main.tf` | GKE Autopilot cluster, Artifact Registry, APIs, **one GSA per agent** + a migrator GSA, IAM roles, Workload Identity bindings. |
 | `infra/terraform/alloydb.tf` | AlloyDB cluster + instance (`c4a-highmem-1`, 1 vCPU / 8 GB), private-services-access peering, IAM database users. |
+| `infra/terraform/artifacts.tf` | GCS bucket for ADK artifacts (uniform access, public-access prevention, 30-day lifecycle) + `roles/storage.objectUser` per agent GSA on that bucket. One shared bucket by design — see the header comment. |
 | `infra/kustomize/base/` | `namespace.yaml`, `serviceaccounts.yaml`, `configmap.yaml`, `networkpolicy.yaml`, `migrate-job.yaml`, `orchestrator.yaml`, `workers.yaml`. |
 | `infra/kustomize/overlays/dev/` | Image name/tag overlay. |
 | `deployment/terraform/single-project/` | Base-template CI/CD Terraform (Cloud Run-shaped). |
@@ -140,13 +145,15 @@ don't merge them.
 Key vars in `variables.tf`: `project_id` (required), `region` (default
 `us-central1`), `agents` (default `["orchestrator","research","math"]` — must
 match `app/agents/`), `service_account_prefix` (`agent`), `alloydb_machine_type`
-(`c4a-highmem-1`), `alloydb_database` (`agents`).
+(`c4a-highmem-1`), `alloydb_database` (`agents`), `artifact_bucket_name`
+(default `<project_id>-agent-artifacts`), `artifact_retention_days` (30).
 
 **Placeholders to fill before `kubectl apply`** (all from
 `terraform output -json kustomize_values`):
 1. `infra/kustomize/base/serviceaccounts.yaml` → the
    `iam.gke.io/gcp-service-account` annotation on each of the 4 ServiceAccounts.
-2. `infra/kustomize/base/configmap.yaml` → `ALLOYDB_INSTANCE_URI`.
+2. `infra/kustomize/base/configmap.yaml` → `ALLOYDB_INSTANCE_URI`,
+   `ARTIFACT_STORAGE_URI`.
 3. `orchestrator.yaml` / `workers.yaml` → `ALLOYDB_IAM_USER` per agent.
 4. `migrate-job.yaml` → `ALLOYDB_IAM_USER`, `AGENT_ROLE_SUFFIX`, `MIGRATE_AGENTS`.
 5. `infra/kustomize/overlays/dev/kustomization.yaml` → image `newName`.
@@ -224,13 +231,16 @@ These are real traps that have bitten this codebase.
   from other pods. The kustomize Deployments set it per role; set it too for
   local two-process runs.
 
-- **`app/fast_api_app.py` is an intentional overlay.** Its only delta from the
-  base template is `instrument_fastapi_app(app)` at line 93, which extracts the
-  W3C `traceparent` from inbound A2A requests. ADK's built-in propagation
-  middleware only reads Google-Agent-Engine headers. Without this call, each pod
-  starts a fresh trace instead of continuing the caller's. **Do not let a
-  scaffold upgrade or a "restore base file" clobber it** — `tests/unit/test_a2a_tracing.py`
-  guards this.
+- **`app/fast_api_app.py` is an intentional overlay**, with exactly three
+  deltas from the base template (listed in its module header): the
+  `instrument_fastapi_app(app)` call, and the Runner taking the injector's
+  *session* and *artifact* services instead of `app/app_utils/services.py`'s.
+  `instrument_fastapi_app` extracts the W3C `traceparent` from inbound A2A
+  requests; ADK's built-in propagation middleware only reads
+  Google-Agent-Engine headers, so without it each pod starts a fresh trace
+  instead of continuing the caller's. **Do not let a scaffold upgrade or a
+  "restore base file" clobber any of the three** — `tests/unit/test_a2a_tracing.py`
+  guards the tracing one.
 
 - **`RemoteA2aAgent` is experimental** and emits a `UserWarning` on every
   construction. Expected noise in test output.
@@ -250,6 +260,14 @@ These are real traps that have bitten this codebase.
   `services.get_session_service()`** — that helper only understands a plain DSN,
   so agents would silently run on per-pod in-memory state while
   `SESSION_BACKEND=alloydb` suggests otherwise.
+
+- **The same trap applies to artifacts.** `app/app_utils/services.py` registers
+  `shared://artifact` → `get_artifact_service()`, which only knows about a GCS
+  bucket in `LOGS_BUCKET_NAME` and otherwise hands back a per-pod in-memory
+  store. The Runner takes the injector's `CloudPathArtifactService` instead, and
+  `fast_api_app.py` re-registers the `shared` artifact scheme when
+  `ARTIFACT_STORAGE_URI` is set so the ADK web upload/download routes hit the
+  same instance.
 
 - **Alembic lives under `app/migrations/`, not the repo root.** The
   base-template-owned `Dockerfile` copies only `./app`; putting migrations
@@ -354,6 +372,12 @@ scaffolder defaults.
 | `SESSION_BACKEND` | `in_memory` | `alloydb` (shared engine), `database` (+`SESSION_DB_URL`), `vertex_ai` (+`AGENT_ENGINE_ID`) |
 | `MEMORY_BACKEND` | `in_memory` | `vertex_ai` (+`AGENT_ENGINE_ID`) |
 | `TASK_STORE_BACKEND` | `in_memory` | `database` (shared engine). In-memory is per-pod, so `tasks/get` breaks past 1 replica. |
+
+### Artifacts (`app/cluster/artifacts.py`)
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `ARTIFACT_STORAGE_URI` | *(unset → in-memory)* | Base path for `CloudPathArtifactService`: `gs://bucket/prefix`, `s3://…`, `az://…`, or a local dir. No `ARTIFACT_BACKEND` switch — the scheme *is* the backend. Set the **same** value for every agent. |
 
 ### Database (`app/cluster/db.py`)
 

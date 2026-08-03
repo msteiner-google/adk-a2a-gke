@@ -79,9 +79,10 @@ Everything you must change. Nothing else in the repo hardcodes a project.
 | 5 | `infra/kustomize/base/configmap.yaml` | `ALLOYDB_INSTANCE_URI` | `projects/msteiner/locations/europe-west4/...` |
 | 6 | `orchestrator.yaml`, `workers.yaml` | `ALLOYDB_IAM_USER` per agent | `agent-<name>@msteiner.iam` |
 | 7 | `infra/kustomize/base/migrate-job.yaml` | `ALLOYDB_IAM_USER`, `AGENT_ROLE_SUFFIX` | `agent-migrator@msteiner.iam`, `msteiner.iam` |
-| 8 | `.env` (local dev only) | `GOOGLE_CLOUD_PROJECT` | `msteiner-kubeflow` |
+| 8 | `infra/kustomize/base/configmap.yaml` | `ARTIFACT_STORAGE_URI` | `gs://msteiner-agent-artifacts/artifacts` |
+| 9 | `.env` (local dev only) | `GOOGLE_CLOUD_PROJECT` | `msteiner-kubeflow` |
 
-Items 2 and 5–7 all come from one command: `tofu output -json kustomize_values`.
+Items 2 and 5–8 all come from one command: `tofu output -json kustomize_values`.
 
 Items 2–4 are all derivable from Terraform outputs after `apply` — see step 4.
 
@@ -203,7 +204,7 @@ tofu output -raw artifact_registry_repo   # <region>-docker.pkg.dev/<project>/ag
 tofu output -json kustomize_values        # every manifest placeholder
 ```
 
-Apply them to items 2-7 from the table:
+Apply them to items 2-8 from the table:
 
 - `infra/kustomize/base/serviceaccounts.yaml` → the
   `iam.gke.io/gcp-service-account` annotation on each ServiceAccount, from
@@ -211,8 +212,9 @@ Apply them to items 2-7 from the table:
 - `infra/kustomize/overlays/dev/kustomization.yaml` →
   `newName: <artifact_registry_repo>/agent`
 - `infra/kustomize/base/configmap.yaml` →
-  `OTEL_RESOURCE_ATTRIBUTES: "gcp.project_id=<project>"` and
-  `ALLOYDB_INSTANCE_URI` from `.configmap`
+  `OTEL_RESOURCE_ATTRIBUTES: "gcp.project_id=<project>"`, and
+  `ALLOYDB_INSTANCE_URI` + `ARTIFACT_STORAGE_URI` from `.configmap`
+  (the artifact bucket name is project-scoped, so it changes with the project)
 - `orchestrator.yaml` / `workers.yaml` / `migrate-job.yaml` →
   `ALLOYDB_IAM_USER`, from `.agent_iam_users`
 
@@ -382,6 +384,7 @@ hyphens, no underscores. See "Add an agent" in [`../AGENTS.md`](../AGENTS.md).
 [ ] configmap.yaml OTEL_RESOURCE_ATTRIBUTES updated(item 4)
 [ ] configmap.yaml ALLOYDB_INSTANCE_URI updated    (item 5)
 [ ] ALLOYDB_IAM_USER set per agent + migrate-job   (items 6-7)
+[ ] configmap.yaml ARTIFACT_STORAGE_URI updated    (item 8)
 [ ] kubectl kustomize shows no PROJECT_ID/REGION placeholders
 [ ] Image built --platform linux/amd64, verified, pushed
 [ ] job/agent-migrate completed BEFORE judging the agents

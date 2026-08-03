@@ -54,6 +54,7 @@ locals {
     "monitoring.googleapis.com",
     "cloudtrace.googleapis.com",
     "telemetry.googleapis.com",         # Telemetry (OTLP) API: ADK/shared trace export
+    "storage.googleapis.com",           # GCS: the artifact bucket (see artifacts.tf)
     "alloydb.googleapis.com",           # AlloyDB cluster + instance
     "servicenetworking.googleapis.com", # Private services access peering for AlloyDB
   ]
