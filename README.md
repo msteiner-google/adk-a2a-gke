@@ -166,7 +166,12 @@ agent name for peer discovery to resolve.
 
 This project deploys as a **multi-agent cluster** via `infra/` (Terraform +
 Kustomize), not via `agents-cli deploy`. See **[GKE.md](GKE.md)** for the full
-walkthrough; the short version:
+walkthrough, and
+**[docs/deploy-to-another-project.md](docs/deploy-to-another-project.md)** to
+stand this repo up in a *different* Google Cloud project (prerequisites, the
+project-specific values to change, verification, teardown, troubleshooting).
+
+The short version:
 
 ```bash
 # 1. Provision the cluster, Workload Identity, and Artifact Registry
@@ -191,12 +196,15 @@ kubectl -n agents port-forward svc/orchestrator 8080:80
 > Autopilot nodes these manifests target are amd64, and an arm64 image fails
 > there with `exec format error`.
 
-The two placeholders to fill before step 3:
+The project-specific values to fill before step 3:
 
 - `infra/kustomize/base/serviceaccount.yaml` → the GSA email
   (`terraform output google_service_account_email`)
 - `infra/kustomize/overlays/dev/kustomization.yaml` → the image repo
   (`terraform output artifact_registry_repo`)
+- `infra/kustomize/base/configmap.yaml` → `OTEL_RESOURCE_ATTRIBUTES:
+  "gcp.project_id=<project>"`. Not cosmetic: Cloud Trace rejects every span
+  batch whose resource lacks it, so tracing fails silently if it's stale.
 
 ## Observability
 
