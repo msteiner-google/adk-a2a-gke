@@ -247,7 +247,7 @@ podman push "$REPO/agent:latest"
 are amd64 and nothing in these manifests requests arm64. A native arm64 build
 pushes fine and then fails at runtime with `exec format error`, which reads like
 an application bug rather than a build one. The cross-build works (the
-`python:3.12-slim` base is multi-arch); it's just slower under emulation.
+`python:3.14-slim` base is multi-arch); it's just slower under emulation.
 
 Confirm before pushing:
 

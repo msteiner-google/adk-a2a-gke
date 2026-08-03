@@ -36,7 +36,7 @@ code path.
 All of these were run in this repo and pass as of the last update to this file.
 
 ```bash
-# Unit tests — 180 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
+# Unit tests — 191 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
 # (see "Importing app hits the network" below).
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite \
 GEMINI_BALANCED_MODEL=gemini-2.5-flash \
@@ -318,10 +318,13 @@ These are real traps that have bitten this codebase.
 
 ## Code style
 
-`ruff.toml` and `ty.toml` at the repo root are **standalone and take precedence**
-over the `[tool.ruff]` / `[tool.ty]` sections in `pyproject.toml` (`ty` prints a
-warning saying so — that is expected, not a problem). They are stricter than the
-scaffolder defaults.
+`ruff.toml` and `ty.toml` at the repo root are **standalone and own the policy**;
+they are stricter than the scaffolder defaults. The `[tool.ruff]` / `[tool.ty]`
+sections the scaffolder puts in `pyproject.toml` have been **removed**, because a
+standalone file takes precedence over them — so they were dead config that
+contradicted the real settings (they still said `py311` / `3.10`) and made `ty`
+warn on every run. Put lint and type-check settings in `ruff.toml` / `ty.toml` /
+`pyrightconfig.json`, never in `pyproject.toml`.
 
 `pyrightconfig.json` follows the same pattern for **basedpyright** (the nvim LSP;
 it also beats any `[tool.basedpyright]` section). Three things to know:
@@ -339,9 +342,25 @@ it also beats any `[tool.basedpyright]` section). Three things to know:
   `ruff.toml`'s per-file-ignores: `app/app_utils` and `app/shared` (not ours to
   fix) and `tests` (fakes cast to real types, internals poked deliberately).
 
-- **Line length 88.** `target-version = "py311"` / ty `python-version = "3.11"`
-  — the *floor*, not the runtime (prod is 3.12). So **no 3.12+ syntax**: use
-  `typing_extensions.override`, not `typing.override`; no PEP 695 type params.
+- **Line length 88.** `target-version = "py314"` / ty `python-version = "3.14"`
+  / basedpyright `pythonVersion "3.14"`.
+- **The project pins exactly one Python version: 3.14.** `requires-python` is
+  `>=3.14,<3.15`, the Dockerfile is `python:3.14-slim`, and the dev venv is
+  3.14 — there is no older interpreter to stay compatible with, so the full
+  3.14 stdlib and syntax are fair game (`typing.override`, PEP 695 type params
+  included). This replaces the old "floor, not runtime" rule; the codebase no
+  longer supports a range.
+  - Changing the version means changing **five** files together:
+    `pyproject.toml` (`requires-python`), `Dockerfile` (`FROM python:`),
+    `ruff.toml`, `ty.toml`, `pyrightconfig.json`.
+    `tests/unit/test_python_version.py` fails if any of them drift apart, which
+    is what catches a scaffold upgrade reverting the two base-template-owned
+    ones.
+  - **`app/shared/**` is exempt from `UP035`.** The upstream shared library
+    still supports 3.11, so it imports `override` from `typing_extensions`.
+    That is correct upstream and only "outdated" by this project's stricter
+    pin. Do not fix it locally — the next scaffold upgrade reverts it and
+    breaks lint again.
 - **Docstrings required** (`D` selected, Google convention). Summary on the
   first line, no blank line before a class docstring.
 - Rule families: `E W F I B C4 UP RUF SIM N D PTH RET ARG TID`.
@@ -508,7 +527,7 @@ Silicon machine and the podman VM is **arm64**, but the GKE Autopilot nodes thes
 manifests target are **amd64** (nothing sets a `kubernetes.io/arch: arm64`
 nodeSelector). A native build produces an arm64 image whose pods fail on the
 cluster with `exec format error` — which looks like an app bug, not a build bug.
-The base image (`python:3.12-slim`) is multi-arch, so the cross-build works fine;
+The base image (`python:3.14-slim`) is multi-arch, so the cross-build works fine;
 it is just slower under emulation.
 
 **Deploying requires explicit human approval. Never run `terraform apply`,
@@ -569,11 +588,20 @@ Install the CLI (one-time): `uv tool install google-agents-cli`
 | The gke variant | `app/agents/**`, `app/cluster/**`, `app/migrations/**`, `infra/**`, `GKE.md`, `ruff.toml`, `ty.toml`, `pyrightconfig.json` | Yours to change |
 | Deliberate overlay | `app/fast_api_app.py` | Yours, despite looking like base infra — see gotchas |
 
-**One deliberate exception to the base-template rule:** `basedpyright` was added
-to the `lint` extra in `pyproject.toml`, because that is where the other linters
-live and it must be installed for the nvim LSP to start. It is the *only* local
-edit to that file. If `agents-cli scaffold upgrade` drops it, re-add it —
-`pyrightconfig.json` itself survives, so only the dependency line is at risk.
+**Three deliberate exceptions to the base-template rule**, all in
+`pyproject.toml`. A scaffold upgrade can revert any of them, so re-apply them if
+it does:
+
+1. **`basedpyright` in the `lint` extra** — that is where the other linters live,
+   and it must be installed for the nvim LSP to start. Only the dependency line
+   is at risk; `pyrightconfig.json` itself survives an upgrade.
+2. **`requires-python = ">=3.14,<3.15"`** — the template ships `>=3.11,<3.14`.
+   Guarded by `tests/unit/test_python_version.py`, together with the matching
+   `FROM python:3.14-slim` in the (also base-template-owned) `Dockerfile`.
+3. **`[tool.ruff]` and `[tool.ty]` deleted** — dead config overridden by
+   `ruff.toml` / `ty.toml`. Harmless if an upgrade puts them back, but they will
+   again state the wrong Python version and make `ty` warn on every run, so
+   delete them again. A comment in the file records this.
 
 Upstream template: `../agentic-template` (variant `variants/gke`). Its own
 `AGENTS.md` is about authoring the template and mostly does **not** apply here.

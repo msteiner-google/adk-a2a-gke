@@ -9,14 +9,15 @@
 # the code you write. Generated infrastructure we don't own is exempted below.
 
 line-length = 88
-# Match the base template's requires-python FLOOR (>=3.11,<3.14). ruff's
-# `target-version` is the *minimum* interpreter to support: pyupgrade will not
-# rewrite to syntax newer than this. It must therefore be the LOWEST version a
-# generated project can install on (3.11) — NOT the newest — or ruff may produce
-# code that breaks there (e.g. `typing.override`, PEP 695 type params). Prod runs
-# 3.12 (base Dockerfile), but installs are permitted down to 3.11. Raise this
-# only when the base template raises its requires-python floor.
-target-version = "py311"
+# This project pins ONE Python version rather than supporting a range:
+# requires-python is `>=3.14,<3.15`, the Dockerfile is `python:3.14-slim`, and
+# the dev venv is 3.14. So `target-version` is not a floor to be conservative
+# about — it is the exact interpreter that runs everywhere, and pyupgrade is
+# free to rewrite to full 3.14 syntax.
+#
+# Keep this in lockstep with requires-python (pyproject.toml), the Dockerfile,
+# ty.toml and pyrightconfig.json. tests/unit/test_python_version.py enforces it.
+target-version = "py314"
 
 [lint]
 select = [
@@ -53,6 +54,12 @@ known-first-party = ["app", "frontend"]
 # Generated serving/A2A infrastructure is owned by the base template, not by
 # app authors — don't hold it to the strict docstring/style/pathlib rules.
 "app/app_utils/**" = ["D", "ARG", "N", "PTH"]
+# The upstream shared library still supports Python 3.11 (this project pins
+# 3.14), so it imports `override` from typing_extensions rather than typing.
+# That is correct for upstream and wrong by UP035's reckoning here. Exempting
+# the rule is deliberate: "fixing" it locally would be reverted by the next
+# `agents-cli scaffold upgrade` and break lint again on every upgrade.
+"app/shared/**" = ["UP035"]
 "app/fast_api_app.py" = ["D", "PTH"]
 # Tests favor readability over docstring coverage and unused-arg purity.
 # Match at any depth so both the base-template tests (tests/**) and the tests

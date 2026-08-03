@@ -35,12 +35,15 @@
   "venvPath": ".",
   "venv": ".venv",
 
-  // Match ruff's target-version and ty's python-version: the requires-python
-  // FLOOR, not the runtime. Prod is 3.12 and the local venv is 3.13, but installs
-  // are permitted down to 3.11, so this makes basedpyright flag 3.12+ syntax
-  // (typing.override, PEP 695 type params) that would crash there. See AGENTS.md
-  // "Code style". Raise only when the base template raises its floor.
-  "pythonVersion": "3.11",
+  // This project pins ONE Python version rather than supporting a range:
+  // requires-python is `>=3.14,<3.15`, the Dockerfile is `python:3.14-slim`, and
+  // the dev venv is 3.14. There is no older interpreter to stay compatible with,
+  // so the full 3.14 stdlib and syntax are fair game (typing.override and PEP 695
+  // type params included).
+  //
+  // Keep this in lockstep with requires-python (pyproject.toml), the Dockerfile,
+  // ruff.toml and ty.toml. tests/unit/test_python_version.py enforces it.
+  "pythonVersion": "3.14",
 
   "typeCheckingMode": "standard",
 
