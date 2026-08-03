@@ -9,7 +9,7 @@ resources:
 #   REGION-docker.pkg.dev/PROJECT_ID/agents/agent
 images:
   - name: agent-image
-    newName: REGION-docker.pkg.dev/PROJECT_ID/agents/agent
+    newName: europe-west4-docker.pkg.dev/msteiner/agents/agent
     newTag: latest
 
 # Dev override: keep a single replica per agent.

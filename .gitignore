@@ -146,6 +146,17 @@ dmypy.json
 .terraform*
 .Terraform*
 
+# Terraform state: machine-local and can contain sensitive values -- never
+# commit. Note `.terraform*` above only matches dot-prefixed paths, so it does
+# NOT cover terraform.tfstate.
+*.tfstate
+*.tfstate.*
+
+# Variable files carry real project ids; commit only examples. A deployment
+# tfvars that is meant to be tracked must be added with `git add -f`.
+*.tfvars
+!*.tfvars.example
+
 
 tmp*
 .agents-cli-scripts/

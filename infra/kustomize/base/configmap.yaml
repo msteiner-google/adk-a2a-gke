@@ -15,6 +15,20 @@ data:
   # to Workload Identity (ADC) but can be set explicitly if you prefer.
   GOOGLE_CLOUD_LOCATION: "global"
 
+  # REQUIRED for the A2A path. app/shared/config.py builds an explicit
+  # Client(vertexai=True), but ADK decides Vertex-vs-Developer mode separately,
+  # from the environment only (utils/env_utils.py: is_enterprise_mode_enabled).
+  # With this unset ADK assumes Developer-API mode and its A2A part converter
+  # attaches `part_metadata` to inbound parts, which the Vertex serializer then
+  # rejects with:
+  #   ValueError: part_metadata parameter is only supported in Gemini Developer
+  #   API mode, not in Gemini Enterprise Agent Platform mode
+  # That breaks every delegated (orchestrator -> worker) call while direct calls
+  # to a leaf agent still succeed. Prefer GOOGLE_GENAI_USE_ENTERPRISE: both ADK
+  # and google-genai check it first and fall back to the now-deprecated
+  # GOOGLE_GENAI_USE_VERTEXAI, which emits a DeprecationWarning.
+  GOOGLE_GENAI_USE_ENTERPRISE: "true"
+
   # Port the container serves on; Services target this. Keep in sync with the
   # containerPort in the Deployments (and the base image's serve command).
   PORT: "8080"
@@ -33,6 +47,16 @@ data:
   # Trace Explorer -- no OTEL_SERVICE_NAME needed here.
   LOG_LEVEL: "INFO"
   LOG_FORMAT: "json"
+  # REQUIRED for trace export. ADK's Cloud exporter posts OTLP to
+  # telemetry.googleapis.com/v1/traces, which rejects any batch whose OTel
+  # Resource lacks `gcp.project_id`:
+  #   Failed to export span batch code: 400, reason: Bad Request
+  #   ("Resource is missing required attribute \"gcp.project_id\"")
+  # app/shared/telemetry.py builds the Resource with Resource.create(), which
+  # merges OTEL_RESOURCE_ATTRIBUTES, so setting it here supplies the attribute
+  # without patching the upstream-owned shared library. Update the project id
+  # if you deploy this overlay to a different project.
+  OTEL_RESOURCE_ATTRIBUTES: "gcp.project_id=msteiner"
   # To send traces to a vendor-neutral stack (Grafana Tempo, Jaeger, Datadog,
   # ...) instead of Cloud Trace, point this at an in-cluster OpenTelemetry
   # Collector; leaving it unset uses Cloud Trace directly. A Collector can also
