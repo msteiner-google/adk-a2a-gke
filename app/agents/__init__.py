@@ -10,7 +10,11 @@ source of truth for *which* agents exist and their default peer topology.
   unset (handy for ``adk web`` and tests).
 
 There is no special "orchestrator" type: the orchestrator is simply the agent
-whose spec lists ``peers``. To add an agent, create ``app/agents/<name>/`` with
+whose spec lists ``peers``. Nor is there a special *graph* type: an agent whose
+spec carries a ``root_node`` (``planner``) is served as an ADK ``Workflow``
+instead of an ``LlmAgent``, but is registered, deployed and reached identically.
+
+To add an agent, create ``app/agents/<name>/`` with
 an ``agent.py`` exposing a ``SPEC``, register it below, and (for the cluster) add
 a Deployment/Service in ``infra/kustomize/base/workers.yaml``. Nothing else needs
 to change.
@@ -21,11 +25,12 @@ from __future__ import annotations
 from app.agents.base import AgentSpec, build_agent
 from app.agents.math.agent import SPEC as MATH
 from app.agents.orchestrator.agent import SPEC as ORCHESTRATOR
+from app.agents.planner.agent import SPEC as PLANNER
 from app.agents.research.agent import SPEC as RESEARCH
 
 # Registered agents, keyed by name. Order is preserved for stable listings.
 AGENTS: dict[str, AgentSpec] = {
-    spec.name: spec for spec in (ORCHESTRATOR, RESEARCH, MATH)
+    spec.name: spec for spec in (ORCHESTRATOR, RESEARCH, MATH, PLANNER)
 }
 
 # The agent a process becomes when AGENT_NAME is unset.

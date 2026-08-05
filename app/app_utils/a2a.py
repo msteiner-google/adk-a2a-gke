@@ -35,6 +35,7 @@ from a2a.utils.constants import (
 )
 from google.adk.a2a.executor.a2a_agent_executor import A2aAgentExecutor
 from google.adk.a2a.utils.agent_card_builder import AgentCardBuilder
+from google.adk.workflow import Workflow
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -65,7 +66,7 @@ def _default_capabilities() -> AgentCapabilities:
 async def attach_a2a_routes(
     app: FastAPI,
     *,
-    agent: BaseAgent,
+    agent: BaseAgent | Workflow,
     runner: Runner,
     task_store: TaskStore,
     rpc_path: str,
@@ -76,6 +77,9 @@ async def attach_a2a_routes(
     """Register A2A routes (JSON-RPC + agent-card endpoints) under ``rpc_path``.
 
     Builds a dynamic agent card from ``agent`` and mounts the routes on ``app``.
+    ``agent`` may be an ``LlmAgent`` or a graph node (ADK's ``AgentCardBuilder``
+    accepts ``BaseAgent | Workflow``), so a graph-rooted agent is served here on
+    exactly the same path as a model-driven one.
     The ``runner`` should share the session/artifact/memory services with the
     standard ADK path. ``capabilities``, ``agent_version``, and ``app_url``
     override their defaults (streaming + ADK extension, ``AGENT_VERSION``,

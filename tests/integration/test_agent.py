@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from google.adk.agents import BaseAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -29,6 +30,11 @@ def test_agent_stream() -> None:
     session_service = InMemorySessionService()
 
     session = session_service.create_session_sync(user_id="test_user", app_name="test")
+    # `root_agent` is `LlmAgent | Workflow` now that a spec may carry a graph
+    # (app/agents/planner). This test drives the DEFAULT agent, which is always
+    # an LlmAgent; Runner's `agent=` parameter only accepts BaseAgent, so assert
+    # that rather than widening the test to something it does not exercise.
+    assert isinstance(root_agent, BaseAgent)
     runner = Runner(agent=root_agent, session_service=session_service, app_name="test")
 
     message = types.Content(

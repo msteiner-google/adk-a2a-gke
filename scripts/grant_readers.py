@@ -39,7 +39,7 @@ import sys
 
 from sqlalchemy import text
 
-from app.cluster.db import Database, get_database
+from app.cluster.db import Database, build_database
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,10 @@ async def grant_readers() -> None:
     if not schemas:
         raise ValueError(f"{SCHEMAS_ENV} must list the agent schemas to grant on.")
 
-    database = get_database()
+    # Standalone admin script, like app/cluster/bootstrap.py: its own process
+    # and its own short-lived pool, so it constructs a Database directly
+    # rather than resolving one through the injector.
+    database = build_database()
     if not database.enabled:
         raise ValueError("No database configured; set DB_BACKEND=alloydb.")
 

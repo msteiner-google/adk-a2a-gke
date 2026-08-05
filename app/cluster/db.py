@@ -45,7 +45,6 @@ therefore small on purpose: ``DB_POOL_SIZE`` connections plus
 
 from __future__ import annotations
 
-import functools
 import os
 import threading
 from collections.abc import Mapping
@@ -414,20 +413,28 @@ class Database:
             self._connector = None
 
 
-@functools.cache
-def get_database() -> Database:
-    """Return the process-wide :class:`Database`.
+def build_database() -> Database:
+    """Construct the :class:`Database` described by the environment.
 
-    Cached so that every consumer shares **one** connection pool. This matters:
-    the session service, the A2A task store, and ADK's service registry are
-    each constructed through a different path, and without a shared instance a
-    single pod would open three independent pools against a one-vCPU instance.
+    A plain factory, matching ``build_session_service`` / ``build_task_store`` /
+    ``build_artifact_service``: sharing is the injector's job, not this
+    function's. ``SessionModule`` provides it as a singleton so the session
+    store and the task store hand out one connection pool between them rather
+    than opening one each against a one-vCPU instance.
+
+    It used to be ``functools.cache``d, on the belief that consumers outside the
+    injector needed to land on the same instance. They do not: ADK's service
+    registry resolves ``shared://session`` to ``app.agent.session_service``,
+    which is the injector's, and the one remaining caller outside the injector
+    is ``app/cluster/bootstrap.py`` -- a separate one-shot process where sharing
+    is meaningless. Caching a value the injector already owns just gives it two
+    homes.
 
     The schema defaults to this process's ``AGENT_NAME``, which is what gives
     each agent its own tables without any per-agent configuration.
 
     Returns:
-        The shared :class:`Database` (disabled when ``DB_BACKEND`` is unset).
+        A new :class:`Database` (disabled when ``DB_BACKEND`` is unset).
     """
     default_schema = (
         os.environ.get(AGENT_NAME_ENV, DEFAULT_AGENT_NAME).strip() or DEFAULT_AGENT_NAME

@@ -35,7 +35,7 @@ code path.
 All of these were run in this repo and pass as of the last update to this file.
 
 ```bash
-# Unit tests — 191 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
+# Unit tests — 242 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
 # (see "Importing app hits the network" below).
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite \
 GEMINI_BALANCED_MODEL=gemini-2.5-flash \
@@ -86,13 +86,17 @@ Read the module docstrings; they are thorough. This is the index.
 | `app/agents/common.py` | `remember` / `recall` tools — shared session-state context that propagates across A2A hops. State keys prefixed `shared:`. |
 | `app/agents/orchestrator/agent.py` | `SPEC` with `peers=("research","math")`, `tier="capable"`. |
 | `app/agents/research/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, tool `web_search`. |
-| `app/agents/math/agent.py` + `tools.py` | Leaf agent, `tier="fast"`, tool `calculate` (AST-based, rejects non-arithmetic). |
+| `app/agents/math/agent.py` + `tools.py` | Leaf agent, `tier="fast"`, tool `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. |
+| `app/agents/planner/` | **Graph agent**: `SPEC` carries `root_node=planner_workflow`, an ADK `Workflow` (draft → human `RequestInput` → apply). No model, no peers. |
+| `app/agents/hitl_strategies.py` | The HITL tool strategies: `publish_result_tool` (`require_confirmation`) and a re-export of ADK's `request_input`. |
+| `app/cluster/hitl.py` | HITL plumbing: the capture plugin, `resume()` with the ADK routing workaround (and the re-drive guard), and `redrive_abandoned()`. |
+| `app/cluster/approvals.py` | The approval store and its state machine (`pending → deciding → approved/rejected`), the heartbeated lease that lets agents scale out, and both backends (in-memory / `hitl_approvals` table). |
 | `app/cluster/config.py` | **Pure stdlib** (no ADK/genai imports). `PeerSpec`, `ClusterConfig.from_env()`, `service_dns_url()`. Parses `AGENT_NAME` / `A2A_*`. |
 | `app/cluster/resolver.py` | `AgentResolver` — turns peers into `RemoteA2aAgent`s pointed at their well-known agent cards. No network I/O at construction (ADK resolves cards lazily). |
 | `app/cluster/di.py` | `ClusterModule` (config + resolver) and `SessionModule` (`Database`, session + memory + artifact services, A2A `TaskStore`). |
 | `app/cluster/session.py` | `build_session_service()` / `build_memory_service()` — backend selected by env. |
 | `app/cluster/artifacts.py` | `build_artifact_service()` — the shared `CloudPathArtifactService` when `ARTIFACT_STORAGE_URI` is set, else in-memory. Same URI for every agent on purpose (artifacts are keyed by the ADK app name `app`, not `AGENT_NAME`). |
-| `app/cluster/db.py` | `DatabaseConfig` + `Database`: the one `AsyncEngine` per pod. AlloyDB via the connector (IAM auth) or a plain DSN. `get_database()` is the process-wide singleton so every consumer shares one pool. |
+| `app/cluster/db.py` | `DatabaseConfig` + `Database`: the one `AsyncEngine` per pod. AlloyDB via the connector (IAM auth) or a plain DSN. `build_database()` is a plain factory — the injector's `@singleton` is what makes every consumer share one pool. |
 | `app/cluster/tasks.py` | `build_task_store()` — A2A `TaskStore`: in-memory, or the a2a SDK's `DatabaseTaskStore` on the shared engine. |
 | `app/cluster/bootstrap.py` | `python -m app.cluster.bootstrap` — creates the database. Exists because the Terraform provider has no `google_alloydb_database` resource. |
 | `app/migrations/` | Alembic (`alembic.ini`, `env.py`, `versions/`). Lives under `app/` on purpose — see gotchas. |
@@ -126,6 +130,11 @@ Read the module docstrings; they are thorough. This is the index.
   `test_migrations.py` renders the Alembic migrations **offline** (no database)
   and diffs them against ADK's and the a2a SDK's own metadata — it is the guard
   that catches a library adding a column.
+- `tests/unit/test_approvals.py` — the store's state machine, run against
+  **both** backends (in-memory and SQLAlchemy-on-SQLite); set `HITL_TEST_PG_DSN`
+  to add real PostgreSQL as a third.
+- `tests/unit/test_hitl.py` — pause capture, response shapes (`{"result": …}`),
+  the graph-agent builder rules, and the resume/claim ordering.
 - `tests/integration/` — `test_agent.py`, `test_server_e2e.py`. Needs a server.
 - `tests/eval/` — `eval_config.yaml`, `response_quality.py`, `datasets/`. Needs GCP creds.
 
@@ -186,6 +195,12 @@ Violating these is how this codebase breaks. They are deliberate.
    the agent whose spec declares `peers`; `build_agent` attaches whatever peers
    the cluster config resolved (empty for a leaf). **Do not reintroduce a
    per-role builder or an orchestrator subclass.**
+   *Relaxed (deliberately):* a spec may set `root_node` to serve an ADK
+   `Workflow` instead of an `LlmAgent` (`app/agents/planner`). This is still one
+   spec shape and one builder — the graph is data on the spec, not a second code
+   path — but such an agent **cannot declare peers** (a graph has no
+   `sub_agents`; `build_agent` raises) and its last node must return
+   `types.Content` or callers receive nothing. See `docs/human-in-the-loop.md`.
 2. **`agents/` = who the agents are. `cluster/` = the plumbing.** Keep config,
    resolution, DI, and session backends out of `agents/`.
 3. **`app/cluster/config.py` must NOT import `app.agents`.** It would cycle:
@@ -300,6 +315,66 @@ These are real traps that have bitten this codebase.
   statements without binding, so a `:param` placeholder ends up verbatim in the
   generated script. Inline controlled constants in migrations (see `0001`).
 
+- **The config targets Terraform; the `terraform` on THIS machine is just too
+  old.** Nothing here is OpenTofu-specific — `versions.tf` declares
+  `required_version = ">= 1.6"` and the commands in this file are the Terraform
+  ones. But the Homebrew `terraform` installed here is **v1.5.7**, below that
+  floor, and it additionally rejects the cross-variable `validation` at
+  `variables.tf:85` (which needs >= 1.9). So `terraform plan` fails on this
+  machine with `Invalid reference in variable validation` — a stale binary, not a
+  broken config. Fix it by installing Terraform >= 1.9 (`hashicorp/tap`).
+  OpenTofu v1.12.3 also happens to be installed and runs the configuration
+  unmodified (`tofu validate` passes, `tofu plan` succeeds), which is how the
+  current state was written — see `docs/deploy-to-another-project.md`.
+  **Local caveat:** `terraform.tfstate` records `terraform_version 1.12.3`, so a
+  Terraform older than that will refuse the existing state until it is upgraded.
+
+- **The applied infrastructure is behind `main`.** State holds GSAs for
+  `orchestrator`, `research` and `math` only, so the `planner` Deployment really
+  does borrow `agent-math` and run DB-less (`DB_BACKEND=none`, in-memory session
+  and task stores — commented in `workers.yaml`). That is a *not-yet-applied*
+  gap, not a tooling block: `var.agents` lists `planner` and a plan creates
+  `agent-planner` plus its IAM, AlloyDB user and Workload Identity binding. The
+  artifact bucket from `artifacts.tf` is likewise unapplied.
+
+- **Read the plan before applying — it is not purely additive.** As of the last
+  update to this file, a plan against the live state is **19 to add, 1 to change,
+  2 to destroy** (measured with `tofu`, see above), and the two destroys are
+  `google_compute_global_address.alloydb_psa` and
+  `google_service_networking_connection.alloydb_psa` being **replaced** under a
+  live AlloyDB cluster. Do not blind-apply to give the planner an identity.
+
+- **HITL: a plausible answer is not proof the flow ran.** Two separate failures
+  (a skipped graph node, a graph output that never reached the caller) both
+  produced confident, sensible replies. Assert on a marker the code emits.
+
+- **HITL approvals are durable, but only with a database.** `hitl_approvals`
+  (migration `0004`, `app/cluster/approvals.py`) survives a restart when
+  `DB_BACKEND` is `alloydb`/`url`; with `none` — the default, and what `planner`
+  runs on — the store is per-pod memory and a restart still loses every pending
+  approval (`docs/plans/hitl/results.md` R6). A pause raised inside an A2A peer
+  is captured on the **caller**, so in the cluster approvals live in the
+  orchestrator's schema.
+
+- **Agents scale out; a pause is not pod-local.** A paused invocation is rebuilt
+  from the session, so any replica can answer any approval — measured, not
+  assumed: at 2 replicas a pause raised on one pod resumed when the decision
+  arrived at the other. Three things keep that safe: approval and session are
+  both in the database, the claim is a single conditional `UPDATE`, and a
+  running resume heartbeats its lease so no peer's sweep can take it. The
+  manifests stay at `replicas: 1` for cost, not correctness.
+
+- **A crashed resume recovers the decision, not necessarily the answer.** The
+  decision is written by the *claim*, so the startup sweep re-drives it without
+  asking the human twice. But if the pause was inside an A2A peer that already
+  finished, its task is terminal (`Task <id> is in terminal state: completed`)
+  and the reply cannot be replayed. ADK reports that as an error **event**, not
+  an exception — so `run_async` returns normally with no answer, and treating
+  "no exception" as success is a bug this repo already shipped once
+  (`results.md` R10). Such a row is closed with `resumed_at` left **NULL** plus a
+  warning; query `resumed_at IS NULL AND status IN ('approved','rejected')` for
+  approvals whose effect happened but whose answer never reached the user.
+
 - **`agents-cli` uses `uv`.** Run Python as `uv run python ...`, never bare
   `python`.
 
@@ -407,6 +482,17 @@ it also beats any `[tool.basedpyright]` section). Three things to know:
 | `MEMORY_BACKEND` | `in_memory` | `vertex_ai` (+`AGENT_ENGINE_ID`) |
 | `TASK_STORE_BACKEND` | `in_memory` | `database` (shared engine). In-memory is per-pod, so `tasks/get` breaks past 1 replica. |
 
+### HITL approvals (`app/cluster/approvals.py`)
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `HITL_LEASE_TTL_SECONDS` | `30` | How long a lease may go **un-renewed** before it is presumed abandoned. Not a budget for the resume: a running resume renews its lease every TTL/3, so this is a liveness timeout. It doubles as the recovery sweep's interval, so it is also how long a dead pod's work waits before a peer picks it up. |
+
+There is no backend switch: the store follows `DB_BACKEND`, durable when a
+database is configured and per-pod in memory otherwise. Scaling an agent past one
+replica therefore requires a database — with `DB_BACKEND=none` each pod has its
+own store and only the pod that took the decision can act on it.
+
 ### Artifacts (`app/cluster/artifacts.py`)
 
 | Var | Default | Meaning |
@@ -495,7 +581,9 @@ AGENT_NAME=orchestrator A2A_PEERS=math=http://127.0.0.1:8091 \
 ```bash
 cd infra/terraform
 cp terraform.tfvars.example terraform.tfvars   # set project_id
-terraform init && terraform apply
+terraform init
+terraform plan -var-file=terraform.tfvars   # READ THE PLAN, see gotchas
+terraform apply -var-file=terraform.tfvars
 eval "$(terraform output -raw get_credentials_command)"
 
 REPO=$(terraform output -raw artifact_registry_repo)
@@ -578,6 +666,17 @@ Three rules worth stating outright:
   import from `app.agents` or `app.cluster`, and it stays portable to Python
   3.11 so it can be reused by other services. Project-specific logic belongs in
   `app/agents/` or `app/cluster/`.
+- **Cluster services come from the injector, not module globals.** `Database`,
+  the session/memory/artifact services, the A2A task store and the HITL
+  `ApprovalStore` are all `@singleton` providers in `app/cluster/di.py`;
+  `app/agent.py` is the composition root that resolves them and hands them to
+  the serving layer and the capture plugin. Do not reintroduce a cached
+  `get_*()` accessor: for the approval store in particular, a second instance is
+  a second dict under `DB_BACKEND=none`, and approvals split between them with
+  no error. Two module-level flags remain on purpose — `_configured` in
+  `shared/telemetry.py` and `shared/logging.py` — because they guard idempotent
+  bootstrap rather than holding a dependency.
+
 - **`pyproject.toml` is for dependencies and packaging only.** Lint and
   type-check policy lives in the standalone config files. One thing there is
   easy to mistake for cruft: `basedpyright` in the `lint` extra. It is not run
@@ -599,4 +698,6 @@ Three rules worth stating outright:
 - **Stop after 3 identical failures.** Fix the root cause instead of retrying.
 - **Terraform Error 409** → `terraform import`, don't retry creation.
 - `GKE.md` and `README.md` are the human-facing docs; keep them in sync when
-  changing architecture or commands.
+  changing architecture or commands. `docs/human-in-the-loop.md` is the HITL
+  guide (which mechanism, when); `docs/plans/` holds planned work and the
+  evidence behind it.

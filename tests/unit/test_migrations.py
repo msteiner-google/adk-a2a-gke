@@ -194,6 +194,77 @@ def test_task_retention_indexes_exist(migration_sql: str) -> None:
     assert "idx_tasks_updated_at" in migration_sql
 
 
+# --- HITL approvals (ours, not a library's) ----------------------------------
+
+
+def test_hitl_approvals_matches_the_store_model(migration_sql: str) -> None:
+    """The migration and the code's Table must not drift apart.
+
+    `hitl_approvals` is the one table no library defines, so there is no
+    upstream to compare against -- but `app/cluster/approvals.py` builds queries
+    from its own `sa.Table`, and if that disagrees with the DDL the failure is a
+    runtime SQL error on a live approval. This is the same guard, pointed at
+    ourselves.
+    """
+    from app.cluster.approvals import APPROVALS
+
+    ours = _column_definitions(_created_tables(migration_sql)["hitl_approvals"])
+    theirs = _library_columns(APPROVALS)
+
+    # Column NAMES must match exactly. Types are compared loosely: the migration
+    # carries server defaults the query layer has no reason to declare.
+    assert {line.split()[0] for line in ours} == {line.split()[0] for line in theirs}, (
+        "hitl_approvals DDL has drifted from app/cluster/approvals.py:APPROVALS.\n"
+        f"  only in migration: {sorted(ours - theirs)}\n"
+        f"  only in model:     {sorted(theirs - ours)}"
+    )
+
+
+def test_hitl_approvals_carries_the_lease_columns(migration_sql: str) -> None:
+    """D4.2: without these, a crashed resume is unrecoverable."""
+    columns = {
+        line.split()[0]
+        for line in _column_definitions(
+            _created_tables(migration_sql)["hitl_approvals"]
+        )
+    }
+    assert {"deciding_since", "deciding_by", "resumed_at"} <= columns
+
+
+def test_hitl_approvals_allows_the_deciding_state(migration_sql: str) -> None:
+    """The CHECK constraint must permit every status the code writes."""
+    from app.cluster.approvals import STATUSES
+
+    body = "\n".join(_created_tables(migration_sql)["hitl_approvals"])
+    assert "ck_hitl_approvals_status" in body
+    for status in STATUSES:
+        assert f"'{status}'" in body, f"CHECK rejects status {status!r}"
+
+
+def test_hitl_approvals_capture_is_idempotent_by_constraint(
+    migration_sql: str,
+) -> None:
+    """ADK replays a pause, so the DB -- not the code -- enforces uniqueness."""
+    assert "uq_hitl_approvals_call" in migration_sql
+
+
+def test_hitl_approvals_indexes_serve_the_documented_queries(
+    migration_sql: str,
+) -> None:
+    # The global queue, the per-user list (D4.1), and the reclaim sweep (D4.2).
+    assert "idx_hitl_approvals_status_created" in migration_sql
+    assert "idx_hitl_approvals_user_pending" in migration_sql
+    assert "WHERE status = 'pending'" in migration_sql
+    assert "idx_hitl_approvals_deciding" in migration_sql
+    assert "WHERE status = 'deciding'" in migration_sql
+
+
+def test_hitl_approvals_needs_no_grant_of_its_own(migration_sql: str) -> None:
+    """Revision 0003's ALTER DEFAULT PRIVILEGES already covers later tables."""
+    approvals_ddl = migration_sql[migration_sql.index("CREATE TABLE hitl_approvals") :]
+    assert "GRANT" not in approvals_ddl
+
+
 # --- Alembic bookkeeping -----------------------------------------------------
 
 

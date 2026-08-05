@@ -148,3 +148,90 @@ spec:
     - name: http
       port: 80
       targetPort: 8080
+---
+# The planner is a GRAPH agent (app/agents/planner): its root is an ADK Workflow,
+# not an LlmAgent. Two consequences visible here:
+#
+# 1. It borrows the math agent's identity (`serviceAccountName: agent-math`)
+#    instead of having its own `agent-planner` GSA. `var.agents` in
+#    infra/terraform/variables.tf DOES list "planner" and a plan creates
+#    `agent-planner` -- the identity simply has not been applied yet, so it does
+#    not exist in the project. Note that apply is NOT purely additive right now
+#    (it also replaces the AlloyDB private-services-access peering), so read the
+#    plan first. Give the planner its own service account once that is done;
+#    borrowing is an experiment shortcut, not a pattern to copy.
+# 2. Because it has no database role of its own, it runs on in-memory session and
+#    task backends, overriding the ConfigMap. Safe here (single replica, and the
+#    orchestrator holds the durable conversation) but it means a restart drops
+#    any plan waiting on a human.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: planner
+  labels:
+    app: planner
+    app.kubernetes.io/component: specialist
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: planner
+  template:
+    metadata:
+      labels:
+        app: planner
+    spec:
+      serviceAccountName: agent-math
+      containers:
+        - name: agent
+          image: agent-image
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: agent-config
+          env:
+            - name: AGENT_NAME
+              value: planner
+            # No agent-planner database role exists yet (see the note above), so
+            # this agent must not try to reach AlloyDB.
+            - name: DB_BACKEND
+              value: none
+            - name: SESSION_BACKEND
+              value: in_memory
+            - name: TASK_STORE_BACKEND
+              value: in_memory
+            - name: APP_URL
+              value: http://planner.agents.svc.cluster.local
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: planner
+  labels:
+    app: planner
+spec:
+  type: ClusterIP
+  selector:
+    app: planner
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

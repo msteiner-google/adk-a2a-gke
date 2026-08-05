@@ -7,7 +7,8 @@ Two :mod:`injector` modules, installed alongside the shared ``ModelModule``:
   layer that turns configured peers into ``RemoteA2aAgent`` children. This is the
   "resolver so an agent can connect to the other agents in the cluster."
 - :class:`SessionModule` provides the pluggable ``BaseSessionService``,
-  ``BaseMemoryService``, ``BaseArtifactService``, and A2A ``TaskStore``
+  ``BaseMemoryService``, ``BaseArtifactService``, the HITL ``ApprovalStore``,
+  and the A2A ``TaskStore``
   (in-memory by default, durable backends via env — see
   ``app/cluster/session.py``, ``app/cluster/artifacts.py``,
   ``app/cluster/tasks.py``), reusing the injected GCP project/location from the
@@ -41,9 +42,10 @@ from google.adk.sessions import BaseSessionService
 from injector import Module, provider, singleton
 
 from app.agents import AGENTS, DEFAULT_AGENT
+from app.cluster.approvals import ApprovalStore, build_approval_store
 from app.cluster.artifacts import build_artifact_service
 from app.cluster.config import AGENT_NAME_ENV, ClusterConfig
-from app.cluster.db import Database, get_database
+from app.cluster.db import Database, build_database
 from app.cluster.resolver import AgentResolver
 from app.cluster.session import build_memory_service, build_session_service
 from app.cluster.tasks import build_task_store
@@ -93,15 +95,14 @@ class SessionModule(Module):
     def provide_database(self) -> Database:
         """Provide the (singleton) shared database engine holder.
 
-        Delegates to :func:`app.cluster.db.get_database` rather than
-        constructing one, so that consumers reached outside the injector — ADK's
-        service registry in particular — resolve the *same* instance and share
-        its connection pool.
+        ``@singleton`` is what makes the pool shared: the session service, the
+        approval store and the A2A task store all take this one instance, so a
+        pod opens one pool rather than three against a one-vCPU instance.
 
         Returns:
             The process-wide :class:`Database`.
         """
-        return get_database()
+        return build_database()
 
     @singleton
     @provider
@@ -124,6 +125,24 @@ class SessionModule(Module):
         return build_session_service(
             project=project, location=location, database=database
         )
+
+    @singleton
+    @provider
+    def provide_approval_store(self, database: Database) -> ApprovalStore:
+        """Provide the (singleton) HITL approval store.
+
+        Durable on the ``hitl_approvals`` table when a database is configured,
+        per-pod memory otherwise. Singleton is load-bearing rather than an
+        optimisation: with the in-memory backend a second instance is a second
+        dict, so approvals would split between them with no visible error.
+
+        Args:
+            database: The injected shared engine holder.
+
+        Returns:
+            The configured :class:`~app.cluster.approvals.ApprovalStore`.
+        """
+        return build_approval_store(database)
 
     @singleton
     @provider

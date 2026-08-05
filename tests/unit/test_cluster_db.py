@@ -12,7 +12,6 @@ from app.cluster.db import (
     URL,
     Database,
     DatabaseConfig,
-    get_database,
 )
 
 
@@ -133,9 +132,19 @@ def test_alloydb_pins_the_search_path() -> None:
     assert database._server_settings() == {"search_path": "math"}
 
 
-def test_get_database_is_process_wide() -> None:
-    """Session store and task store must not open separate pools."""
-    assert get_database() is get_database()
+def test_the_injector_shares_one_database() -> None:
+    """Session store, approval store and task store share a single pool.
+
+    build_database() is a plain factory -- calling it twice gives two holders,
+    and two pools against a one-vCPU instance. Sharing is the injector's job,
+    so that is what this pins.
+    """
+    from injector import Injector
+
+    from app.cluster.di import SessionModule
+
+    injector = Injector([SessionModule()])
+    assert injector.get(Database) is injector.get(Database)
 
 
 @pytest.mark.asyncio

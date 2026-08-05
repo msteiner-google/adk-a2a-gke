@@ -40,7 +40,7 @@ variable "agents" {
     hyphens) and Kubernetes DNS labels forbid underscores.
   EOT
   type        = list(string)
-  default     = ["orchestrator", "research", "math"]
+  default     = ["orchestrator", "research", "math", "planner"]
 
   validation {
     condition     = alltrue([for name in var.agents : can(regex("^[a-z][a-z0-9]*$", name))])

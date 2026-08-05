@@ -50,14 +50,23 @@ _CONFIG_NO_PEERS = ClusterConfig(
 
 
 def test_registry_lists_expected_agents():
-    assert set(AGENTS) == {"orchestrator", "research", "math"}
+    assert set(AGENTS) == {"orchestrator", "research", "math", "planner"}
     assert DEFAULT_AGENT == "orchestrator"
 
 
 def test_orchestrator_declares_peers_others_do_not():
-    assert AGENTS["orchestrator"].peers == ("research", "math")
+    assert AGENTS["orchestrator"].peers == ("research", "math", "planner")
     assert AGENTS["research"].peers == ()
     assert AGENTS["math"].peers == ()
+    # A graph agent cannot delegate: it has no sub_agents to attach peers to.
+    assert AGENTS["planner"].peers == ()
+
+
+def _tool_names(agent: LlmAgent) -> set[str]:
+    """Tool names, whether the tool is a plain callable or a ``BaseTool``."""
+    return {
+        getattr(t, "name", None) or getattr(t, "__name__", "?") for t in agent.tools
+    }
 
 
 def test_build_agent_leaf_has_no_sub_agents():
@@ -66,7 +75,14 @@ def test_build_agent_leaf_has_no_sub_agents():
     assert isinstance(agent, LlmAgent)
     assert agent.name == "research"
     assert agent.sub_agents == []
-    assert len(agent.tools) == 3
+    # Names rather than a count: a count breaks whenever a tool is added and
+    # says nothing about which tools the agent actually got.
+    assert _tool_names(agent) == {
+        "web_search",
+        "adk_request_input",
+        "remember",
+        "recall",
+    }
 
 
 def test_build_agent_attaches_resolved_peers_as_sub_agents():

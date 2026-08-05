@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from app.agents.base import AgentSpec
 from app.agents.common import recall, remember
+from app.agents.hitl_strategies import publish_result_tool
 from app.agents.math.tools import calculate
 
 SPEC = AgentSpec(
@@ -17,8 +18,11 @@ SPEC = AgentSpec(
     instruction=(
         "You are a math specialist. Use the `calculate` tool for every "
         "arithmetic step rather than computing in your head, then explain the "
-        "result briefly. Use `remember`/`recall` for shared context."
+        "result briefly. When the user asks you to publish, record or share a "
+        "result, call `publish_result` with it -- that action is reviewed by a "
+        "human before it takes effect. Use `remember`/`recall` for shared "
+        "context."
     ),
     tier="fast",
-    tools=(calculate, remember, recall),
+    tools=(calculate, publish_result_tool, remember, recall),
 )

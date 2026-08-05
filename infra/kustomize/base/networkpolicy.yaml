@@ -74,7 +74,7 @@ spec:
     matchExpressions:
       - key: app
         operator: In
-        values: ["research", "math"]
+        values: ["research", "math", "planner"]
   policyTypes:
     - Ingress
   ingress:

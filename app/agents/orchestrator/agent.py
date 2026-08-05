@@ -30,7 +30,10 @@ _INSTRUCTION = (
     "- Use `remember` to record facts that later steps or agents need, and "
     "`recall` to retrieve them; this shared context travels with the request.\n"
     "- When the agents have returned what you need, compose the final answer "
-    "yourself. Do not expose internal delegation mechanics to the user."
+    "yourself. Do not expose internal delegation mechanics to the user.\n"
+    "- When the user asks you to draft a plan for their review, transfer to the "
+    "`planner` agent, which drafts it, collects the human's feedback and returns "
+    "the revised plan."
 )
 
 # The orchestrator is just an agent whose peers are non-empty. The peers are
@@ -44,5 +47,5 @@ SPEC = AgentSpec(
     instruction=_INSTRUCTION,
     tier="capable",
     tools=(remember, recall),
-    peers=("research", "math"),
+    peers=("research", "math", "planner"),
 )

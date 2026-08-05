@@ -30,7 +30,7 @@ import sys
 
 from sqlalchemy import text
 
-from app.cluster.db import DatabaseConfig, get_database
+from app.cluster.db import DatabaseConfig, build_database
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,11 @@ async def ensure_database() -> bool:
         ValueError: If no database backend is configured, or the configured
             database name is not a safe lowercase PostgreSQL identifier.
     """
-    database = get_database()
+    # A one-shot process of its own: nothing here shares a pool with the
+    # agents, so this constructs its Database directly rather than standing
+    # up an injector (which would drag in the model catalog and a network
+    # call this step has no use for).
+    database = build_database()
     if not database.enabled:
         raise ValueError(
             "No database configured. Set DB_BACKEND=alloydb (or url) before "

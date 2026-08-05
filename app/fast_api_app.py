@@ -31,26 +31,32 @@
 # only handles Google-Agent-Engine headers, not the standard `traceparent`, so
 # this explicit instrumentation is what makes cross-pod A2A tracing work.
 
+import asyncio
 import contextlib
 import os
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
 import google.auth
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from google.adk.artifacts.base_artifact_service import BaseArtifactService
 from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.cli.service_registry import get_service_registry
 from google.adk.runners import Runner
 from google.adk.sessions import BaseSessionService
 from google.cloud import logging as google_cloud_logging
+from google.genai import types as genai_types
+from loguru import logger as log
+from pydantic import BaseModel
 
 from app.app_utils import services
 from app.app_utils.a2a import attach_a2a_routes
 from app.app_utils.typing import Feedback
+from app.cluster import approvals, hitl
 from app.cluster.artifacts import ARTIFACT_STORAGE_URI_ENV
-from app.cluster.db import get_database
+from app.cluster.db import DatabaseConfig
 from app.shared.telemetry import instrument_fastapi_app
 
 load_dotenv()
@@ -64,6 +70,15 @@ allow_origins = (
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+# Whether a durable database is configured. A pure config read, deliberately not
+# a Database instance: this runs at import, and the only question being asked is
+# yes/no. Reading it from `app.agent` instead would import the injector here, and
+# that resolves the live Vertex model catalog over the network -- see the
+# "Importing app hits the network" gotcha in AGENTS.md. The instance itself comes
+# from the injector, inside lifespan, like every other service.
+_DATABASE_CONFIGURED = DatabaseConfig.from_env().enabled
+
+
 # When a durable database is configured, override app_utils/services.py's
 # "shared://session" registration so the ADK web routes resolve to the SAME
 # DB-backed session service the Runner and the A2A path use. app/__init__.py
@@ -74,7 +89,7 @@ AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # This is intentionally conditional: with no database configured (the default,
 # and every test run) the original registration is left completely untouched,
 # so local `adk web` behaviour is unchanged.
-if get_database().enabled:
+if _DATABASE_CONFIGURED:
 
     def _shared_session_service(uri: str, **kwargs: Any) -> BaseSessionService:
         """Resolve `shared://session` to the injector's session service."""
@@ -107,10 +122,51 @@ if os.environ.get(ARTIFACT_STORAGE_URI_ENV, "").strip():
     get_service_registry().register_artifact_service("shared", _shared_artifact_service)
 
 
+async def _sweep_abandoned_resumes(
+    runner: Runner, store: approvals.ApprovalStore
+) -> None:
+    """Reclaim and finish resumes whose owner stopped renewing their lease.
+
+    Runs for the life of the process, on every replica. A resume in flight keeps
+    its own lease fresh, so this only ever picks up work whose owner died.
+
+    Nothing here may escape: a sweep that raises would kill the task and leave
+    recovery silently off for the rest of the pod's life, which is worse than a
+    failed tick.
+
+    Args:
+        runner: The serving Runner, used to drive a recovered resume.
+        store: The injector's approval store.
+    """
+    interval = approvals.lease_ttl_seconds()
+    while True:
+        try:
+            for item in await hitl.redrive_abandoned(runner, store):
+                # Separate a genuine replay from a row that was merely closed
+                # out. The second means the human's decision took effect but the
+                # conversation never got its answer -- someone must know.
+                if item.get("replayed"):
+                    log.info("HITL: replayed abandoned resume {}", item["approval_id"])
+                else:
+                    log.warning(
+                        "HITL: approval {} finished as {} WITHOUT a replayed answer "
+                        "(decision stands, narration lost): {}",
+                        item["approval_id"],
+                        item.get("status"),
+                        item.get("errors") or item.get("error") or "no final response",
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("HITL: abandoned-resume sweep failed")
+        await asyncio.sleep(interval)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.agent import app as adk_app
     from app.agent import (
+        approval_store,
         artifact_service,
         database,
         root_agent,
@@ -135,6 +191,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.runner = runner
     app.state.agent_app_name = adk_app.name
+    # The one store the injector built, shared with the capture plugin that
+    # app/agent.py handed the same instance to.
+    app.state.approval_store = approval_store
     await attach_a2a_routes(
         app,
         agent=root_agent,
@@ -144,7 +203,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         task_store=task_store,
         rpc_path=f"/a2a/{adk_app.name}",
     )
+
+    # HITL recovery (D4.2) runs on a timer rather than only at startup: a lease
+    # is reclaimed on staleness, not on whose name is against it, so any replica
+    # can recover any dead owner's work and a crash no longer waits for a
+    # restart to be noticed.
+    sweeper = asyncio.create_task(_sweep_abandoned_resumes(runner, approval_store))
+
     yield
+
+    # Stop the sweeper before the pool goes away, or its next tick queries a
+    # disposed engine on the way down.
+    sweeper.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await sweeper
     # Dispose the pool and stop the AlloyDB connector's background certificate
     # refresh, which would otherwise keep the event loop alive on shutdown.
     await database.aclose()
@@ -181,6 +253,174 @@ def collect_feedback(feedback: Feedback) -> dict[str, str]:
     """
     logger.log_struct(feedback.model_dump(), severity="INFO")
     return {"status": "success"}
+
+
+# --- Human-in-the-loop --------------------------------------------------------
+# The approval surface. Capture happens in app/cluster/hitl.py's plugin, which
+# runs on the Runner, so a pause is recorded whichever surface drove it -- these
+# routes, the ADK web UI, or an inbound A2A call. Resuming goes through the SAME
+# Runner (app.state.runner), so it shares the session and artifact services the
+# rest of the serving layer uses.
+
+
+class HitlRun(BaseModel):
+    """Start (or continue) a conversation that may pause for a human."""
+
+    text: str
+    session_id: str | None = None
+    user_id: str = "hitl-user"
+
+
+class HitlDecision(BaseModel):
+    """A human's answer to a pending approval."""
+
+    approved: bool = True
+    """Used by confirmation pauses; ignored by free-form input pauses."""
+    text: str = ""
+    """Free-form reply: the note on a confirmation, the answer to a question."""
+    decided_by: str = ""
+    """Who decided, for audit. NOT verified -- see docs/human-in-the-loop.md."""
+
+
+@app.post("/hitl/run")
+async def hitl_run(req: HitlRun) -> dict[str, Any]:
+    """Run a turn and report whether it completed or paused for a human."""
+    runner = app.state.runner
+    store = app.state.approval_store
+    session_id = req.session_id or f"hitl-{uuid.uuid4().hex[:8]}"
+
+    # Scope the before/after diff to THIS session. The store is shared across
+    # replicas, so an unscoped diff would report a pause raised by somebody
+    # else's concurrent request as belonging to this one.
+    def mine(items: list[approvals.PendingApproval]) -> list[approvals.PendingApproval]:
+        return [item for item in items if item.session_id == session_id]
+
+    known = {p.approval_id for p in mine(await store.list_by_status(approvals.PENDING))}
+    trace: list[str] = []
+    final_text: str | None = None
+    async for event in runner.run_async(
+        user_id=req.user_id,
+        session_id=session_id,
+        new_message=genai_types.Content(
+            role="user", parts=[genai_types.Part(text=req.text)]
+        ),
+    ):
+        trace.append(hitl.summarise(event))
+        if (
+            event.is_final_response()
+            and event.content
+            and event.content.parts
+            and (text := "".join(p.text or "" for p in event.content.parts).strip())
+        ):
+            final_text = text
+    new = [
+        p.public()
+        for p in mine(await store.list_by_status(approvals.PENDING))
+        if p.approval_id not in known
+    ]
+    return {
+        "status": "paused" if new else "completed",
+        "session_id": session_id,
+        "final_text": final_text,
+        "pending": new,
+        "trace": trace,
+    }
+
+
+@app.get("/hitl/session/{session_id}")
+async def hitl_session(session_id: str, user_id: str = "hitl-user") -> dict[str, Any]:
+    """Dump a session's events. Diagnostic surface for pauses and resumes."""
+    session = await app.state.runner.session_service.get_session(
+        app_name=app.state.agent_app_name, user_id=user_id, session_id=session_id
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="unknown session")
+    return {
+        "count": len(session.events),
+        "events": [
+            {
+                "author": e.author,
+                "summary": hitl.summarise(e),
+                # Not a plain model_dump(): a Part's thought_signature is raw
+                # bytes and used to 500 the whole route. See hitl.content_json.
+                "content": hitl.content_json(e),
+                "custom_metadata": e.custom_metadata,
+            }
+            for e in session.events
+        ],
+    }
+
+
+@app.get("/hitl/approvals")
+async def hitl_approvals(status: str = approvals.PENDING) -> dict[str, Any]:
+    """List captured approvals, oldest first."""
+    items = [p.public() for p in await app.state.approval_store.list_by_status(status)]
+    return {"count": len(items), "approvals": items}
+
+
+@app.post("/hitl/approvals/{approval_id}")
+async def hitl_decide(approval_id: str, decision: HitlDecision) -> dict[str, Any]:
+    """Answer a pending approval and resume the paused invocation."""
+    store = app.state.approval_store
+
+    # Claim and record the decision in ONE write, before resuming (D4.2). Two
+    # properties come from that ordering. A concurrent retry loses the race
+    # rather than driving the same invocation twice; and if this pod dies
+    # mid-resume, the row still carries what the human said, so the startup
+    # sweep can finish the job without asking again. The claim is reclaimable,
+    # which is what stops a crash from making the approval permanently
+    # un-retryable -- the R4 failure, see docs/plans/hitl/results.md.
+    outcome, pending = await store.claim(
+        approval_id,
+        decision={"approved": decision.approved, "text": decision.text},
+        decided_by=decision.decided_by,
+    )
+    if outcome is approvals.ClaimOutcome.NOT_FOUND or pending is None:
+        raise HTTPException(status_code=404, detail="unknown approval_id")
+    if outcome is approvals.ClaimOutcome.ALREADY_DECIDED:
+        # Idempotent: report the recorded outcome instead of resuming twice.
+        return {"status": "already_decided", "approval": pending.public()}
+    if outcome is approvals.ClaimOutcome.IN_PROGRESS:
+        raise HTTPException(
+            status_code=409,
+            detail="a resume is already running for this approval; retry later",
+        )
+
+    try:
+        # Hold the lease open for as long as the resume runs. Without this a
+        # sweep -- on this pod or any other replica -- would see the lease go
+        # stale after the TTL and re-drive an invocation still in flight.
+        async with approvals.heartbeat(store, approval_id):
+            trace, final_text = await hitl.resume(
+                app.state.runner, pending, hitl.content_for(pending)
+            )
+    except LookupError as exc:
+        await store.release(approval_id)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        # ADK rejects a response that does not match the pause's response_schema
+        # (R4). Surface it as a client error rather than letting it escape as an
+        # unhandled ASGI exception, which drops the connection -- and, through a
+        # port-forward, kills the tunnel -- while telling the caller nothing.
+        await store.release(approval_id)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        # Any other failure is ours to recover from too: put it back so the
+        # human can retry once the cause is fixed.
+        await store.release(approval_id)
+        raise
+
+    await store.complete(
+        approval_id,
+        status=approvals.APPROVED if decision.approved else approvals.REJECTED,
+    )
+    refreshed = await store.get(approval_id)
+    return {
+        "status": "resumed",
+        "approval": (refreshed or pending).public(),
+        "final_text": final_text,
+        "trace": trace,
+    }
 
 
 # Main execution
