@@ -1,10 +1,40 @@
 # Inspecting the database
 
 How to look at what the agents have actually stored in AlloyDB — sessions,
-events, and A2A tasks.
+events, A2A tasks and pending human approvals.
 
-For the design behind the schema layout, see
-[`../GKE.md`](../GKE.md#durable-storage-on-alloydb).
+## What is in there
+
+The agents share **one PostgreSQL database** (`agents`) on AlloyDB, and each
+agent owns **its own schema** inside it, named after the agent. So `math`'s
+conversations live in the `math` schema, `research`'s in `research`, and so on.
+Nothing is in `public`. [`../GKE.md`](../GKE.md#durable-storage-on-alloydb)
+explains why it is arranged that way; the practical consequence is that you must
+qualify every table (`math.sessions`) or set a `search_path`.
+
+Each schema holds the same four tables:
+
+| Table | What it holds | Owned by |
+| --- | --- | --- |
+| `sessions` | One row per conversation, including the shared state `remember` writes | ADK |
+| `events` | Every turn, tool call and tool result within a session | ADK |
+| `tasks` | A2A tasks — the unit of work when one agent calls another | the a2a SDK |
+| `hitl_approvals` | Captured [human-in-the-loop](human-in-the-loop.md) pauses awaiting or undergoing a decision | this repo |
+
+Plus `alembic_version`, which is per-schema: each agent is migrated
+independently.
+
+Two things follow that are worth knowing before you go looking for data:
+
+- **A request that crosses agents leaves rows in several schemas**, with no
+  shared id column. [Tracing a request](#tracing-a-request-across-agents) shows
+  how to join them.
+- **An approval raised inside a delegated agent is stored on the *caller*.** If
+  the orchestrator asked `math` to do something gated, the row is in
+  `orchestrator.hitl_approvals`, not `math`'s.
+
+An agent deployed without a database (`DB_BACKEND=none`) has no schema at all —
+its state is per-pod and nothing here applies to it.
 
 ---
 
@@ -13,6 +43,9 @@ For the design behind the schema layout, see
 Use **AlloyDB Studio** in the Cloud console:
 
 **Console → AlloyDB → `agents-db` → AlloyDB Studio → IAM authentication → Authenticate**
+
+(`agents-db` is the default `alloydb_cluster_id`; if you changed that variable,
+use your own name. The same applies to `--region` below, which is `var.region`.)
 
 Then pick database `agents` and query. The tables are **not** in `public` — each
 agent owns a schema, so either qualify the table or set the search path:
@@ -65,12 +98,12 @@ authenticates fine and then shows you an empty Explorer pane.
 Two steps. First, Terraform — add the principal to `database_readers`:
 
 ```hcl
-# infra/terraform/msteiner.tfvars
-database_readers = ["msteiner@google.com", "someone-else@google.com"]
+# infra/terraform/terraform.tfvars
+database_readers = ["someone@example.com", "someone-else@example.com"]
 ```
 
 ```bash
-cd infra/terraform && tofu apply -var-file=msteiner.tfvars
+cd infra/terraform && terraform apply -var-file=terraform.tfvars
 ```
 
 That creates the AlloyDB cluster user and grants the two project IAM roles. It
@@ -82,37 +115,50 @@ Second, apply the grants with `scripts/grant_readers.py`, run as the migrator
 inject the script:
 
 ```bash
-REPO=europe-west4-docker.pkg.dev/msteiner/agents
+cd infra/terraform
+REPO=$(terraform output -raw artifact_registry_repo)
+# The database role is the migrator's service account email minus the
+# ".gserviceaccount.com" suffix.
+MIGRATOR=$(terraform output -raw migrator_service_account_email)
+MIGRATOR=${MIGRATOR%.gserviceaccount.com}
+cd -
 
-cat > /tmp/ov.json <<'JSON'
+READERS="someone@example.com"                              # comma-separated
+SCHEMAS="orchestrator research math"                       # every agent with a schema
+B64=$(base64 < scripts/grant_readers.py | tr -d '\n')
+
+# Unquoted heredoc: the shell substitutes the variables above.
+cat > /tmp/ov.json <<JSON
 {"apiVersion":"v1","spec":{"serviceAccountName":"agent-migrator","restartPolicy":"Never",
- "containers":[{"name":"g","image":"REPLACE_IMAGE",
+ "containers":[{"name":"g","image":"$REPO/agent:latest",
   "envFrom":[{"configMapRef":{"name":"agent-config"}}],
-  "env":[{"name":"ALLOYDB_IAM_USER","value":"agent-migrator@msteiner.iam"},
-         {"name":"DB_READERS","value":"msteiner@google.com"},
-         {"name":"DB_READER_SCHEMAS","value":"orchestrator research math"},
+  "env":[{"name":"ALLOYDB_IAM_USER","value":"$MIGRATOR"},
+         {"name":"DB_READERS","value":"$READERS"},
+         {"name":"DB_READER_SCHEMAS","value":"$SCHEMAS"},
          {"name":"OTEL_SDK_DISABLED","value":"true"},
          {"name":"LOG_LEVEL","value":"WARNING"}],
-  "command":["sh","-c","REPLACE_CMD"],
+  "command":["sh","-c","echo $B64 | base64 -d > /tmp/g.py && uv run python /tmp/g.py"],
   "resources":{"requests":{"cpu":"500m","memory":"1Gi"}}}]}}
 JSON
-
-B64=$(base64 < scripts/grant_readers.py | tr -d '\n')
-sed -i '' "s|REPLACE_IMAGE|$REPO/agent:latest|; \
-           s|REPLACE_CMD|echo $B64 \| base64 -d > /tmp/g.py \&\& uv run python /tmp/g.py|" /tmp/ov.json
 
 kubectl -n agents run grant-readers --restart=Never \
   --image="$REPO/agent:latest" --overrides="$(cat /tmp/ov.json)"
 kubectl -n agents logs -f grant-readers
+kubectl -n agents delete pod grant-readers      # it does not clean up after itself
 ```
+
+`DB_READER_SCHEMAS` accepts commas or whitespace; `DB_READERS` is
+**comma-separated only**. List every agent that has a schema — an agent running
+with `DB_BACKEND=none` has none and must be left out, or the script fails on a
+schema that does not exist.
 
 It is idempotent, and it prints the *effective* privileges afterwards rather
 than assuming the grants took:
 
 ```
-msteiner@google.com on orchestrator  usage=True select=True insert=False create=False
-msteiner@google.com on research      usage=True select=True insert=False create=False
-msteiner@google.com on math          usage=True select=True insert=False create=False
+someone@example.com on orchestrator  usage=True select=True insert=False create=False
+someone@example.com on research      usage=True select=True insert=False create=False
+someone@example.com on math          usage=True select=True insert=False create=False
 ```
 
 `insert=False` and `create=False` are the point: a human reader can look at agent
@@ -215,6 +261,7 @@ CREATE VIEW all_events AS
     SELECT 'orchestrator'::text AS agent, * FROM orchestrator.events
     UNION ALL SELECT 'research', * FROM research.events
     UNION ALL SELECT 'math',     * FROM math.events;
+    -- ...one line per agent that has a schema
 ```
 
 ...and delete the CTEs from the queries. Views need `CREATE` on a schema, which
@@ -268,6 +315,33 @@ FROM orchestrator.tasks ORDER BY updated_at DESC LIMIT 10;
 SELECT count(*) FROM math.sessions WHERE update_time < now() - interval '30 days';
 ```
 
+### Human-in-the-loop approvals
+
+Remember these live in the schema of the agent that *received* the request, even
+when the pause was raised in a peer it delegated to.
+
+```sql
+-- What is waiting for a human right now?
+SELECT approval_id, kind, tool_name, author AS paused_agent, created_at
+FROM orchestrator.hitl_approvals
+WHERE status = 'pending'
+ORDER BY created_at;
+
+-- Approvals whose decision was applied but whose answer never reached the user.
+-- This is the documented failure mode when a resume crashes and the A2A task it
+-- needs to reply on has already completed -- see docs/human-in-the-loop.md.
+SELECT approval_id, status, decided_by, decided_at
+FROM orchestrator.hitl_approvals
+WHERE resumed_at IS NULL AND status IN ('approved', 'rejected');
+
+-- Stuck mid-decision: a resume that stopped heartbeating its lease. A live pod
+-- reclaims these automatically within HITL_LEASE_TTL_SECONDS (default 30).
+SELECT approval_id, deciding_by, deciding_since
+FROM orchestrator.hitl_approvals
+WHERE status = 'deciding'
+  AND deciding_since < now() - interval '2 minutes';
+```
+
 Note `sessions.state` is `JSONB` (ADK) while `tasks.status` is plain `json`
 (a2a), so `->>` works on both but JSONB containment operators only on the former.
 That difference is deliberate — see the migration comments.
@@ -283,7 +357,10 @@ SELECT r.rolname, n.nspname,
 FROM pg_roles r
 CROSS JOIN pg_namespace n
 WHERE r.rolname LIKE 'agent-%'
-  AND n.nspname IN ('orchestrator', 'research', 'math')
+  -- Every agent schema, discovered rather than hardcoded, so this stays correct
+  -- as agents are added or removed.
+  AND n.nspname NOT LIKE 'pg_%'
+  AND n.nspname NOT IN ('information_schema', 'public', 'ai', 'google_ml')
 ORDER BY 1, 2;
 ```
 
@@ -294,7 +371,10 @@ ORDER BY 1, 2;
 **`scripts/dbcheck.py`** — a read-only summary of every schema (row counts,
 alembic revision, recent sessions and tasks). Same injection pattern as above but
 with no `DB_READERS`. Good for a quick "did anything land?" check from the
-terminal.
+terminal. It reports on `CHECK_SCHEMAS` (whitespace-separated, default
+`orchestrator research math`), so set that variable if your set of agents
+differs. Note it summarises sessions and tasks only — for approvals, use the
+queries above.
 
 **psql from a pod** — for anything Studio's 10 MB / five-minute limits get in the
 way of. Run a pod as the migrator and connect through the AlloyDB connector; the
@@ -330,10 +410,10 @@ When you do switch, the shape is:
 ```bash
 # 1. Grant the group the same two project roles (Terraform: member = "group:...").
 # 2. Add the group to the cluster.
-gcloud beta alloydb users create agents-db-readers@google.com \
-  --cluster=agents-db --region=europe-west4 --type=IAM_GROUP
+gcloud beta alloydb users create agents-db-readers@example.com \
+  --cluster=agents-db --region="$REGION" --type=IAM_GROUP
 # 3. Grant it read-only, exactly as for an individual:
-#    DB_READERS=agents-db-readers@google.com scripts/grant_readers.py
+#    DB_READERS=agents-db-readers@example.com scripts/grant_readers.py
 ```
 
 Two traps worth knowing in advance:
@@ -355,7 +435,7 @@ broken and you need in:
 
 ```bash
 gcloud alloydb users set-password postgres \
-  --cluster=agents-db --region=europe-west4 --password=<temp>
+  --cluster=agents-db --region="$REGION" --password=<temp>
 ```
 
 Then sign in to Studio with **built-in authentication** as `postgres`. Clear the

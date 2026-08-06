@@ -146,6 +146,14 @@ dmypy.json
 .terraform*
 .Terraform*
 
+# Machine-local agent instructions. AGENTS.md is the shared, universally-true
+# context; anything specific to one workstation or one deployed project goes
+# here instead. Load it by adding "instructions": ["AGENTS.local.md"] to your
+# cloudcode config (global ~/.config/cloudcode/cloudcode.jsonc, or a
+# .cloudcode/cloudcode.jsonc here) -- relative instruction paths are globbed up
+# to the worktree root and a missing file is ignored.
+AGENTS.local.md
+
 # Terraform state: machine-local and can contain sensitive values -- never
 # commit. Note `.terraform*` above only matches dot-prefixed paths, so it does
 # NOT cover terraform.tfstate.

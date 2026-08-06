@@ -67,10 +67,10 @@ Other commands (require a server / GCP creds, not part of the fast loop):
 | `uv run pytest tests/integration` | Needs a running server |
 | `agents-cli eval generate` / `grade` / `compare` / `analyze` / `optimize` | Eval loop; needs GCP creds |
 
-Tooling present on this machine: `agents-cli`, `uv`, `kubectl`, `terraform`,
-`gcloud`, and **`podman` 6.0.0** (machine `podman-machine-default` running).
-**`docker` is NOT installed** — use `podman` for image builds, and read the
-`--platform` warning in "Deploy to GKE" before building.
+Tooling this repo assumes on your PATH: `agents-cli`, `uv`, `kubectl`,
+`terraform` (>= 1.9, see "Deploy to GKE"), `gcloud`, and an OCI image builder
+(`docker` or `podman`). Read the `--platform` warning in "Deploy to GKE" before
+building an image.
 
 ## File map
 
@@ -315,34 +315,22 @@ These are real traps that have bitten this codebase.
   statements without binding, so a `:param` placeholder ends up verbatim in the
   generated script. Inline controlled constants in migrations (see `0001`).
 
-- **The config targets Terraform; the `terraform` on THIS machine is just too
-  old.** Nothing here is OpenTofu-specific — `versions.tf` declares
-  `required_version = ">= 1.6"` and the commands in this file are the Terraform
-  ones. But the Homebrew `terraform` installed here is **v1.5.7**, below that
-  floor, and it additionally rejects the cross-variable `validation` at
-  `variables.tf:85` (which needs >= 1.9). So `terraform plan` fails on this
-  machine with `Invalid reference in variable validation` — a stale binary, not a
-  broken config. Fix it by installing Terraform >= 1.9 (`hashicorp/tap`).
-  OpenTofu v1.12.3 also happens to be installed and runs the configuration
-  unmodified (`tofu validate` passes, `tofu plan` succeeds), which is how the
-  current state was written — see `docs/deploy-to-another-project.md`.
-  **Local caveat:** `terraform.tfstate` records `terraform_version 1.12.3`, so a
-  Terraform older than that will refuse the existing state until it is upgraded.
+- **Terraform >= 1.9 is required in practice, not the declared >= 1.6.**
+  `versions.tf` says `required_version = ">= 1.6"`, but the cross-variable
+  `validation` at `variables.tf:85` needs 1.9; an older binary fails with
+  `Invalid reference in variable validation`, which reads like a broken config
+  and is not. Nothing here is OpenTofu-specific, but OpenTofu (>= 1.9) runs the
+  configuration unmodified if you prefer it — see
+  `docs/deploy-to-another-project.md`. Whichever you use, a binary older than
+  the `terraform_version` recorded in an existing state file will refuse that
+  state until it is upgraded.
 
-- **The applied infrastructure is behind `main`.** State holds GSAs for
-  `orchestrator`, `research` and `math` only, so the `planner` Deployment really
-  does borrow `agent-math` and run DB-less (`DB_BACKEND=none`, in-memory session
-  and task stores — commented in `workers.yaml`). That is a *not-yet-applied*
-  gap, not a tooling block: `var.agents` lists `planner` and a plan creates
-  `agent-planner` plus its IAM, AlloyDB user and Workload Identity binding. The
-  artifact bucket from `artifacts.tf` is likewise unapplied.
-
-- **Read the plan before applying — it is not purely additive.** As of the last
-  update to this file, a plan against the live state is **19 to add, 1 to change,
-  2 to destroy** (measured with `tofu`, see above), and the two destroys are
+- **Read the plan before applying — it is not purely additive.** Against an
+  already-deployed environment a plan can include **destroys**, notably
   `google_compute_global_address.alloydb_psa` and
-  `google_service_networking_connection.alloydb_psa` being **replaced** under a
-  live AlloyDB cluster. Do not blind-apply to give the planner an identity.
+  `google_service_networking_connection.alloydb_psa` being *replaced* under a
+  live AlloyDB cluster. Adding an agent to `var.agents` is not automatically a
+  safe, additive apply. Never blind-apply.
 
 - **HITL: a plausible answer is not proof the flow ran.** Two separate failures
   (a skipped graph node, a graph output that never reached the caller) both
@@ -394,8 +382,8 @@ them would be dead config that silently contradicts the real settings. Put lint
 and type-check settings in `ruff.toml` / `ty.toml` / `pyrightconfig.json`, never
 in `pyproject.toml`.
 
-`pyrightconfig.json` follows the same pattern for **basedpyright** (the nvim LSP;
-it also beats any `[tool.basedpyright]` section). Three things to know:
+`pyrightconfig.json` follows the same pattern for **basedpyright** (the editor
+LSP; it also beats any `[tool.basedpyright]` section). Three things to know:
 
 - It sets `typeCheckingMode = "standard"`, **not** basedpyright's default
   `"recommended"`. `"recommended"` turns on the based-only Any-hunting rules
@@ -450,80 +438,35 @@ it also beats any `[tool.basedpyright]` section). Three things to know:
 
 ## Environment variables
 
-### Cluster / A2A (`app/cluster/config.py`)
+**[`docs/environment-variables.md`](docs/environment-variables.md) is the full
+reference** — every variable, its default, accepted values, which companions it
+makes mandatory, and whether a bad value raises at startup, falls back silently,
+or fails later on first use. It also covers what the manifests set, the legacy
+variables that look like config but are dead, and minimum viable configurations
+for tests / local / cluster.
 
-| Var | Default | Meaning |
+**Keep it current: when you add, rename or remove an environment variable,
+update that file in the same change.** Nothing generates or validates it, so an
+omission is invisible until someone goes scavenging through the source. Its
+"Maintaining this file" section has the checklist and the grep commands that
+find every read site.
+
+The handful that bite most often:
+
+| Var | Default | Why it matters here |
 | --- | --- | --- |
-| `AGENT_NAME` | `orchestrator` | Which registered agent this process becomes |
-| `A2A_PEERS` | *(agent's `AgentSpec.peers`)* | Comma-separated `name` or `name=url`; url is a service **root** |
-| `A2A_NAMESPACE` | `agents` | K8s namespace for DNS-derived peer URLs |
-| `A2A_CLUSTER_DOMAIN` | `svc.cluster.local` | Cluster DNS domain |
-| `A2A_PEER_SCHEME` | `http` | Scheme for derived URLs |
-| `A2A_PEER_PORT` | `80` | Port for derived URLs (default port omitted from URL) |
-| `A2A_RPC_PATH` | `/a2a/app` | Where the serving layer mounts RPC + card |
-| `APP_URL` | `http://0.0.0.0:8000` | Base URL this agent advertises in its own card |
+| `AGENT_NAME` | `orchestrator` | Selects which registered agent this process becomes; also the default `DB_SCHEMA` |
+| `APP_URL` | `http://0.0.0.0:8000` | The default is unreachable from other pods — delegation hangs while probes stay green. Set it per agent |
+| `GEMINI_*_MODEL` | *(live Vertex catalog)* | Unset means a network call at import. Pin all four for hermetic tests |
+| `A2A_PEERS` | *(agent's `AgentSpec.peers`)* | Comma-separated `name` or `name=url`; the url is a service **root** |
+| `DB_BACKEND` | `none` | Gates the session, task and HITL approval stores all at once |
+| `ARTIFACT_STORAGE_URI` | *(unset → in-memory)* | The scheme *is* the backend; a typo'd scheme silently writes to local disk |
+| `HITL_LEASE_TTL_SECONDS` | `30` | Lease liveness timeout, heartbeat interval (TTL/3) and recovery sweep interval |
 
-### Models (`app/shared/config.py`)
-
-| Var | Default |
-| --- | --- |
-| `GOOGLE_CLOUD_PROJECT` | ADC discovery |
-| `GOOGLE_CLOUD_LOCATION` | `global` |
-| `GEMINI_FAST_MODEL` | latest `flash-lite` from live catalog |
-| `GEMINI_BALANCED_MODEL` | latest `flash` |
-| `GEMINI_CAPABLE_MODEL` | latest `pro` |
-| `GEMINI_EMBEDDING_MODEL` | best embedding model |
-
-### Session / memory / tasks (`app/cluster/session.py`, `app/cluster/tasks.py`)
-
-| Var | Default | Options |
-| --- | --- | --- |
-| `SESSION_BACKEND` | `in_memory` | `alloydb` (shared engine), `database` (+`SESSION_DB_URL`), `vertex_ai` (+`AGENT_ENGINE_ID`) |
-| `MEMORY_BACKEND` | `in_memory` | `vertex_ai` (+`AGENT_ENGINE_ID`) |
-| `TASK_STORE_BACKEND` | `in_memory` | `database` (shared engine). In-memory is per-pod, so `tasks/get` breaks past 1 replica. |
-
-### HITL approvals (`app/cluster/approvals.py`)
-
-| Var | Default | Meaning |
-| --- | --- | --- |
-| `HITL_LEASE_TTL_SECONDS` | `30` | How long a lease may go **un-renewed** before it is presumed abandoned. Not a budget for the resume: a running resume renews its lease every TTL/3, so this is a liveness timeout. It doubles as the recovery sweep's interval, so it is also how long a dead pod's work waits before a peer picks it up. |
-
-There is no backend switch: the store follows `DB_BACKEND`, durable when a
-database is configured and per-pod in memory otherwise. Scaling an agent past one
-replica therefore requires a database — with `DB_BACKEND=none` each pod has its
-own store and only the pod that took the decision can act on it.
-
-### Artifacts (`app/cluster/artifacts.py`)
-
-| Var | Default | Meaning |
-| --- | --- | --- |
-| `ARTIFACT_STORAGE_URI` | *(unset → in-memory)* | Base path for `CloudPathArtifactService`: `gs://bucket/prefix`, `s3://…`, `az://…`, or a local dir. No `ARTIFACT_BACKEND` switch — the scheme *is* the backend. Set the **same** value for every agent. |
-
-### Database (`app/cluster/db.py`)
-
-| Var | Default | Meaning |
-| --- | --- | --- |
-| `DB_BACKEND` | `none` | `alloydb` (IAM auth via the connector) or `url` (plain DSN) |
-| `ALLOYDB_INSTANCE_URI` | — | `projects/P/locations/L/clusters/C/instances/I` |
-| `ALLOYDB_IAM_USER` | — | GSA email **minus** `.gserviceaccount.com` |
-| `ALLOYDB_IP_TYPE` | `PRIVATE` | `PRIVATE`, `PUBLIC`, or `PSC` |
-| `DB_NAME` | `agents` | Database holding every agent's schema |
-| `DB_SCHEMA` | *(`AGENT_NAME`)* | Per-agent schema, applied as `search_path`. Leave unset. |
-| `DB_URL` | — | SQLAlchemy async URL for the `url` backend |
-| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `5` / `2` | Per-pod pool; small because the instance has 1 vCPU |
-| `DB_AGENT_ROLE` | — | Migration-time only: the role revision `0003` grants on the schema |
-
-### Observability (`app/shared/`)
-
-| Var | Default | Effect |
-| --- | --- | --- |
-| `LOG_LEVEL` | `INFO` | loguru + stdlib level |
-| `LOG_FORMAT` | `json` | `json` (Cloud Logging) or `console` (local) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | Redirect traces to an OTLP collector instead of Cloud Trace |
-| `OTEL_SERVICE_NAME` | `AGENT_NAME` | Trace service name |
-
-Local `.env` currently sets `GOOGLE_GENAI_USE_VERTEXAI=true`,
-`GOOGLE_CLOUD_PROJECT=msteiner-kubeflow`, `GOOGLE_CLOUD_LOCATION=global`.
+Local development reads a gitignored `.env`; copy `.env.example` and set at
+least `GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, and
+`GOOGLE_CLOUD_LOCATION=global`. Note `.env` is loaded *after* the injector is
+built, so it does not reach most configuration — export the variables instead.
 
 ## Common tasks
 
@@ -588,27 +531,26 @@ eval "$(terraform output -raw get_credentials_command)"
 
 REPO=$(terraform output -raw artifact_registry_repo)
 
-# Auth: no docker on this machine, so log podman straight in (this avoids the
-# gcloud docker-credential helper entirely).
-podman login -u oauth2accesstoken \
+# Auth. Either configure the gcloud credential helper once
+# (`gcloud auth configure-docker "${REPO%%/*}"`) or log the builder in directly:
+docker login -u oauth2accesstoken \
   -p "$(gcloud auth print-access-token)" "${REPO%%/*}"
 
-# --platform linux/amd64 is REQUIRED here — see the warning below.
-podman build --platform linux/amd64 -t "$REPO/agent:latest" .
-podman push "$REPO/agent:latest"
+# --platform linux/amd64 is REQUIRED — see the warning below.
+docker build --platform linux/amd64 -t "$REPO/agent:latest" .
+docker push "$REPO/agent:latest"
 
 # fill the two placeholders, then:
 kubectl apply -k infra/kustomize/overlays/dev
 kubectl -n agents port-forward svc/orchestrator 8080:80
 ```
 
-**Always pass `--platform linux/amd64` when building here.** This is an Apple
-Silicon machine and the podman VM is **arm64**, but the GKE Autopilot nodes these
-manifests target are **amd64** (nothing sets a `kubernetes.io/arch: arm64`
-nodeSelector). A native build produces an arm64 image whose pods fail on the
-cluster with `exec format error` — which looks like an app bug, not a build bug.
-The base image (`python:3.14-slim`) is multi-arch, so the cross-build works fine;
-it is just slower under emulation.
+**Always pass `--platform linux/amd64` when building.** The GKE Autopilot nodes
+these manifests target are **amd64** (nothing sets a `kubernetes.io/arch: arm64`
+nodeSelector), so on an arm64 workstation a native build produces an arm64 image
+whose pods fail on the cluster with `exec format error` — which looks like an app
+bug, not a build bug. The base image (`python:3.14-slim`) is multi-arch, so the
+cross-build works fine; it is just slower under emulation.
 
 **Deploying requires explicit human approval. Never run `terraform apply` or
 `kubectl apply` without being asked.**
@@ -680,7 +622,7 @@ Three rules worth stating outright:
 - **`pyproject.toml` is for dependencies and packaging only.** Lint and
   type-check policy lives in the standalone config files. One thing there is
   easy to mistake for cruft: `basedpyright` in the `lint` extra. It is not run
-  by `agents-cli lint`, but it must be installed for the nvim LSP to start —
+  by `agents-cli lint`, but it must be installed for the editor LSP to start —
   leave it.
 - **`app/fast_api_app.py` looks like boilerplate and is not.** See the gotcha
   above about its three load-bearing deviations from the stock ADK wiring.
@@ -697,7 +639,10 @@ Three rules worth stating outright:
 - **Run Python with `uv`**: `uv run python script.py`; `agents-cli install` first.
 - **Stop after 3 identical failures.** Fix the root cause instead of retrying.
 - **Terraform Error 409** → `terraform import`, don't retry creation.
+- **Adding, renaming or removing an environment variable means updating
+  [`docs/environment-variables.md`](docs/environment-variables.md) in the same
+  change** — it is the only inventory, and nothing validates it.
 - `GKE.md` and `README.md` are the human-facing docs; keep them in sync when
-  changing architecture or commands. `docs/human-in-the-loop.md` is the HITL
-  guide (which mechanism, when); `docs/plans/` holds planned work and the
-  evidence behind it.
+  changing architecture or commands. `docs/environment-variables.md` is the
+  configuration reference; `docs/human-in-the-loop.md` is the HITL guide (which
+  mechanism, when); `docs/plans/` holds planned work and the evidence behind it.

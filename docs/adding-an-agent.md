@@ -1,17 +1,41 @@
 # Adding an agent
 
 How to add a new specialist agent to the multi-agent system, from code to a
-running pod.
+running pod. The worked example throughout is a fictional `weather` agent.
 
-For *what* the system is, read [`../GKE.md`](../GKE.md). For deploying the whole
-thing to a fresh project, read
-[`deploy-to-another-project.md`](deploy-to-another-project.md).
+## Before you start
 
-Every agent in this repo is the same kind of thing: a declarative `AgentSpec`
-built by the single `build_agent()`. There is no orchestrator base class to
-subclass and no per-role code path — an agent that coordinates others is simply
-one whose `peers` is non-empty. So "adding an agent" is mostly declaration, not
-implementation.
+**What this system is.** A cluster of small agents that call each other over
+A2A, an HTTP protocol for agent-to-agent calls. An *orchestrator* agent receives
+the user's request and delegates sub-tasks to specialists; each agent is its own
+Kubernetes Deployment and Service. [README.md](../README.md) has the overview
+and [`../GKE.md`](../GKE.md) the architecture in depth. Everything below assumes
+only that much.
+
+**What an agent is here.** Not a class you subclass. An agent is a declarative
+`AgentSpec` — a name, a description, an instruction, a model tier and a tuple of
+tools — placed in a registry and turned into a running agent by one shared
+factory, `build_agent()`. There is no orchestrator base class and no per-role
+code path: an agent that coordinates others is simply one whose `peers` is
+non-empty. So adding an agent is mostly declaration, not implementation.
+
+**What you will write:** three small files under `app/agents/<name>/`, one line
+in a registry, one entry in the delegating agent's `peers`, and two test
+updates. That is a complete, working agent you can exercise locally.
+
+**How far you need to go.** Steps 0–5 are the whole job if you run locally —
+stop there. Steps 6–8 are cluster-only: five infrastructure files, a Terraform
+apply and a deploy. The [checklist](#checklist) at the end is split the same way.
+
+**One variation to know about.** A spec can set `root_node` to serve a fixed
+graph instead of a model-driven agent — that is what the `planner` agent in this
+repo does, and it is how you build a pipeline with a human approval step. Such
+an agent cannot declare peers. See
+[human-in-the-loop.md](human-in-the-loop.md#c-a-graph-agent-with-a-human-step).
+Everything else below applies unchanged.
+
+For standing the whole system up in a fresh Google Cloud project, read
+[`deploy-to-another-project.md`](deploy-to-another-project.md) instead.
 
 The steps below were verified by adding a throwaway agent to this repo and
 running the tests and `kubectl kustomize`.
@@ -147,7 +171,7 @@ Ruff's `TID252` rejects parent-relative imports across subpackages.
 from app.agents.weather.agent import SPEC as WEATHER
 
 AGENTS: dict[str, AgentSpec] = {
-    spec.name: spec for spec in (ORCHESTRATOR, RESEARCH, MATH, WEATHER)
+    spec.name: spec for spec in (ORCHESTRATOR, RESEARCH, MATH, PLANNER, WEATHER)
 }
 ```
 
@@ -163,7 +187,10 @@ Add it to the delegating agent's spec — normally the orchestrator, in
 `app/agents/orchestrator/agent.py`:
 
 ```python
-peers = (("research", "math", "weather"),)
+SPEC = AgentSpec(
+    ...,
+    peers=("research", "math", "planner", "weather"),
+)
 ```
 
 This is the **default** topology; `A2A_PEERS` overrides it at deploy time
@@ -181,7 +208,12 @@ Exactly two tests assert the registry contents, and both fail until updated
 
 ```python
 def test_registry_lists_expected_agents():
-    assert set(AGENTS) == {"orchestrator", "research", "math", "weather"}
+    assert set(AGENTS) == {"orchestrator", "research", "math", "planner", "weather"}
+
+
+def test_orchestrator_declares_peers_others_do_not():
+    assert AGENTS["orchestrator"].peers == ("research", "math", "planner", "weather")
+    assert AGENTS["weather"].peers == ()
 ```
 
 Add tests for your tool's behaviour alongside them — `test_agents.py` has
@@ -242,12 +274,18 @@ Five files, all in `infra/`. Skip this section entirely if you only run locally.
 `infra/terraform/variables.tf`, the `agents` default:
 
 ```hcl
-default = ["orchestrator", "research", "math", "weather"]
+default = ["orchestrator", "research", "math", "planner", "weather"]
 ```
 
-Then `terraform apply`. This creates the GSA `agent-weather@<project>`, its IAM
-roles, the Workload Identity binding, and its AlloyDB IAM database user — all
-driven by `for_each` over that list, so there is nothing else to write.
+Then `terraform apply`. This creates a **Google service account** (GSA)
+`agent-weather@<project>`, its IAM roles, a **Workload Identity** binding — the
+mechanism that lets a Kubernetes pod authenticate to Google Cloud as that
+service account, with no key file — and its AlloyDB IAM database user. All of it
+is driven by `for_each` over that list, so there is nothing else to write.
+
+Each agent gets its own identity so that a compromised or misbehaving agent has
+only the permissions it needs. That is why this step is per-agent rather than
+shared.
 
 If this agent needs cloud permissions the others should not have, that is the
 whole point of separate identities:
@@ -276,9 +314,11 @@ metadata:
     iam.gke.io/gcp-service-account: agent-weather@PROJECT.iam.gserviceaccount.com
 ```
 
-The KSA name must be `agent-<name>`; Terraform's Workload Identity binding names
-the pair `<namespace>/<ksa>` explicitly, so a mismatch means the pod silently
-falls back to the node's identity and Vertex calls 403.
+This is the **Kubernetes service account** (KSA) the pod runs as; the annotation
+is what pairs it with the Google service account from the previous step. The KSA
+name must be `agent-<name>`, because Terraform's Workload Identity binding names
+the pair `<namespace>/<ksa>` explicitly — a mismatch means the pod silently falls
+back to the node's identity and Vertex calls fail with `403`.
 
 ### 6c. `workers.yaml` — Deployment + Service
 
@@ -314,7 +354,7 @@ agent absent from the allow-list is simply unreachable:
     matchExpressions:
       - key: app
         operator: In
-        values: ["research", "math", "weather"]
+        values: ["research", "math", "planner", "weather"]
 ```
 
 If the new agent is *called by* something other than the orchestrator, add a
@@ -322,6 +362,8 @@ rule rather than widening this one — the policy is meant to mirror
 `AgentSpec.peers`, so keep the two in sync.
 
 ### 6e. `migrate-job.yaml` — give it a schema
+
+Append your agent to the space-separated list — whatever it currently holds:
 
 ```yaml
             - name: MIGRATE_AGENTS
@@ -331,6 +373,10 @@ rule rather than widening this one — the policy is meant to mirror
 The Job loops over this list, creating each schema, running every migration in
 it, and granting that agent's IAM role access to its own schema and nothing
 else.
+
+This list is *agents that need a database schema*, which is not necessarily
+every registered agent — one deployed with `DB_BACKEND=none` has no schema and
+no database role, so it does not belong here. Everything else does.
 
 > The `replicas:` list in `infra/kustomize/overlays/dev/kustomization.yaml` is
 > **optional** — an agent not listed there just uses the base's replica count
@@ -359,8 +405,12 @@ and A2A tasks.
 
 ```bash
 REPO=$(cd infra/terraform && terraform output -raw artifact_registry_repo)
-podman build --platform linux/amd64 -t "$REPO/agent:latest" .   # amd64 is required
-podman push "$REPO/agent:latest"
+
+# --platform linux/amd64 is required: the Autopilot nodes are amd64, so an
+# arm64 workstation's native build fails on the cluster with "exec format
+# error". (podman accepts the same arguments as docker.)
+docker build --platform linux/amd64 -t "$REPO/agent:latest" .
+docker push "$REPO/agent:latest"
 
 # The Job's spec is immutable, so clear the previous run.
 kubectl -n agents delete job/agent-migrate --ignore-not-found
@@ -387,6 +437,7 @@ delegation in Cloud Trace — one trace spans every A2A hop.
 ## Checklist
 
 ```
+--- code; enough to run locally (steps 0-5) ---
 [ ] Name is a single lowercase word, identical in all six places
 [ ] app/agents/<name>/__init__.py has a docstring          (ruff D104)
 [ ] tools.py: Google-style docstrings; ToolContext imported at runtime
@@ -398,7 +449,7 @@ delegation in Cloud Trace — one trace spans every A2A hop.
 [ ] Tool tests added
 [ ] pytest + agents-cli lint green
 [ ] Exercised locally over a real A2A hop
---- cluster only ---
+--- cluster only (steps 6-8) ---
 [ ] var.agents updated, terraform apply run
 [ ] serviceaccounts.yaml: KSA agent-<name> + GSA annotation
 [ ] workers.yaml: Deployment + Service (AGENT_NAME, APP_URL, ALLOYDB_IAM_USER)

@@ -1,23 +1,43 @@
 # Multi-agent system on GKE
 
 This project is a **cloud-native, multi-agent system** designed to run on Google
-Kubernetes Engine (GKE). A planner/orchestrator agent breaks a request into
-sub-tasks and delegates them to specialist worker agents, each running as its own
+Kubernetes Engine (GKE). An orchestrator agent breaks a request into sub-tasks
+and delegates them to specialist worker agents, each running as its own
 Kubernetes Service and reached over the **A2A** protocol.
 
 ```
                        ┌───────────────────┐
-   user ───────────▶   │   orchestrator    │   (planner, models.capable)
+   user ───────────▶   │   orchestrator    │   (entry point, models.capable)
                        │  Deployment/Svc   │
                        └─────────┬─────────┘
               A2A (RemoteA2aAgent, well-known agent card)
-                 ┌───────────────┴───────────────┐
-                 ▼                               ▼
-        ┌────────────────┐              ┌────────────────┐
-        │    research    │              │      math      │   specialists
-        │ Deployment/Svc │              │ Deployment/Svc │   (workers)
-        └────────────────┘              └────────────────┘
+        ┌──────────────────────┼──────────────────────┐
+        ▼                      ▼                      ▼
+┌────────────────┐    ┌────────────────┐    ┌────────────────┐
+│    research    │    │      math      │    │    planner     │  specialists
+│ Deployment/Svc │    │ Deployment/Svc │    │ Deployment/Svc │  (workers)
+└────────────────┘    └────────────────┘    └────────────────┘
+                                             a graph agent with
+                                             a human approval step
 ```
+
+**This is the architecture document** — how the pieces fit and why they were
+chosen. [README.md](README.md) is the shorter overview and the entry point for
+everything else; start there if you have not.
+
+| Section | What it covers |
+| --- | --- |
+| [Agents](#agents-all-equal-one-selected-per-pod) | The uniform agent model and how one image becomes any agent |
+| [Service discovery](#service-discovery-the-resolver) | How an agent finds and calls its peers |
+| [Session & memory](#session--memory-persistence) · [Artifacts](#artifact-storage-blobs) | Where conversation state and files live |
+| [Durable storage](#durable-storage-on-alloydb) | AlloyDB, schema-per-agent isolation, IAM auth, migrations |
+| [Human-in-the-loop](#human-in-the-loop) | Pausing an agent for a person, durably and across hops |
+| [Observability](#observability-logs--distributed-tracing-across-a2a) | One trace across every pod, trace-correlated logs |
+| [Run locally](#run-locally) · [Deploy](#deploy-to-gke) | Getting it running |
+
+Configuration throughout is by environment variable;
+[docs/environment-variables.md](docs/environment-variables.md) is the complete
+reference for every one mentioned below.
 
 ## How it maps to the requirements
 
@@ -30,6 +50,7 @@ Kubernetes Service and reached over the **A2A** protocol.
 | Context sharing & propagation | `remember`/`recall` tools write session state that travels across A2A hops — `app/agents/common.py` |
 | Session & memory persistence | Pluggable, env-selectable backends — `app/cluster/session.py` + `SessionModule` |
 | Artifact (blob) storage | Blob-store-agnostic via `cloudpathlib` — `app/cluster/artifacts.py` + `app/shared/artifacts.py` |
+| Human-in-the-loop | Durable pauses captured by a plugin and resumed from the session — `app/cluster/hitl.py` + `app/cluster/approvals.py` |
 | Cloud-native reference architecture | `infra/terraform` (GKE Autopilot + WI + Artifact Registry) and `infra/kustomize` |
 | ADK / DI best practices | `injector` modules (`ModelModule`, `ClusterModule`, `SessionModule`) resolved in `app/agent.py` |
 | Observability across the MAS | Trace context propagates over A2A (httpx inject + `instrument_fastapi_app` extract) → one Cloud Trace per request; trace-correlated loguru logs — see "Observability" below |
@@ -47,12 +68,20 @@ Every pod runs the same image; `AGENT_NAME` selects which agent from the registr
 (`app/agents/__init__.py`) this process becomes:
 
 - `AGENT_NAME=orchestrator` (default) → the agent with `peers=("research",
-  "math")`. It attaches them as remote sub-agents and delegates.
-- `AGENT_NAME=research` / `AGENT_NAME=math` → a leaf agent (no peers), served over
-  A2A so others can reach it.
+  "math", "planner")`. It attaches them as remote sub-agents and delegates.
+- `AGENT_NAME=research` / `math` / `planner` → a leaf agent (no peers), served
+  over A2A so others can reach it.
 
 The one asymmetry that remains — which agent is exposed to users — is a
 **deployment** concern (which Service gets external ingress), not a code one.
+
+**One deliberate variation.** A spec may set `root_node` to serve an ADK
+`Workflow` — a fixed graph of nodes — instead of a model-driven `LlmAgent`. That
+is the `planner` agent, and it is how a pipeline with a mandatory human stage is
+built. It is still one spec shape and one builder (the graph is data on the
+spec, not a second code path), but such an agent **cannot declare peers**: a
+graph has no `sub_agents`, so `build_agent` raises if a spec sets both. See
+[Human-in-the-loop](#human-in-the-loop).
 
 Add an agent by:
 
@@ -255,14 +284,71 @@ Two deliberate additions beyond what the libraries declare:
   own columns. The columns stay invisible to the ORM.
 - Indexes on `sessions.update_time` and `tasks.updated_at`, so a retention sweep
   is a range scan rather than a full table scan.
+- `hitl_approvals` (revision `0004`), the pending-pause store described next.
+  Unlike the other two this table is ours, not a library's.
+
+## Human-in-the-loop
+
+An agent can stop mid-task and wait for a person — to approve an action before
+it runs, or to answer a question — and then carry on exactly where it stopped.
+All three mechanisms reduce to the same thing: a **long-running function call**
+that ends the invocation with no final answer.
+
+Three properties make this a cluster feature rather than a request-scoped trick:
+
+**It is captured wherever it happens.** `HitlPlugin` (`app/cluster/hitl.py`)
+observes events on the Runner rather than hooking a route, so it catches pauses
+from the `/hitl` API, the ADK web UI, and inbound A2A calls alike.
+
+**It crosses A2A hops unchanged.** A pause raised inside a peer surfaces in the
+*caller's* event stream, and the answer is relayed back to that peer on the same
+A2A task — ADK and the a2a SDK do that; this repo adds no relay code. So the
+orchestrator can own the entire human-facing API while the pause happens in a
+specialist. The consequence for operators: approvals live in the **caller's**
+schema, not the paused agent's.
+
+**It is not pod-local.** A paused invocation is rebuilt from the session rather
+than held in a process's memory, so any replica can answer any approval —
+measured, not assumed. Three things keep that safe:
+
+```
+   pending ──claim (single conditional UPDATE)──▶ deciding ──▶ approved | rejected
+                                                     │
+                                    heartbeat every TTL/3 while the resume runs;
+                                    a lease that stops advancing is reclaimed
+                                    by a peer's sweep after HITL_LEASE_TTL_SECONDS
+```
+
+the approval row and the session are both in the database, the claim is a single
+conditional `UPDATE` so two deciders cannot both win, and a running resume
+heartbeats its lease so recovery reclaims only work that actually stalled. If a
+pod dies mid-resume a live peer finishes the job without waiting for a restart.
+
+**There is no `HITL_BACKEND`.** The store follows `DB_BACKEND`: durable in
+`hitl_approvals` when a database is configured, per-pod memory otherwise. With
+`DB_BACKEND=none` a restart loses every pending approval and only the pod that
+took a decision can act on it — so scaling an agent past one replica requires a
+database. The manifests stay at `replicas: 1` for cost, not correctness.
+
+One recovery limit worth knowing before you rely on it: the decision is written
+by the *claim*, so a crashed resume is re-driven without asking the human twice —
+but if the pause was inside an A2A peer whose task already completed, that task
+is terminal and the reply cannot be replayed. Such a row is closed with
+`resumed_at` left NULL and a warning logged; query `resumed_at IS NULL AND status
+IN ('approved','rejected')` to find approvals whose effect happened but whose
+answer never reached the user.
+
+> **[`docs/human-in-the-loop.md`](docs/human-in-the-loop.md)** is the full guide:
+> which of the three mechanisms to reach for, the HTTP API with real payloads, a
+> local walkthrough, and the production checklist.
 
 ## Observability: logs + distributed tracing across A2A
 
 The shared library (`app/shared/observability.py`) wires **structured logging**
 (loguru) and **OpenTelemetry tracing** for every agent. `app/agent.py` calls
 `configure_observability()` at startup, using this pod's `AGENT_NAME` as the
-trace `service.name` so `orchestrator`, `research`, and `math` appear as distinct
-services in Cloud Trace.
+trace `service.name`, so every agent appears as a distinct service in Cloud
+Trace.
 
 **One trace across the whole cluster.** ADK already emits spans (`invoke_agent`,
 `execute_tool`, `generate_content`). Here they are made to span *pods*:
@@ -299,7 +385,7 @@ its own; it relies on Google Cloud's managed observability by default.
 | Env | Default | Effect |
 | --- | --- | --- |
 | `LOG_LEVEL` | `INFO` | Log level (loguru + stdlib) |
-| `LOG_FORMAT` | `json` | `json` (Cloud Logging) or `console` (local) |
+| `LOG_FORMAT` | *(auto-detected)* | `json` (Cloud Logging) or `console` (local). Unset means "`json` unless stderr is a TTY", so pods get JSON and an interactive shell gets the readable format. The ConfigMap pins `json` anyway |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | Redirect traces to an OTLP collector instead of Cloud Trace |
 | `OTEL_SERVICE_NAME` | `AGENT_NAME` | Override the trace service name |
 
@@ -335,8 +421,12 @@ Unit tests (hermetic — pin the model tiers so no catalog lookup is needed):
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite \
 GEMINI_BALANCED_MODEL=gemini-2.5-flash \
 GEMINI_CAPABLE_MODEL=gemini-2.5-pro \
+GEMINI_EMBEDDING_MODEL=gemini-embedding-001 \
   uv run pytest tests/unit app/shared/tests -q
 ```
+
+All four pins are needed: importing `app` resolves every tier — the embedding
+model included — against the live Vertex catalog, and *raises* on failure.
 
 ## Deploy to GKE
 
@@ -373,9 +463,15 @@ agent**, and a migrator account. Provisioning AlloyDB takes several minutes.
 ```bash
 REPO=$(cd infra/terraform && terraform output -raw artifact_registry_repo)
 gcloud auth configure-docker "${REPO%%/*}"
-docker build -t "$REPO/agent:latest" .
+docker build --platform linux/amd64 -t "$REPO/agent:latest" .
 docker push "$REPO/agent:latest"
 ```
+
+> `--platform linux/amd64` is **required**. The Autopilot nodes these manifests
+> target are amd64, so on an arm64 workstation a native build produces an image
+> whose pods fail with `exec format error` — which reads like an application bug
+> rather than a build one. The base image is multi-arch, so the cross-build works
+> fine; it is just slower under emulation.
 
 ### 3. Deploy the agents (Kustomize)
 
@@ -418,9 +514,12 @@ or front it with an Ingress/Gateway (the workers stay internal `ClusterIP`).
 
 ## Notes & knobs
 
-- **Container port:** the manifests use `8080` (`PORT` in the ConfigMap and
-  `containerPort`/`targetPort`). If the container serves on a different port,
-  update those three together.
+- **Container port:** everything serves on `8080`. Note the ConfigMap's `PORT`
+  key is **documentation, not configuration** — nothing reads it; the
+  `Dockerfile` `CMD` hardcodes `--port 8080`. Moving the port means editing six
+  places by hand — the `CMD`, `EXPOSE`, each `containerPort`, each probe's
+  `tcpSocket.port`, each Service's `targetPort`, and the NetworkPolicy `ports` —
+  plus that key, to keep it honest.
 - **Least privilege:** the workers use internal `ClusterIP` Services; only the
   orchestrator needs external exposure.
 - **Scaling:** bump `replicas` per role in the overlay; the resolver addresses
