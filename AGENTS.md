@@ -1,4 +1,4 @@
-# AGENTS.md — bnpp-gke
+# AGENTS.md — mas-gke
 
 Context for coding agents working in this repo. Read this first; it should
 remove the need to re-scan the tree.

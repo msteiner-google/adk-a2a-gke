@@ -1,4 +1,4 @@
-# bnpp-gke
+# mas-gke
 
 A **multi-agent system on Kubernetes**, built on Google [ADK](https://adk.dev/):
 an orchestrator agent breaks a request into sub-tasks and delegates them to
@@ -71,7 +71,7 @@ deliberately.
 ## Project Structure
 
 ```
-bnpp-gke/
+mas-gke/
 ├── app/
 │   ├── agent.py                # Entry point: picks this process's agent by AGENT_NAME
 │   ├── fast_api_app.py         # FastAPI serving app (+ inbound A2A trace extraction)

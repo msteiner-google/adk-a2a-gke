@@ -1,5 +1,5 @@
 [project]
-name = "bnpp-gke"
+name = "mas-gke"
 version = "0.1.0"
 description = "Multi-agent system for GKE — an A2A orchestrator + specialist workers"
 license = "Apache-2.0"
