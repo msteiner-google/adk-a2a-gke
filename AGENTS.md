@@ -35,7 +35,7 @@ code path.
 All of these were run in this repo and pass as of the last update to this file.
 
 ```bash
-# Unit tests — 242 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
+# Unit tests — 259 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
 # (see "Importing app hits the network" below).
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite \
 GEMINI_BALANCED_MODEL=gemini-2.5-flash \
@@ -418,8 +418,16 @@ LSP; it also beats any `[tool.basedpyright]` section). Three things to know:
     "outdated" by this project's stricter pin; leave it alone.
 - **Docstrings required** (`D` selected, Google convention). Summary on the
   first line, no blank line before a class docstring.
-- Rule families: `E W F I B C4 UP RUF SIM N D PTH RET ARG TID`.
+- Rule families: `E W F I B C4 CPY UP RUF SIM N D PTH RET ARG TID`.
   Exempt: `app/app_utils/**`, `app/fast_api_app.py`, `**/tests/**`.
+- **Apache 2.0 header on every `.py` file** (`CPY001`, enforced everywhere —
+  the exemptions above do *not* cover it). The root `LICENSE` is what legally
+  licenses the repo; the per-file header is for files that get copied out of it,
+  which is `app/shared/**`'s whole purpose. `lint.flake8-copyright.author` pins
+  the form to `# Copyright <year> Google LLC` — a bare `# Copyright 2026` fails.
+  **CPY001 has no autofix**, so paste the 13-line block (copy it from any
+  existing file) at the top of a new file, followed by a blank line, before the
+  module docstring.
 - **No parent-relative imports across subpackages** (`TID252`). From
   `app/cluster/*` or `app/agents/*`, import absolutely: `from app.agents.base
   import AgentSpec`. Only `app/agent.py` (at the `app/` root) uses single-dot

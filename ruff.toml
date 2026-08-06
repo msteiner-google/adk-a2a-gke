@@ -27,6 +27,7 @@ select = [
     "I",    # isort (import sorting)
     "B",    # flake8-bugbear (likely bugs, e.g. mutable defaults)
     "C4",   # flake8-comprehensions
+    "CPY",  # flake8-copyright (Apache 2.0 header on every file)
     "UP",   # pyupgrade (modern syntax)
     "RUF",  # ruff-specific rules
     "SIM",  # flake8-simplify
@@ -46,6 +47,21 @@ ignore = [
 
 [lint.pydocstyle]
 convention = "google"
+
+[lint.flake8-copyright]
+# CPY001 requires the Apache 2.0 header at the top of every Python file. The
+# root LICENSE already licenses the repo — the license itself only *recommends*
+# the per-file notice — but headers travel with a file when it is copied out of
+# the repo, which is exactly what app/shared/** is built for.
+#
+# `author` is checked immediately after the copyright notice, so this matches
+# the existing "# Copyright 2026 Google LLC" form and would reject a bare
+# "# Copyright 2026". The year is left to ruff's default pattern so files
+# written in a later year do not have to be backdated.
+#
+# NOTE: CPY001 has no autofix. A new file needs the header pasted in by hand
+# (or `google/addlicense`); ruff will only tell you it is missing.
+author = "Google LLC"
 
 [lint.isort]
 known-first-party = ["app", "frontend"]
