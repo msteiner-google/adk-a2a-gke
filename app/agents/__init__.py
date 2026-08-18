@@ -22,21 +22,24 @@ source of truth for *which* agents exist and their default peer topology.
   Kubernetes Service name and the value of ``AGENT_NAME`` for that agent's pods.
 - :data:`DEFAULT_AGENT` is the agent a process becomes when ``AGENT_NAME`` is
   unset (handy for ``adk web`` and tests).
+- :data:`PAYLOADS` (defined in ``app/agents/contracts.py``) maps a name -> the
+  request contract that agent accepts. Every agent that can be delegated to
+  needs an entry, or callers fall back to an untyped request.
 
 There is no special "orchestrator" type: the orchestrator is simply the agent
-whose spec lists ``peers``. Nor is there a special *graph* type: an agent whose
-spec carries a ``root_node`` (``planner``) is served as an ADK ``Workflow``
-instead of an ``LlmAgent``, but is registered, deployed and reached identically.
+whose spec lists ``peers``, and those peers are attached as typed tools rather
+than sub-agents (see ``app/cluster/peer_tool.py``).
 
-To add an agent, create ``app/agents/<name>/`` with
-an ``agent.py`` exposing a ``SPEC``, register it below, and (for the cluster) add
-a Deployment/Service in ``infra/kustomize/base/workers.yaml``. Nothing else needs
-to change.
+To add an agent, create ``app/agents/<name>/`` with an ``agent.py`` exposing a
+``SPEC``, register it below, add its request contract to
+``app/agents/contracts.py``, and (for the cluster) add a Deployment/Service in
+``infra/kustomize/base/workers.yaml``.
 """
 
 from __future__ import annotations
 
 from app.agents.base import AgentSpec, build_agent
+from app.agents.contracts import PAYLOADS
 from app.agents.math.agent import SPEC as MATH
 from app.agents.orchestrator.agent import SPEC as ORCHESTRATOR
 from app.agents.planner.agent import SPEC as PLANNER
@@ -50,4 +53,4 @@ AGENTS: dict[str, AgentSpec] = {
 # The agent a process becomes when AGENT_NAME is unset.
 DEFAULT_AGENT = ORCHESTRATOR.name
 
-__all__ = ["AGENTS", "DEFAULT_AGENT", "AgentSpec", "build_agent"]
+__all__ = ["AGENTS", "DEFAULT_AGENT", "PAYLOADS", "AgentSpec", "build_agent"]

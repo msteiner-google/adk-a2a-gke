@@ -15,7 +15,7 @@ by executing the parsers, not just by reading them.
   [database](#database) ·
   [session, memory & tasks](#session-memory--tasks) ·
   [artifacts](#artifacts) ·
-  [HITL approvals](#hitl-approvals) ·
+  [approval cases](#approval-cases) ·
   [observability](#observability) ·
   [serving](#serving) ·
   [migrations & scripts](#migrations--scripts)
@@ -41,13 +41,11 @@ Two consequences worth knowing:
 - `load_dotenv()` in `app/fast_api_app.py` runs *after* the injector already
   exists, so a `.env` file does **not** reach most configuration. Export the
   variables in your shell for local runs.
-- `HITL_LEASE_TTL_SECONDS` is the exception — it is re-read on every claim,
-  sweep and heartbeat.
 
 **Failure style is deliberately inconsistent, so know which you are dealing
 with.** Backend *selectors* (`DB_BACKEND`, `SESSION_BACKEND`, …) raise
 `ValueError` at startup on an unknown value. Numeric *tuning* knobs
-(`DB_POOL_SIZE`, `HITL_LEASE_TTL_SECONDS`, `A2A_PEER_PORT`) never raise — a typo
+(`DB_POOL_SIZE`, `A2A_PEER_PORT`) never raise — a typo
 silently falls back to the default, because a bad ConfigMap value must not take
 the pod down. Anything that is only validated by a remote service
 (`ALLOYDB_IP_TYPE`, model ids, `DB_SCHEMA`) fails later, on first use.
@@ -106,13 +104,11 @@ Legend: **R** = raises at startup if invalid · **S** = silently falls back ·
 | `AGENT_ENGINE_ID` | — | Bare reasoning-engine id. Required by the `vertex_ai` backends | R / L |
 | `TASK_STORE_BACKEND` | `in_memory` | `in_memory` \| `database` | R |
 
-### Artifacts, HITL, observability, serving
+### Artifacts, approvals, observability, serving
 
 | Variable | Default | Effect | Bad value |
 | --- | --- | --- | --- |
 | `ARTIFACT_STORAGE_URI` | *(unset → in-memory)* | `gs://` / `s3://` / `az://` / local path. Same value for every agent | L |
-| `HITL_LEASE_TTL_SECONDS` | `30` | Approval lease liveness timeout, heartbeat interval (TTL/3) and sweep interval | S |
-| `HOSTNAME` | `socket.gethostname()` | HITL lease-owner identity. Kubernetes sets it to the pod name | S |
 | `LOG_LEVEL` | `INFO` | loguru + stdlib level | R |
 | `LOG_FORMAT` | *(auto: `json` when stderr is not a TTY)* | `json` \| `console` | S |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | Send traces to an OTLP collector instead of Cloud Trace | L |
@@ -273,27 +269,28 @@ That fallback is silent and is the trap here:
 | `~/artifacts` | local directory literally named `~` — tilde is **not** expanded |
 | `az://…` | raises: the Azure SDK is not installed in this project |
 
-Set the **same** URI for every agent. Artifacts are keyed by the ADK app name
-(`app`), not `AGENT_NAME`, which is exactly what lets an artifact cross an A2A
-hop.
+**This is not how a document reaches a specialist.** Artifacts are keyed by the
+ADK app name (`app`), the user and the session, so reaching one across agents
+means sharing a session — the implicit coupling this architecture removes. Large
+inputs travel as explicit `document_refs` in the request payload, and the
+specialist reads them itself with its own credentials (the claim-check pattern;
+see [`design-decisions.md`](design-decisions.md) D4 and
+`app/agents/documents.py`). `ARTIFACT_STORAGE_URI` is for an agent's *own*
+artifact storage; it need not be identical across agents, and setting it per
+agent is the safer default.
 
-## HITL approvals
+## Approval cases
 
-`HITL_LEASE_TTL_SECONDS` is a **liveness timeout, not a resume budget** — a
-running resume heartbeats its own lease every TTL/3, so a long resume is never
-reclaimed. One number drives three things: the staleness cutoff for reclaiming a
-`deciding` row, the heartbeat interval (TTL/3), and the recovery sweep interval
-(TTL). Non-numeric values fall back to 30 silently; `0` and negatives are
-clamped to 1 second.
+**Approval cases have no environment variables of their own, and that is the
+headline.** Nothing is held open between a proposal and its approval, so none of
+the knobs a suspend-and-resume mechanism needs exist here: no lease timeout, no
+heartbeat interval, no owner token, no recovery sweep. See
+[`design-decisions.md`](design-decisions.md) (D5).
 
-**The approval store has no backend switch of its own** — it follows
-`DB_BACKEND`. With `DB_BACKEND=none` it is a per-pod dict, so a restart loses
-every pending approval and only the pod that took a decision can act on it.
-Scaling an agent past one replica therefore requires a database.
-
-`HOSTNAME` is read **once at import** to build the lease-owner token
-`<host>/<uuid12>`. The UUID matters: a restarted pod reuses its name, and
-without the suffix a dead predecessor's lease would look like our own.
+**The case store has no backend switch of its own** — it follows `DB_BACKEND`.
+With `DB_BACKEND=none` it is a per-pod dict, so a restart loses every pending
+approval and only the replica that recorded a case can act on it. Scaling an
+agent past one replica therefore requires a database.
 
 ## Observability
 

@@ -12,34 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The planner agent's spec: a graph-rooted agent.
+"""The planner agent: drafts a plan for a human to review.
 
-Unlike every other agent here, this one is not an ``LlmAgent``. Its spec carries
-a ``root_node``, so ``build_agent`` serves the graph in
-``app/agents/planner/workflow.py`` directly. It is still an ordinary cluster
-member: one registry entry, one Deployment/Service, its own agent card, reachable
-over A2A exactly like the others.
+This agent used to be a graph — an ADK ``Workflow`` whose middle node yielded a
+``RequestInput`` to pause the whole invocation until a human replied. That was
+strategy C of the coroutine-based HITL design, and it went when that design did:
+see ``docs/design-decisions.md`` for why, and ``docs/design-decisions.md``
+for the evidence that motivated the change.
 
-``instruction``/``tier``/``tools`` are unused for a graph agent (there is no model
-to instruct), and it declares no peers — a graph has no ``sub_agents``, so it can
-be delegated *to* but cannot delegate onwards.
+What replaces it is simpler and framework-neutral: the planner **drafts and
+returns**. It holds nothing open, so a review that takes a week costs nothing.
+The human step happens where it belongs — in the caller's business workflow,
+against a case record — and a revision is an ordinary second call carrying the
+reviewer's feedback in the payload.
 """
 
 from __future__ import annotations
 
 from app.agents.base import AgentSpec
-from app.agents.planner.workflow import planner_workflow
 
 SPEC = AgentSpec(
     name="planner",
     description=(
-        "Drafts a step-by-step plan, has a human review it, and returns the "
-        "revised plan. Use when the user wants to approve or amend a plan "
-        "before it is finalised."
+        "Drafts a step-by-step plan for a human to review. Use when the user "
+        "wants a plan they can approve or amend before it is acted on."
     ),
-    # Unused for a graph agent; kept non-empty so the agent card reads sensibly
-    # and so the spec shape stays uniform across the registry.
-    instruction="",
-    tier="fast",
-    root_node=planner_workflow,
+    instruction=(
+        "You are a planning specialist. You receive a JSON request with an "
+        "`objective`, an optional `constraints` field, and a `case_id`.\n\n"
+        "- Produce a concise, numbered plan that achieves the objective and "
+        "respects every constraint.\n"
+        "- Each step must be concrete enough for someone else to execute "
+        "without asking you what you meant.\n"
+        "- Where a step is risky or irreversible, say so on the step itself, so "
+        "a reviewer can see what they are approving.\n"
+        "- If the request carries reviewer feedback on an earlier draft, "
+        "produce the revised plan and note briefly what changed.\n"
+        "- The request is all the context you have: you cannot see the "
+        "conversation it came from. Return the plan as plain text."
+    ),
+    tier="balanced",
 )

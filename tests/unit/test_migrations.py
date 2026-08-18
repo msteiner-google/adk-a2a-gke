@@ -208,75 +208,84 @@ def test_task_retention_indexes_exist(migration_sql: str) -> None:
     assert "idx_tasks_updated_at" in migration_sql
 
 
-# --- HITL approvals (ours, not a library's) ----------------------------------
+# --- Approval cases (ours, not a library's) ----------------------------------
 
 
-def test_hitl_approvals_matches_the_store_model(migration_sql: str) -> None:
+def test_approval_cases_matches_the_store_model(migration_sql: str) -> None:
     """The migration and the code's Table must not drift apart.
 
-    `hitl_approvals` is the one table no library defines, so there is no
-    upstream to compare against -- but `app/cluster/approvals.py` builds queries
+    `approval_cases` is the one table no library defines, so there is no
+    upstream to compare against -- but `app/cluster/cases.py` builds queries
     from its own `sa.Table`, and if that disagrees with the DDL the failure is a
     runtime SQL error on a live approval. This is the same guard, pointed at
     ourselves.
     """
-    from app.cluster.approvals import APPROVALS
+    from app.cluster.cases import CASES
 
-    ours = _column_definitions(_created_tables(migration_sql)["hitl_approvals"])
-    theirs = _library_columns(APPROVALS)
+    ours = _column_definitions(_created_tables(migration_sql)["approval_cases"])
+    theirs = _library_columns(CASES)
 
     # Column NAMES must match exactly. Types are compared loosely: the migration
     # carries server defaults the query layer has no reason to declare.
     assert {line.split()[0] for line in ours} == {line.split()[0] for line in theirs}, (
-        "hitl_approvals DDL has drifted from app/cluster/approvals.py:APPROVALS.\n"
+        "approval_cases DDL has drifted from app/cluster/cases.py:CASES.\n"
         f"  only in migration: {sorted(ours - theirs)}\n"
         f"  only in model:     {sorted(theirs - ours)}"
     )
 
 
-def test_hitl_approvals_carries_the_lease_columns(migration_sql: str) -> None:
-    """D4.2: without these, a crashed resume is unrecoverable."""
-    columns = {
-        line.split()[0]
-        for line in _column_definitions(
-            _created_tables(migration_sql)["hitl_approvals"]
-        )
-    }
-    assert {"deciding_since", "deciding_by", "resumed_at"} <= columns
-
-
-def test_hitl_approvals_allows_the_deciding_state(migration_sql: str) -> None:
+def test_approval_cases_allows_every_status_the_code_writes(
+    migration_sql: str,
+) -> None:
     """The CHECK constraint must permit every status the code writes."""
-    from app.cluster.approvals import STATUSES
+    from app.cluster.cases import STATUSES
 
-    body = "\n".join(_created_tables(migration_sql)["hitl_approvals"])
-    assert "ck_hitl_approvals_status" in body
+    body = "\n".join(_created_tables(migration_sql)["approval_cases"])
+    assert "ck_approval_cases_status" in body
     for status in STATUSES:
         assert f"'{status}'" in body, f"CHECK rejects status {status!r}"
 
 
-def test_hitl_approvals_capture_is_idempotent_by_constraint(
+def test_approval_cases_carries_the_audit_anchor(migration_sql: str) -> None:
+    """`proposal` is what the human approved; without it the trail is prose."""
+    columns = {
+        line.split()[0]
+        for line in _column_definitions(
+            _created_tables(migration_sql)["approval_cases"]
+        )
+    }
+    assert {"proposal", "decided_by", "decided_at", "result", "executed_at"} <= columns
+
+
+def test_approval_cases_indexes_serve_the_documented_queries(
     migration_sql: str,
 ) -> None:
-    """ADK replays a pause, so the DB -- not the code -- enforces uniqueness."""
-    assert "uq_hitl_approvals_call" in migration_sql
+    # The queue, the per-case view, and the reconciliation query for an approved
+    # action that never completed.
+    assert "idx_approval_cases_status_created" in migration_sql
+    assert "idx_approval_cases_case" in migration_sql
+    assert "idx_approval_cases_unexecuted" in migration_sql
+    assert "WHERE status = 'approved'" in migration_sql
 
 
-def test_hitl_approvals_indexes_serve_the_documented_queries(
-    migration_sql: str,
-) -> None:
-    # The global queue, the per-user list (D4.1), and the reclaim sweep (D4.2).
-    assert "idx_hitl_approvals_status_created" in migration_sql
-    assert "idx_hitl_approvals_user_pending" in migration_sql
-    assert "WHERE status = 'pending'" in migration_sql
-    assert "idx_hitl_approvals_deciding" in migration_sql
-    assert "WHERE status = 'deciding'" in migration_sql
-
-
-def test_hitl_approvals_needs_no_grant_of_its_own(migration_sql: str) -> None:
+def test_approval_cases_needs_no_grant_of_its_own(migration_sql: str) -> None:
     """Revision 0003's ALTER DEFAULT PRIVILEGES already covers later tables."""
-    approvals_ddl = migration_sql[migration_sql.index("CREATE TABLE hitl_approvals") :]
-    assert "GRANT" not in approvals_ddl
+    cases_ddl = migration_sql[migration_sql.index("CREATE TABLE approval_cases") :]
+    assert "GRANT" not in cases_ddl
+
+
+def test_the_superseded_approvals_table_is_dropped(migration_sql: str) -> None:
+    """0005 removes the coroutine-era table rather than leaving it orphaned.
+
+    Its columns existed to make a *suspended invocation* resumable. Nothing is
+    suspended any more (docs/design-decisions.md), so leaving the
+    table behind would leave rows that nothing can ever act on.
+    """
+    assert "DROP TABLE hitl_approvals" in migration_sql
+    # And it must be dropped AFTER it was created, or the render is incoherent.
+    assert migration_sql.index("CREATE TABLE hitl_approvals") < migration_sql.index(
+        "DROP TABLE hitl_approvals"
+    )
 
 
 # --- Alembic bookkeeping -----------------------------------------------------

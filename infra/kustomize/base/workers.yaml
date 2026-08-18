@@ -149,21 +149,25 @@ spec:
       port: 80
       targetPort: 8080
 ---
-# The planner is a GRAPH agent (app/agents/planner): its root is an ADK Workflow,
-# not an LlmAgent. Two consequences visible here:
+# The planner drafts a plan and returns it. It used to be a GRAPH agent whose
+# middle node paused the whole invocation until a human replied; that went with
+# the coroutine-based HITL design (docs/design-decisions.md), so it
+# is now an ordinary LlmAgent like the others. Review happens against an
+# `approval_cases` row on the orchestrator instead, which is why nothing here has
+# to survive a wait.
 #
-# 1. It borrows the math agent's identity (`serviceAccountName: agent-math`)
-#    instead of having its own `agent-planner` GSA. `var.agents` in
-#    infra/terraform/variables.tf DOES list "planner" and a plan creates
-#    `agent-planner` -- the identity simply has not been applied yet, so it does
-#    not exist in the project. Note that apply is NOT purely additive right now
-#    (it also replaces the AlloyDB private-services-access peering), so read the
-#    plan first. Give the planner its own service account once that is done;
-#    borrowing is an experiment shortcut, not a pattern to copy.
-# 2. Because it has no database role of its own, it runs on in-memory session and
-#    task backends, overriding the ConfigMap. Safe here (single replica, and the
-#    orchestrator holds the durable conversation) but it means a restart drops
-#    any plan waiting on a human.
+# It still borrows the math agent's identity (`serviceAccountName: agent-math`)
+# instead of having its own `agent-planner` GSA. `var.agents` in
+# infra/terraform/variables.tf DOES list "planner" and a plan creates
+# `agent-planner` -- the identity simply has not been applied yet, so it does not
+# exist in the project. Note that apply is NOT purely additive right now (it also
+# replaces the AlloyDB private-services-access peering), so read the plan first.
+# Give the planner its own service account once that is done; borrowing is an
+# experiment shortcut, not a pattern to copy.
+#
+# Because it has no database role of its own it runs on in-memory session and
+# task backends, overriding the ConfigMap. Harmless now that it holds no state
+# between calls: a restart loses nothing but an in-flight request.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

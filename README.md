@@ -10,7 +10,7 @@ the [A2A protocol](https://a2a-protocol.org/).
    user ───────────▶   │   orchestrator    │  entry point; plans and delegates
                        │  Deployment/Svc   │
                        └─────────┬─────────┘
-              A2A (RemoteA2aAgent, well-known agent card)
+        A2A — one typed payload per call, never the transcript
                  ┌───────────────┴───────────────┐
                  ▼                               ▼
         ┌────────────────┐              ┌────────────────┐
@@ -19,8 +19,8 @@ the [A2A protocol](https://a2a-protocol.org/).
         └────────────────┘              └────────────────┘
 
         ┌────────────────┐
-        │    planner     │  a graph agent: fixed pipeline with a human step.
-        │ Deployment/Svc │  Reachable over A2A; not one of the orchestrator's peers.
+        │    planner     │  drafts a plan for a human to review
+        │ Deployment/Svc │
         └────────────────┘
 ```
 
@@ -33,11 +33,12 @@ blast-radius isolation — and immediately raises questions a single process nev
 has to answer. How does an agent find its peers? Where does state live when the
 next request lands on a different pod? What does one trace look like when a task
 crosses three services? How does a human approve an action that is happening two
-hops away?
+hops away — when the approval might take a week? And how much of that can you do
+without the agents secretly sharing state, so a squad on LangGraph can join in?
 
 Those answers are the substance of this repo. The agents themselves are
-deliberately trivial — arithmetic, a web search, a toy plan-and-revise pipeline —
-because they are scaffolding for the parts that are not.
+deliberately trivial — arithmetic, a web search, a plan draft — because they are
+scaffolding for the parts that are not.
 
 **What is wired up:**
 
@@ -46,9 +47,10 @@ because they are scaffolding for the parts that are not.
 | **Agent definition** | Every agent is a declarative `AgentSpec` in a registry, built by one factory. There is no orchestrator class — the orchestrator is just the agent whose spec declares `peers` |
 | **One image, every agent** | `AGENT_NAME` selects which agent a process becomes at startup, so there is a single build and a single container to deploy |
 | **Service discovery** | Peers are declared in code, resolved from cluster DNS, and discovered through their published A2A agent cards |
-| **Durable state** | Sessions, A2A tasks and human approvals persist in AlloyDB, each agent in its own PostgreSQL schema, with Alembic-managed migrations |
+| **Share-nothing delegation** | A specialist is called with an explicit typed payload and sees nothing else — no transcript, no shared session state. Large inputs travel as object-store references it reads itself |
+| **Durable state** | Sessions, A2A tasks and approval cases persist in AlloyDB, each agent in its own PostgreSQL schema, with Alembic-managed migrations |
 | **Per-agent identity** | One Google service account per agent, bound by Workload Identity, authenticating to the database with IAM — no passwords anywhere |
-| **Human-in-the-loop** | An agent can pause mid-task and wait for a person, durably and across A2A hops. Three mechanisms — [docs/human-in-the-loop.md](docs/human-in-the-loop.md) |
+| **Human-in-the-loop** | A gated action is proposed, recorded as a durable case, and carried out later — so an approval can take a week and costs one row. The effect is unreachable without an approver — [docs/human-in-the-loop.md](docs/human-in-the-loop.md) |
 | **Observability** | Structured logs and distributed traces that follow a request across every hop, so one trace covers the whole cluster |
 | **Infrastructure** | Terraform for the Google Cloud side, Kustomize for the Kubernetes side, both in `infra/` |
 
@@ -61,11 +63,13 @@ deliberately.
 | If you want to… | Read |
 | --- | --- |
 | Understand the architecture in depth | **[GKE.md](GKE.md)** — service discovery, session backends, observability, deployment |
+| Understand *why* it is built this way | **[docs/design-decisions.md](docs/design-decisions.md)** — the decisions, the measurements, and the alternatives that were tried and rejected |
 | Get it running locally | [Quick Start](#quick-start), below |
 | Add an agent of your own | [docs/adding-an-agent.md](docs/adding-an-agent.md) |
 | Configure anything | [docs/environment-variables.md](docs/environment-variables.md) |
 | Make an agent wait for a human | [docs/human-in-the-loop.md](docs/human-in-the-loop.md) |
 | Deploy to your own GCP project | [docs/deploy-to-another-project.md](docs/deploy-to-another-project.md) |
+| Inspect sessions, tasks and approvals in AlloyDB | [docs/inspecting-the-database.md](docs/inspecting-the-database.md) |
 | Work on this with a coding agent | `AGENTS.md` — invariants, gotchas, verified commands |
 
 ## Project Structure
@@ -78,21 +82,22 @@ mas-gke/
 │   ├── agents/                 # WHO the agents are
 │   │   ├── __init__.py         #   the registry (AGENTS + DEFAULT_AGENT)
 │   │   ├── base.py             #   AgentSpec + the single build_agent()
-│   │   ├── common.py           #   shared tools (remember / recall)
-│   │   ├── hitl_strategies.py  #   the human-in-the-loop tool strategies
+│   │   ├── contracts.py        #   THE WIRE CONTRACTS: opt-in payload model per agent
+│   │   ├── documents.py        #   read_document (claim-check references)
+│   │   ├── reporting.py        #   keeps structured results intact across A2A
 │   │   ├── orchestrator/       #   entry point (declares peers)
 │   │   ├── research/           #   specialist + web_search tool
-│   │   ├── math/               #   specialist + calculate tool
-│   │   └── planner/            #   graph agent with a human step
+│   │   ├── math/               #   specialist + calculate, propose/execute_publish
+│   │   └── planner/            #   specialist that drafts a plan for review
 │   ├── cluster/                # The PLUMBING
 │   │   ├── config.py           #   env -> ClusterConfig / peers
-│   │   ├── resolver.py         #   peers -> RemoteA2aAgent (agent-card discovery)
+│   │   ├── resolver.py         #   peers -> typed PeerTool (agent-card discovery)
+│   │   ├── peer_tool.py        #   explicit-payload delegation (never the transcript)
 │   │   ├── di.py               #   injector modules
 │   │   ├── session.py          #   pluggable session + memory backends
 │   │   ├── artifacts.py        #   blob-store-agnostic artifact storage (cloudpathlib)
 │   │   ├── tasks.py            #   pluggable A2A task store
-│   │   ├── hitl.py             #   pause capture + resume
-│   │   ├── approvals.py        #   the approval store and its state machine
+│   │   ├── cases.py            #   approval cases: propose -> decide -> execute
 │   │   ├── db.py               #   the one AsyncEngine per pod (AlloyDB, IAM auth)
 │   │   └── bootstrap.py        #   creates the database (no Terraform resource exists)
 │   ├── migrations/             # Alembic. Under app/ so the image carries it.
@@ -107,7 +112,7 @@ mas-gke/
 ├── tests/                      # unit / integration / eval
 ├── docs/                       # environment-variables, adding-an-agent,
 │                               #   inspecting-the-database, human-in-the-loop,
-│                               #   deploy-to-another-project, plans/
+│                               #   design-decisions, deploy-to-another-project
 ├── AGENTS.md                   # AI-assisted development guide
 └── pyproject.toml              # Project dependencies
 ```
@@ -154,9 +159,28 @@ AGENT_NAME=math uv run adk web
 
 You can also use features from the [ADK](https://adk.dev/) CLI with `uv run adk`.
 
-### Exercise A2A delegation locally
+### Run the whole cluster locally
 
-Run two processes and point the orchestrator at the specialist:
+The agents only behave like a distributed system when they are genuinely in
+separate processes, so the Makefile starts all four and wires the peer URLs:
+
+```bash
+make check     # credentials, location, and that the model is actually reachable
+make up        # orchestrator :8090, math :8091, research :8092, planner :8093
+make demo      # the approval flow end to end, asserted rather than eyeballed
+make down
+```
+
+`make status` shows health and the resolved model per agent; `make logs A=math`
+follows one; `make serve-math` runs a single agent in the foreground.
+
+`make check` is worth running first. Two settings break this in ways that look
+like something else — a stale `GOOGLE_CLOUD_LOCATION` produces a 403 that reads
+as a model problem, and a `GOOGLE_API_KEY` in your shell makes google-genai
+bypass Application Default Credentials entirely. The Makefile neutralises both;
+`check` tells you before you spend time on it.
+
+To do it by hand instead — two processes, orchestrator pointed at a specialist:
 
 ```bash
 # Terminal 1 — the math specialist
@@ -197,16 +221,18 @@ AGENT_NAME=orchestrator A2A_PEERS=math=http://127.0.0.1:8091 \
 
 Each agent is a declarative `AgentSpec` in `app/agents/<name>/agent.py`,
 registered in `app/agents/__init__.py`. There is no special orchestrator class —
-the orchestrator is simply the agent whose spec declares `peers`. (One variation:
-a spec may set `root_node` to serve a fixed graph instead of a model-driven
-agent, which is what `planner` does.)
+the orchestrator is simply the agent whose spec declares `peers`.
 
 **To add an agent**, in code:
 
 1. Create `app/agents/<name>/agent.py` exposing a `SPEC = AgentSpec(...)`
    (agent-specific tools go in `app/agents/<name>/tools.py`).
 2. Register it in `app/agents/__init__.py`.
-3. Add the name to another agent's `AgentSpec.peers` if it should be delegated to.
+3. *Optional, but the convention here:* declare its request contract in
+   `app/agents/contracts.py` and add it to `PAYLOADS`. The default contract
+   between agents is a single free-text task plus a `case_id`; a model here
+   upgrades that to named, validated, card-published fields.
+4. Add the name to another agent's `AgentSpec.peers` if it should be delegated to.
 
 Use a single lowercase word valid as **both** a Python identifier and a
 Kubernetes DNS label (e.g. `research`, `math`) — the Service name must equal the
@@ -222,7 +248,7 @@ walkthrough with a checklist.
 ## Configuration
 
 Everything is configured by environment variable — which agent a process becomes,
-which model tier it uses, whether sessions, tasks, artifacts and HITL approvals
+which model tier it uses, whether sessions, tasks, artifacts and approval cases
 are durable or per-pod.
 
 **[docs/environment-variables.md](docs/environment-variables.md)** is the
@@ -291,22 +317,26 @@ The project-specific values to fill before step 3 — all of them come from
 
 ## Human-in-the-loop
 
-An agent can stop mid-task and wait for a person — to approve an action before it
-runs, or to answer a question. The pause is durable, survives a restart when a
-database is configured, and works unchanged when the paused agent is an A2A hop
-away from the human, so the orchestrator can own the whole human-facing API.
+An action that needs sign-off is **proposed, not performed**. The specialist
+returns a proposal and finishes; the orchestrator records a durable case and
+answers the user. Nothing is held open, so an approval can take a fortnight and
+costs one row. When it arrives, the same request is re-sent with the approver
+attached, and the specialist recomputes the result from the same input — so
+there is nothing for anyone to retype incorrectly.
 
 ```bash
-curl -X POST localhost:8080/hitl/run -H 'content-type: application/json' \
-  -d '{"text":"Ask the math specialist to compute 23 * 19 and publish the result."}'
-# → status "paused", with what is waiting and the exact call being gated
-curl -X POST localhost:8080/hitl/approvals/<id> -H 'content-type: application/json' \
-  -d '{"approved":true,"text":"approved by ops"}'
+curl -X POST localhost:8080/cases/run -H 'content-type: application/json' \
+  -d '{"text":"Work out 17 * 23 and publish it as q3-revenue."}'
+# → status "awaiting_approval", with the proposal and what it would do
+curl -X POST localhost:8080/cases/<proposal_id> -H 'content-type: application/json' \
+  -d '{"approved":true,"decided_by":"ops@example.com"}'
+# → status "executed"
 ```
 
-Three mechanisms — gate an action, ask a question, or a fixed pipeline with a
-human stage. **[docs/human-in-the-loop.md](docs/human-in-the-loop.md)** covers
-which to reach for, with a local walkthrough.
+Nothing is suspended between the two calls, so there is no recovery machinery —
+and nothing ADK-specific either, so a specialist on another framework implements
+the same two skills. **[docs/human-in-the-loop.md](docs/human-in-the-loop.md)**
+has the walkthrough and the known limits.
 
 ## Observability
 

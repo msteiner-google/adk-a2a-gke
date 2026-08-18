@@ -31,8 +31,8 @@
 # only handles Google-Agent-Engine headers, not the standard `traceparent`, so
 # this explicit instrumentation is what makes cross-pod A2A tracing work.
 
-import asyncio
 import contextlib
+import dataclasses
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -54,7 +54,7 @@ from pydantic import BaseModel
 from app.app_utils import services
 from app.app_utils.a2a import attach_a2a_routes
 from app.app_utils.typing import Feedback
-from app.cluster import approvals, hitl
+from app.cluster import cases
 from app.cluster.artifacts import ARTIFACT_STORAGE_URI_ENV
 from app.cluster.db import DatabaseConfig
 from app.shared.telemetry import instrument_fastapi_app
@@ -122,52 +122,63 @@ if os.environ.get(ARTIFACT_STORAGE_URI_ENV, "").strip():
     get_service_registry().register_artifact_service("shared", _shared_artifact_service)
 
 
-async def _sweep_abandoned_resumes(
-    runner: Runner, store: approvals.ApprovalStore
-) -> None:
-    """Reclaim and finish resumes whose owner stopped renewing their lease.
+@dataclasses.dataclass
+class TurnResult:
+    """What one conversational turn produced.
 
-    Runs for the life of the process, on every replica. A resume in flight keeps
-    its own lease fresh, so this only ever picks up work whose owner died.
+    Attributes:
+        trace: One log-friendly line per event.
+        final_text: The agent's final answer, if it produced one.
+        texts: Every text body the turn emitted — tool results included. A
+            specialist reached over A2A arrives as a tool result, so this is
+            where a reported proposal is found.
+    """
 
-    Nothing here may escape: a sweep that raises would kill the task and leave
-    recovery silently off for the rest of the pod's life, which is worse than a
-    failed tick.
+    trace: list[str] = dataclasses.field(default_factory=list)
+    final_text: str | None = None
+    texts: list[str] = dataclasses.field(default_factory=list)
+
+
+async def _run_turn(
+    runner: Runner, *, user_id: str, session_id: str, text: str
+) -> TurnResult:
+    """Drive one conversational turn and collect what it produced.
 
     Args:
-        runner: The serving Runner, used to drive a recovered resume.
-        store: The injector's approval store.
+        runner: The serving Runner.
+        user_id: The session's user.
+        session_id: The session to run on.
+        text: The user (or system) message to send.
+
+    Returns:
+        The turn's trace, final answer and every text it emitted.
     """
-    interval = approvals.lease_ttl_seconds()
-    while True:
-        try:
-            for item in await hitl.redrive_abandoned(runner, store):
-                # Separate a genuine replay from a row that was merely closed
-                # out. The second means the human's decision took effect but the
-                # conversation never got its answer -- someone must know.
-                if item.get("replayed"):
-                    log.info("HITL: replayed abandoned resume {}", item["approval_id"])
-                else:
-                    log.warning(
-                        "HITL: approval {} finished as {} WITHOUT a replayed answer "
-                        "(decision stands, narration lost): {}",
-                        item["approval_id"],
-                        item.get("status"),
-                        item.get("errors") or item.get("error") or "no final response",
-                    )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("HITL: abandoned-resume sweep failed")
-        await asyncio.sleep(interval)
+    result = TurnResult()
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=genai_types.Content(
+            role="user", parts=[genai_types.Part(text=text)]
+        ),
+    ):
+        result.trace.append(cases.summarise(event))
+        result.texts.extend(cases.reply_texts(event))
+        if (
+            event.is_final_response()
+            and event.content
+            and event.content.parts
+            and (body := "".join(p.text or "" for p in event.content.parts).strip())
+        ):
+            result.final_text = body
+    return result
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.agent import app as adk_app
     from app.agent import (
-        approval_store,
         artifact_service,
+        case_store,
         database,
         root_agent,
         session_service,
@@ -191,9 +202,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.runner = runner
     app.state.agent_app_name = adk_app.name
-    # The one store the injector built, shared with the capture plugin that
-    # app/agent.py handed the same instance to.
-    app.state.approval_store = approval_store
+    # The one store the injector built. Only this agent writes it: a case
+    # belongs to whoever asked the human, not to the specialist that proposed.
+    app.state.case_store = case_store
     await attach_a2a_routes(
         app,
         agent=root_agent,
@@ -204,19 +215,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         rpc_path=f"/a2a/{adk_app.name}",
     )
 
-    # HITL recovery (D4.2) runs on a timer rather than only at startup: a lease
-    # is reclaimed on staleness, not on whose name is against it, so any replica
-    # can recover any dead owner's work and a crash no longer waits for a
-    # restart to be noticed.
-    sweeper = asyncio.create_task(_sweep_abandoned_resumes(runner, approval_store))
+    # No recovery task. Nothing is held open between a proposal and its
+    # approval, so there is no in-flight work a crash could strand -- which is
+    # the operational point of modelling approval as business state rather than
+    # a suspended invocation (docs/design-decisions.md).
 
     yield
 
-    # Stop the sweeper before the pool goes away, or its next tick queries a
-    # disposed engine on the way down.
-    sweeper.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await sweeper
     # Dispose the pool and stop the AlloyDB connector's background certificate
     # refresh, which would otherwise keep the event loop alive on shutdown.
     await database.aclose()
@@ -255,171 +260,141 @@ def collect_feedback(feedback: Feedback) -> dict[str, str]:
     return {"status": "success"}
 
 
-# --- Human-in-the-loop --------------------------------------------------------
-# The approval surface. Capture happens in app/cluster/hitl.py's plugin, which
-# runs on the Runner, so a pause is recorded whichever surface drove it -- these
-# routes, the ADK web UI, or an inbound A2A call. Resuming goes through the SAME
-# Runner (app.state.runner), so it shares the session and artifact services the
-# rest of the serving layer uses.
+# --- Approval cases -----------------------------------------------------------
+# The human's window onto work that needs sign-off. A specialist never blocks:
+# it returns a proposal and finishes, this agent records a case, and the
+# approved action is carried out later by an ordinary new call. Nothing is held
+# open in between, so an approval may take a week.
+#
+# See docs/design-decisions.md (D5) for why this replaced the previous
+# pause-and-resume machinery, and docs/human-in-the-loop.md for the guide.
 
 
-class HitlRun(BaseModel):
-    """Start (or continue) a conversation that may pause for a human."""
+class CaseRun(BaseModel):
+    """Start (or continue) a conversation that may raise an approval."""
 
     text: str
     session_id: str | None = None
-    user_id: str = "hitl-user"
+    user_id: str = "case-user"
 
 
-class HitlDecision(BaseModel):
-    """A human's answer to a pending approval."""
+class CaseDecision(BaseModel):
+    """A human's decision on a pending case."""
 
     approved: bool = True
-    """Used by confirmation pauses; ignored by free-form input pauses."""
-    text: str = ""
-    """Free-form reply: the note on a confirmation, the answer to a question."""
+    note: str = ""
+    """Free-form feedback recorded with the decision."""
     decided_by: str = ""
     """Who decided, for audit. NOT verified -- see docs/human-in-the-loop.md."""
 
 
-@app.post("/hitl/run")
-async def hitl_run(req: HitlRun) -> dict[str, Any]:
-    """Run a turn and report whether it completed or paused for a human."""
+@app.post("/cases/run")
+async def cases_run(req: CaseRun) -> dict[str, Any]:
+    """Run a turn and report any approvals it raised."""
     runner = app.state.runner
-    store = app.state.approval_store
-    session_id = req.session_id or f"hitl-{uuid.uuid4().hex[:8]}"
+    store: cases.CaseStore = app.state.case_store
+    session_id = req.session_id or f"case-{uuid.uuid4().hex[:8]}"
 
-    # Scope the before/after diff to THIS session. The store is shared across
-    # replicas, so an unscoped diff would report a pause raised by somebody
-    # else's concurrent request as belonging to this one.
-    def mine(items: list[approvals.PendingApproval]) -> list[approvals.PendingApproval]:
-        return [item for item in items if item.session_id == session_id]
-
-    known = {p.approval_id for p in mine(await store.list_by_status(approvals.PENDING))}
-    trace: list[str] = []
-    final_text: str | None = None
-    async for event in runner.run_async(
-        user_id=req.user_id,
-        session_id=session_id,
-        new_message=genai_types.Content(
-            role="user", parts=[genai_types.Part(text=req.text)]
-        ),
-    ):
-        trace.append(hitl.summarise(event))
-        if (
-            event.is_final_response()
-            and event.content
-            and event.content.parts
-            and (text := "".join(p.text or "" for p in event.content.parts).strip())
-        ):
-            final_text = text
-    new = [
-        p.public()
-        for p in mine(await store.list_by_status(approvals.PENDING))
-        if p.approval_id not in known
-    ]
-    return {
-        "status": "paused" if new else "completed",
-        "session_id": session_id,
-        "final_text": final_text,
-        "pending": new,
-        "trace": trace,
-    }
-
-
-@app.get("/hitl/session/{session_id}")
-async def hitl_session(session_id: str, user_id: str = "hitl-user") -> dict[str, Any]:
-    """Dump a session's events. Diagnostic surface for pauses and resumes."""
-    session = await app.state.runner.session_service.get_session(
-        app_name=app.state.agent_app_name, user_id=user_id, session_id=session_id
+    turn = await _run_turn(
+        runner, user_id=req.user_id, session_id=session_id, text=req.text
     )
-    if session is None:
-        raise HTTPException(status_code=404, detail="unknown session")
-    return {
-        "count": len(session.events),
-        "events": [
-            {
-                "author": e.author,
-                "summary": hitl.summarise(e),
-                # Not a plain model_dump(): a Part's thought_signature is raw
-                # bytes and used to 500 the whole route. See hitl.content_json.
-                "content": hitl.content_json(e),
-                "custom_metadata": e.custom_metadata,
-            }
-            for e in session.events
-        ],
-    }
 
-
-@app.get("/hitl/approvals")
-async def hitl_approvals(status: str = approvals.PENDING) -> dict[str, Any]:
-    """List captured approvals, oldest first."""
-    items = [p.public() for p in await app.state.approval_store.list_by_status(status)]
-    return {"count": len(items), "approvals": items}
-
-
-@app.post("/hitl/approvals/{approval_id}")
-async def hitl_decide(approval_id: str, decision: HitlDecision) -> dict[str, Any]:
-    """Answer a pending approval and resume the paused invocation."""
-    store = app.state.approval_store
-
-    # Claim and record the decision in ONE write, before resuming (D4.2). Two
-    # properties come from that ordering. A concurrent retry loses the race
-    # rather than driving the same invocation twice; and if this pod dies
-    # mid-resume, the row still carries what the human said, so the startup
-    # sweep can finish the job without asking again. The claim is reclaimable,
-    # which is what stops a crash from making the approval permanently
-    # un-retryable -- the R4 failure, see docs/plans/hitl/results.md.
-    outcome, pending = await store.claim(
-        approval_id,
-        decision={"approved": decision.approved, "text": decision.text},
-        decided_by=decision.decided_by,
-    )
-    if outcome is approvals.ClaimOutcome.NOT_FOUND or pending is None:
-        raise HTTPException(status_code=404, detail="unknown approval_id")
-    if outcome is approvals.ClaimOutcome.ALREADY_DECIDED:
-        # Idempotent: report the recorded outcome instead of resuming twice.
-        return {"status": "already_decided", "approval": pending.public()}
-    if outcome is approvals.ClaimOutcome.IN_PROGRESS:
-        raise HTTPException(
-            status_code=409,
-            detail="a resume is already running for this approval; retry later",
+    opened: list[dict[str, Any]] = []
+    for found in cases.find_proposals(turn.texts):
+        case = cases.case_from_proposal(
+            found, session_id=session_id, case_id=session_id
         )
+        if await store.open(case):
+            opened.append(case.public())
 
-    try:
-        # Hold the lease open for as long as the resume runs. Without this a
-        # sweep -- on this pod or any other replica -- would see the lease go
-        # stale after the TTL and re-drive an invocation still in flight.
-        async with approvals.heartbeat(store, approval_id):
-            trace, final_text = await hitl.resume(
-                app.state.runner, pending, hitl.content_for(pending)
-            )
-    except LookupError as exc:
-        await store.release(approval_id)
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        # ADK rejects a response that does not match the pause's response_schema
-        # (R4). Surface it as a client error rather than letting it escape as an
-        # unhandled ASGI exception, which drops the connection -- and, through a
-        # port-forward, kills the tunnel -- while telling the caller nothing.
-        await store.release(approval_id)
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception:
-        # Any other failure is ours to recover from too: put it back so the
-        # human can retry once the cause is fixed.
-        await store.release(approval_id)
-        raise
-
-    await store.complete(
-        approval_id,
-        status=approvals.APPROVED if decision.approved else approvals.REJECTED,
-    )
-    refreshed = await store.get(approval_id)
     return {
-        "status": "resumed",
-        "approval": (refreshed or pending).public(),
-        "final_text": final_text,
-        "trace": trace,
+        "status": "awaiting_approval" if opened else "completed",
+        "session_id": session_id,
+        "user_id": req.user_id,
+        "final_text": turn.final_text,
+        "pending": opened,
+        "trace": turn.trace,
+    }
+
+
+@app.get("/cases")
+async def cases_list(status: str = cases.PENDING) -> dict[str, Any]:
+    """List approval cases in a status, oldest first."""
+    items = [c.public() for c in await app.state.case_store.list_by_status(status)]
+    return {"count": len(items), "cases": items}
+
+
+@app.get("/cases/{proposal_id}")
+async def case_detail(proposal_id: str) -> dict[str, Any]:
+    """Read one approval case."""
+    case = await app.state.case_store.get(proposal_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="unknown proposal_id")
+    return case.public()
+
+
+@app.post("/cases/{proposal_id}")
+async def case_decide(
+    proposal_id: str, decision: CaseDecision, user_id: str = "case-user"
+) -> dict[str, Any]:
+    """Decide a pending case and, if approved, carry the action out.
+
+    The decision is written FIRST and separately from the execution. That
+    ordering is what makes this recoverable with no lease and no sweeper: if the
+    pod dies before or during the execution turn, the decision still stands on
+    the row, and calling this endpoint again re-drives it. A retry is safe
+    because a closed case short-circuits below rather than running twice.
+    """
+    store: cases.CaseStore = app.state.case_store
+
+    outcome, case = await store.decide(
+        proposal_id,
+        approved=decision.approved,
+        decided_by=decision.decided_by,
+        note=decision.note,
+    )
+    if outcome is cases.DecisionOutcome.NOT_FOUND or case is None:
+        raise HTTPException(status_code=404, detail="unknown proposal_id")
+    if case.status == cases.REJECTED:
+        return {"status": "rejected", "case": case.public()}
+    if case.status in (cases.EXECUTED, cases.FAILED):
+        # Idempotent: the action already ran, so report it instead of repeating.
+        return {"status": "already_executed", "case": case.public()}
+
+    # Approved. Ask the agent to carry the action out: an ordinary new turn, not
+    # a resumed invocation, which is why the elapsed time since the proposal
+    # costs nothing.
+    turn = await _run_turn(
+        app.state.runner,
+        user_id=user_id,
+        session_id=case.session_id,
+        text=cases.execution_instruction(case),
+    )
+
+    performed = cases.find_execution(turn.texts, case.proposal)
+    if performed is None:
+        # "No exception" is not proof the effect happened -- the trap this repo
+        # has hit before (docs/design-decisions.md). Say so plainly and
+        # leave the case re-drivable rather than recording it as done.
+        log.warning(
+            "case {}: approved, but the reply carried no confirmed execution",
+            proposal_id,
+        )
+        return {
+            "status": "approved_not_confirmed",
+            "case": (await store.get(proposal_id) or case).public(),
+            "final_text": turn.final_text,
+            "trace": turn.trace,
+        }
+
+    updated = await store.record_execution(
+        proposal_id, succeeded=True, result=performed
+    )
+    return {
+        "status": "executed",
+        "case": (updated or case).public(),
+        "final_text": turn.final_text,
+        "trace": turn.trace,
     }
 
 

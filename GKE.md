@@ -17,8 +17,8 @@ Kubernetes Service and reached over the **A2A** protocol.
 │    research    │    │      math      │    │    planner     │  specialists
 │ Deployment/Svc │    │ Deployment/Svc │    │ Deployment/Svc │  (workers)
 └────────────────┘    └────────────────┘    └────────────────┘
-                                             a graph agent with
-                                             a human approval step
+
+Every arrow above carries ONE typed payload, never the caller's transcript.
 ```
 
 **This is the architecture document** — how the pieces fit and why they were
@@ -46,11 +46,12 @@ reference for every one mentioned below.
 | Multi-agent runtime architecture | One image, agent-selected at startup (`AGENT_NAME`) — `app/agent.py` |
 | Uniform agent model | Every agent is an `AgentSpec` built by one `build_agent` — `app/agents/base.py` |
 | Orchestration / planner layer | `app/agents/orchestrator/agent.py` (an agent whose spec declares peers; delegates via ADK agent transfer) |
-| Agent-to-agent communication | `app/cluster/resolver.py` builds `RemoteA2aAgent`s from peer agent cards |
-| Context sharing & propagation | `remember`/`recall` tools write session state that travels across A2A hops — `app/agents/common.py` |
+| Agent-to-agent communication | `app/cluster/resolver.py` builds typed `PeerTool`s from peer agent cards |
+| Context provisioning | Explicit payload per call, free text by default and typed where a contract is declared — `app/agents/contracts.py`; no transcript, no shared session state |
+| Large inputs | Claim-check: object-store references in the payload, read by the specialist — `app/agents/documents.py` |
 | Session & memory persistence | Pluggable, env-selectable backends — `app/cluster/session.py` + `SessionModule` |
 | Artifact (blob) storage | Blob-store-agnostic via `cloudpathlib` — `app/cluster/artifacts.py` + `app/shared/artifacts.py` |
-| Human-in-the-loop | Durable pauses captured by a plugin and resumed from the session — `app/cluster/hitl.py` + `app/cluster/approvals.py` |
+| Human-in-the-loop | Propose → durable case → execute — `app/cluster/cases.py` + `app/agents/math/tools.py` |
 | Cloud-native reference architecture | `infra/terraform` (GKE Autopilot + WI + Artifact Registry) and `infra/kustomize` |
 | ADK / DI best practices | `injector` modules (`ModelModule`, `ClusterModule`, `SessionModule`) resolved in `app/agent.py` |
 | Observability across the MAS | Trace context propagates over A2A (httpx inject + `instrument_fastapi_app` extract) → one Cloud Trace per request; trace-correlated loguru logs — see "Observability" below |
@@ -75,19 +76,20 @@ Every pod runs the same image; `AGENT_NAME` selects which agent from the registr
 The one asymmetry that remains — which agent is exposed to users — is a
 **deployment** concern (which Service gets external ingress), not a code one.
 
-**One deliberate variation.** A spec may set `root_node` to serve an ADK
-`Workflow` — a fixed graph of nodes — instead of a model-driven `LlmAgent`. That
-is the `planner` agent, and it is how a pipeline with a mandatory human stage is
-built. It is still one spec shape and one builder (the graph is data on the
-spec, not a second code path), but such an agent **cannot declare peers**: a
-graph has no `sub_agents`, so `build_agent` raises if a spec sets both. See
-[Human-in-the-loop](#human-in-the-loop).
+**Peers are attached as tools, not sub-agents**, and that is the load-bearing
+detail of the whole design. A peer in `sub_agents` is reached with
+`transfer_to_agent`, which hands it the caller's session — measured at ten
+message parts, including the user's phone number and a different specialist's
+answer, where the task needed one. A peer in `tools` receives exactly the payload
+the caller composed. See [Context provisioning](#context-provisioning) below and
+[`docs/design-decisions.md`](docs/design-decisions.md) (D1).
 
 Add an agent by:
 
 1. Creating `app/agents/<name>/agent.py` exposing a `SPEC = AgentSpec(...)` (put
-   agent-specific tools in `app/agents/<name>/tools.py`; shared context tools
-   live in `app/agents/common.py`).
+   agent-specific tools in `app/agents/<name>/tools.py`) and — optional in the
+   mechanism, conventional here — declaring its request contract in
+   `app/agents/contracts.py`.
 2. Registering it in `app/agents/__init__.py`.
 3. Adding it to the delegating agent's `AgentSpec.peers`.
 4. For the cluster: five files under `infra/` — `var.agents`,
@@ -133,6 +135,74 @@ role to `http://<service-name>.<namespace>.svc.cluster.local` (see
 `infra/kustomize/base/orchestrator.yaml` and `workers.yaml`). It must match how
 peers address that Service.
 
+## Context provisioning
+
+**A specialist sees the payload it was sent, and nothing else.** No conversation
+history, no shared session state, no shared artifact handles. Everything it needs
+arrives in that payload; everything else stays with the caller.
+
+**How structured the payload is, is a per-peer choice.** The default contract
+between two agents here is one free-text `task` plus a `case_id`
+(`UnknownPeerRequest` in `app/cluster/resolver.py`) — enough to keep delegation
+explicit, and the honest level for a peer another squad owns whose real schema
+lives in its own agent card. Declaring a model in `app/agents/contracts.py` is
+the **opt-in** upgrade: named parameters the calling model sees, validation
+before the call leaves the pod, and a JSON Schema published in the card. Every
+agent in this repo takes the upgrade — one free-text field is where a caller
+starts pasting the conversation back in — but the mechanism supports both, and
+a peer with no declared model is still a first-class peer.
+
+This is a wiring decision, and it is easy to reverse by accident. A peer attached
+as an ADK **sub-agent** is reached with `transfer_to_agent`, and
+`RemoteA2aAgent` then rebuilds the outbound A2A message from the caller's
+*session events* — every turn since the peer last replied, with other agents'
+replies folded in and prefixed `For context:`. Measured on this repo's own
+agents, that was **ten message parts** where the task needed one, and it
+included the user's personal phone number and a different specialist's answer
+([`docs/design-decisions.md`](docs/design-decisions.md), D1).
+
+A peer attached as a **tool** (`app/cluster/peer_tool.py`) runs against a fresh
+session whose only content is the arguments the caller composed:
+
+```json
+{"case_id": "case-123", "question": "Is BNP Paribas registered in IE?"}
+```
+
+Four things follow, and each is a problem under `sub_agents`:
+
+- **Data segregation.** A specialist cannot receive personal or unrelated detail
+  that merely happened to be earlier in the conversation.
+- **Attention.** The model is not handed nine irrelevant parts, each explicitly
+  labelled as context to weigh.
+- **Cost and latency.** The transcript is not re-sent to every specialist on
+  every turn.
+- **Framework independence.** The contract is a JSON Schema published in the
+  agent card, so a LangGraph or plain-FastAPI specialist is a first-class peer.
+
+**Continuity is declared, not implicit.** Where a specialist genuinely needs to
+build on earlier work — entity disambiguation, say — the caller passes the same
+`case_id` and the specialist keys **its own** private store on it. A2A's
+`contextId` carries the same idea at the protocol level. Either way, continuity
+is part of the contract rather than a side effect of the transport.
+
+**Large inputs travel by reference.** A caller passes
+`document_refs: ["gs://bucket/cases/123/dossier.pdf"]` and the specialist reads
+it with `read_document` (`app/agents/documents.py`), using its own credentials.
+Embedding the document would blow the payload and the context window, but the
+real reason is division of labour: if the caller had to pre-summarise a 200-page
+filing to fit, the caller would be doing domain extraction it is not qualified
+for. The planner knows *which* document matters; the specialist knows what to
+take out of it.
+
+**The one thing that is convention rather than enforcement:** ADK's `AgentTool`
+copies the parent's session state into the child session (filtering only
+`_adk`-prefixed keys). That state never reaches the wire — measured — so it
+is not a cross-pod leak, but it does mean the isolation depends on nobody
+writing shared state in the first place. A tool that stashes a value for another
+agent to pick up is the thing to reject in review: the transport does not carry
+it, so it cannot work as advertised
+([`docs/design-decisions.md`](docs/design-decisions.md), D3).
+
 ## Session & memory persistence
 
 Wired through dependency injection so agent code depends only on ADK base
@@ -168,14 +238,16 @@ backend, so a second selector could only contradict it. Credentials follow each
 provider's normal discovery — in the cluster that is ADC via Workload Identity,
 with no key material anywhere.
 
-**Every agent shares one artifact namespace, on purpose.** Artifacts are keyed by
+**This is not how a document reaches a specialist.** Artifacts are keyed by
 `{app_name}/{user_id}/{session_id}/{filename}/{version}`, and `app_name` is the
-ADK `App` name (`"app"`) for every agent — not `AGENT_NAME`. Pointing all agents
-at the same URI is therefore what lets `research` save a document that the
-orchestrator loads back on the same session: the artifact counterpart of the
-`shared:` session state written by `remember`/`recall`. This deliberately does
-*not* mirror the schema-per-agent split used for AlloyDB; the trade-off is that
-bucket-level IAM lets any agent read any artifact, which
+ADK `App` name (`"app"`) for every agent — so reaching one across agents means
+sharing a session, which is exactly the implicit coupling this architecture
+removes. Large inputs travel as explicit `document_refs` in the request payload
+and the specialist reads them itself
+([Context provisioning](#context-provisioning)). `ARTIFACT_STORAGE_URI` is for
+an agent's *own* artifact storage; it need not be identical across agents, and a
+per-agent prefix is the safer default. The trade-off with one shared bucket is
+that bucket-level IAM lets any agent read any object, which
 `infra/terraform/artifacts.tf` documents along with how to tighten it.
 
 The bucket is provisioned by `infra/terraform/artifacts.tf` (uniform bucket-level
@@ -284,63 +356,69 @@ Two deliberate additions beyond what the libraries declare:
   own columns. The columns stay invisible to the ORM.
 - Indexes on `sessions.update_time` and `tasks.updated_at`, so a retention sweep
   is a range scan rather than a full table scan.
-- `hitl_approvals` (revision `0004`), the pending-pause store described next.
-  Unlike the other two this table is ours, not a library's.
+- `approval_cases` (revision `0005`), the approval store described next. Unlike
+  the other two this table is ours, not a library's. Revision `0005` also drops
+  `hitl_approvals`, the coroutine-era table it replaces.
 
 ## Human-in-the-loop
 
-An agent can stop mid-task and wait for a person — to approve an action before
-it runs, or to answer a question — and then carry on exactly where it stopped.
-All three mechanisms reduce to the same thing: a **long-running function call**
-that ends the invocation with no final answer.
-
-Three properties make this a cluster feature rather than a request-scoped trick:
-
-**It is captured wherever it happens.** `HitlPlugin` (`app/cluster/hitl.py`)
-observes events on the Runner rather than hooking a route, so it catches pauses
-from the `/hitl` API, the ADK web UI, and inbound A2A calls alike.
-
-**It crosses A2A hops unchanged.** A pause raised inside a peer surfaces in the
-*caller's* event stream, and the answer is relayed back to that peer on the same
-A2A task — ADK and the a2a SDK do that; this repo adds no relay code. So the
-orchestrator can own the entire human-facing API while the pause happens in a
-specialist. The consequence for operators: approvals live in the **caller's**
-schema, not the paused agent's.
-
-**It is not pod-local.** A paused invocation is rebuilt from the session rather
-than held in a process's memory, so any replica can answer any approval —
-measured, not assumed. Three things keep that safe:
+An action that must not happen without a person is **proposed, not performed**.
+The specialist returns a proposal and finishes its turn; the caller records a
+durable case and answers the user; the approved action is carried out later by
+an ordinary new call.
 
 ```
-   pending ──claim (single conditional UPDATE)──▶ deciding ──▶ approved | rejected
-                                                     │
-                                    heartbeat every TTL/3 while the resume runs;
-                                    a lease that stops advancing is reclaimed
-                                    by a peer's sweep after HITL_LEASE_TTL_SECONDS
+   pending ──decide (single conditional UPDATE)──▶ approved ──execute──▶ executed
+        │                                                                    ▲
+        └────────────────────────────────▶ rejected      re-drivable ────────┘
+                                                         if execution is not
+                                                         confirmed
 ```
 
-the approval row and the session are both in the database, the claim is a single
-conditional `UPDATE` so two deciders cannot both win, and a running resume
-heartbeats its lease so recovery reclaims only work that actually stalled. If a
-pod dies mid-resume a live peer finishes the job without waiting for a restart.
+Four properties make this a cluster feature rather than a request-scoped trick:
+
+**Waiting is free.** A pending approval is a row in `approval_cases`. No
+coroutine is suspended, no session is pinned in memory, nothing needs renewing.
+An approval that takes a fortnight costs exactly what one taking a second costs
+— which matters, because enterprise sign-off genuinely does take days.
+
+**Nothing is pod-local.** Any replica can decide any case, because the only
+state they share is the row. There is no recovery machinery to run because
+nothing is in flight: the decision is written *before* the action is attempted,
+so a pod that dies mid-execution leaves a re-drivable `approved` case rather
+than an unanswerable one.
+
+**What was approved is what runs.** Two things enforce it. The specialist
+recomputes its result from the original request rather than from values a caller
+retypes, and the caller confirms execution by checking the returned values
+against the proposal it stored — a result that does not match is reported, not
+recorded. Confirming that the *call* happened, rather than what it produced,
+would catch neither.
+
+**Nothing here is ADK-specific.** Two ordinary skills and a JSON contract — a
+specialist written in LangGraph or plain FastAPI implements the same thing with
+no framework hooks, which is what makes the pattern usable across squads.
 
 **There is no `HITL_BACKEND`.** The store follows `DB_BACKEND`: durable in
-`hitl_approvals` when a database is configured, per-pod memory otherwise. With
-`DB_BACKEND=none` a restart loses every pending approval and only the pod that
-took a decision can act on it — so scaling an agent past one replica requires a
-database. The manifests stay at `replicas: 1` for cost, not correctness.
+`approval_cases` when a database is configured, per-pod memory otherwise. With
+`DB_BACKEND=none` a restart loses every pending approval and only the replica
+that recorded a case can act on it — so scaling an agent past one replica
+requires a database.
 
-One recovery limit worth knowing before you rely on it: the decision is written
-by the *claim*, so a crashed resume is re-driven without asking the human twice —
-but if the pause was inside an A2A peer whose task already completed, that task
-is terminal and the reply cannot be replayed. Such a row is closed with
-`resumed_at` left NULL and a warning logged; query `resumed_at IS NULL AND status
-IN ('approved','rejected')` to find approvals whose effect happened but whose
-answer never reached the user.
+The reconciliation query is `status = 'approved'` (indexed by `0005`): an
+approved case whose action never completed. Every such row is actionable —
+re-drive it by calling `POST /cases/{proposal_id}` again.
+
+**Why not suspend the invocation instead?** ADK can pause a call and resume it,
+so the tempting design freezes the invocation across the A2A hop until the human
+answers. It needs a reclaimable lease, a heartbeat and a background sweeper, and
+it still cannot deliver the answer once the peer's A2A task has gone terminal.
+[`docs/design-decisions.md`](docs/design-decisions.md) (D5) has the measurements
+behind rejecting it.
 
 > **[`docs/human-in-the-loop.md`](docs/human-in-the-loop.md)** is the full guide:
-> which of the three mechanisms to reach for, the HTTP API with real payloads, a
-> local walkthrough, and the production checklist.
+> the HTTP API with real payloads, how to write a gated action, a local
+> walkthrough, and the known limits.
 
 ## Observability: logs + distributed tracing across A2A
 

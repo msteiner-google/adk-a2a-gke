@@ -30,10 +30,10 @@ def test_agent_stream() -> None:
     session_service = InMemorySessionService()
 
     session = session_service.create_session_sync(user_id="test_user", app_name="test")
-    # `root_agent` is `LlmAgent | Workflow` now that a spec may carry a graph
-    # (app/agents/planner). This test drives the DEFAULT agent, which is always
-    # an LlmAgent; Runner's `agent=` parameter only accepts BaseAgent, so assert
-    # that rather than widening the test to something it does not exercise.
+    # Every agent is an LlmAgent again -- the graph-rooted planner went with the
+    # coroutine HITL design it existed to demonstrate. Runner's `agent=`
+    # parameter takes a BaseAgent, so keep this as a cheap guard on what the
+    # test actually drives.
     assert isinstance(root_agent, BaseAgent)
     runner = Runner(agent=root_agent, session_service=session_service, app_name="test")
 

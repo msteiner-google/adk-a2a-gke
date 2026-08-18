@@ -19,13 +19,12 @@ from typing import cast
 
 import pytest
 from google.adk.agents import LlmAgent
-from google.adk.tools import ToolContext
 
-from app.agents import AGENTS, DEFAULT_AGENT, build_agent
+from app.agents import AGENTS, DEFAULT_AGENT, PAYLOADS, build_agent
 from app.agents.base import AgentSpec
-from app.agents.common import recall, remember
 from app.agents.math.tools import calculate
 from app.cluster.config import ClusterConfig, PeerSpec
+from app.cluster.peer_tool import PeerTool
 from app.cluster.resolver import AgentResolver
 from app.shared.config import Models
 
@@ -63,6 +62,10 @@ _CONFIG_NO_PEERS = ClusterConfig(
 )
 
 
+def _resolver(config: ClusterConfig) -> AgentResolver:
+    return AgentResolver(config, payload_schemas=PAYLOADS)
+
+
 def test_registry_lists_expected_agents():
     assert set(AGENTS) == {"orchestrator", "research", "math", "planner"}
     assert DEFAULT_AGENT == "orchestrator"
@@ -72,8 +75,14 @@ def test_orchestrator_declares_peers_others_do_not():
     assert AGENTS["orchestrator"].peers == ("research", "math", "planner")
     assert AGENTS["research"].peers == ()
     assert AGENTS["math"].peers == ()
-    # A graph agent cannot delegate: it has no sub_agents to attach peers to.
     assert AGENTS["planner"].peers == ()
+
+
+def test_every_delegatable_agent_declares_a_contract():
+    # An agent reachable as a peer but missing from PAYLOADS silently degrades
+    # to an untyped request, which is the failure mode D1 exists to prevent.
+    delegatable = {name for spec in AGENTS.values() for name in spec.peers}
+    assert delegatable <= set(PAYLOADS), delegatable - set(PAYLOADS)
 
 
 def _tool_names(agent: LlmAgent) -> set[str]:
@@ -83,35 +92,58 @@ def _tool_names(agent: LlmAgent) -> set[str]:
     }
 
 
-def test_build_agent_leaf_has_no_sub_agents():
-    resolver = AgentResolver(_CONFIG_NO_PEERS)
-    agent = build_agent(AGENTS["research"], _FAKE_MODELS, resolver)
+def test_build_agent_leaf_has_only_its_own_tools():
+    agent = build_agent(AGENTS["research"], _FAKE_MODELS, _resolver(_CONFIG_NO_PEERS))
     assert isinstance(agent, LlmAgent)
     assert agent.name == "research"
     assert agent.sub_agents == []
     # Names rather than a count: a count breaks whenever a tool is added and
     # says nothing about which tools the agent actually got.
-    assert _tool_names(agent) == {
-        "web_search",
-        "adk_request_input",
-        "remember",
-        "recall",
-    }
+    assert _tool_names(agent) == {"web_search", "read_document"}
 
 
-def test_build_agent_attaches_resolved_peers_as_sub_agents():
-    resolver = AgentResolver(_CONFIG_WITH_PEERS)
-    orchestrator = build_agent(AGENTS["orchestrator"], _FAKE_MODELS, resolver)
+def test_build_agent_attaches_resolved_peers_as_tools():
+    orchestrator = build_agent(
+        AGENTS["orchestrator"], _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS)
+    )
     assert orchestrator.name == "orchestrator"
-    assert [a.name for a in orchestrator.sub_agents] == ["research", "math"]
+    assert _tool_names(orchestrator) == {"research", "math"}
+    assert all(isinstance(t, PeerTool) for t in orchestrator.tools)
+
+
+def test_build_agent_never_attaches_peers_as_sub_agents():
+    # The invariant behind D1. A peer in sub_agents is reached with
+    # transfer_to_agent, which forwards the caller's transcript to it.
+    orchestrator = build_agent(
+        AGENTS["orchestrator"], _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS)
+    )
+    assert orchestrator.sub_agents == []
+
+
+def test_build_agent_keeps_own_tools_alongside_peers():
+    # A coordinating agent that also has local tools must keep both.
+    spec = AgentSpec(
+        name="hybrid",
+        description="x",
+        instruction="x",
+        tier="fast",
+        tools=(calculate,),
+        peers=("research",),
+    )
+    agent = build_agent(spec, _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS))
+    assert _tool_names(agent) == {"calculate", "research", "math"}
 
 
 def test_build_agent_peers_come_from_config_not_spec():
     # Even a normally-leaf agent gets peers if the config resolved some (e.g. via
     # an A2A_PEERS override): peers are attached uniformly from the resolver.
-    resolver = AgentResolver(_CONFIG_WITH_PEERS)
-    agent = build_agent(AGENTS["research"], _FAKE_MODELS, resolver)
-    assert [a.name for a in agent.sub_agents] == ["research", "math"]
+    agent = build_agent(AGENTS["research"], _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS))
+    assert _tool_names(agent) == {
+        "web_search",
+        "read_document",
+        "research",
+        "math",
+    }
 
 
 def test_build_agent_unknown_tier_raises():
@@ -122,7 +154,18 @@ def test_build_agent_unknown_tier_raises():
         tier="ludicrous",
     )
     with pytest.raises(ValueError, match="tier"):
-        build_agent(spec, _FAKE_MODELS, AgentResolver(_CONFIG_NO_PEERS))
+        build_agent(spec, _FAKE_MODELS, _resolver(_CONFIG_NO_PEERS))
+
+
+def test_no_agent_carries_a_shared_state_tool():
+    # D3: `remember`/`recall` wrote `shared:` session state and were documented
+    # as propagating across A2A hops. They did not (docs/design-decisions.md D3),
+    # leaving that pattern in place teaches callers to rely on implicit context.
+    for spec in AGENTS.values():
+        names = {
+            getattr(t, "name", None) or getattr(t, "__name__", "?") for t in spec.tools
+        }
+        assert not names & {"remember", "recall"}, spec.name
 
 
 def test_calculate_evaluates_arithmetic():
@@ -132,18 +175,3 @@ def test_calculate_evaluates_arithmetic():
 def test_calculate_rejects_non_arithmetic():
     result = calculate("__import__('os').system('echo hi')")
     assert result["status"] == "error"
-
-
-def test_remember_and_recall_roundtrip():
-    ctx = cast(ToolContext, SimpleNamespace(state={}))
-    remember("topic", "penguins", ctx)
-    assert recall("topic", ctx) == {
-        "status": "found",
-        "key": "topic",
-        "value": "penguins",
-    }
-
-
-def test_recall_missing_key():
-    ctx = cast(ToolContext, SimpleNamespace(state={}))
-    assert recall("absent", ctx)["status"] == "not_found"

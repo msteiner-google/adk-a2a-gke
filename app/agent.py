@@ -41,17 +41,15 @@ import os
 
 from a2a.server.tasks import TaskStore
 from google.adk.apps import App
-from google.adk.apps.app import ResumabilityConfig
 from google.adk.artifacts.base_artifact_service import BaseArtifactService
 from google.adk.memory import BaseMemoryService
 from google.adk.sessions import BaseSessionService
 from injector import Injector
 
 from .agents import AGENTS, build_agent
-from .cluster.approvals import ApprovalStore
+from .cluster.cases import CaseStore
 from .cluster.db import Database
 from .cluster.di import ClusterModule, SessionModule
-from .cluster.hitl import HitlPlugin
 from .cluster.resolver import AgentResolver
 from .shared.config import ModelModule, Models
 from .shared.observability import configure_observability
@@ -89,11 +87,11 @@ memory_service = _injector.get(BaseMemoryService)
 # loadable by the orchestrator on the same session.
 artifact_service = _injector.get(BaseArtifactService)
 task_store = _injector.get(TaskStore)
-# Where HITL pauses are recorded. Resolved here, and passed to both the capture
-# plugin below and the serving layer, so there is exactly one store per process:
-# with the in-memory backend a second instance would be a second dict, and
-# approvals would split between them silently.
-approval_store = _injector.get(ApprovalStore)
+# Where proposals awaiting a human decision are recorded. Resolved here and
+# handed to the serving layer, so there is exactly one store per process: with
+# the in-memory backend a second instance would be a second dict, and cases
+# would split between them silently.
+case_store = _injector.get(CaseStore)
 
 # The shared engine holder, exported so the serving layer can dispose of the
 # pool and stop the AlloyDB connector's background refresh tasks on shutdown.
@@ -108,13 +106,9 @@ root_agent = build_agent(AGENTS[_name], models, resolver)
 
 # The `App` wraps the root agent for serving/deployment.
 # NOTE: `name` must match the agent directory (default: "app").
-app = App(
-    root_agent=root_agent,
-    name="app",
-    # Human-in-the-loop: an invocation that stops on a long-running function
-    # call (a confirmation request, an input request) can be resumed later with
-    # the human's response. Required for every HITL strategy in
-    # docs/plans/hitl/; harmless for agents that never pause.
-    resumability_config=ResumabilityConfig(is_resumable=True),
-    plugins=[HitlPlugin(approval_store)],
-)
+#
+# No `resumability_config` and no capture plugin: an invocation here always runs
+# to completion. Human approval is modelled as business state instead -- a
+# specialist proposes, the caller records a case, and the approved action is a
+# fresh call later (app/cluster/cases.py, docs/design-decisions.md D5).
+app = App(root_agent=root_agent, name="app")

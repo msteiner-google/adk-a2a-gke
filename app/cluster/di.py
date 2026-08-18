@@ -21,7 +21,7 @@ Two :mod:`injector` modules, installed alongside the shared ``ModelModule``:
   layer that turns configured peers into ``RemoteA2aAgent`` children. This is the
   "resolver so an agent can connect to the other agents in the cluster."
 - :class:`SessionModule` provides the pluggable ``BaseSessionService``,
-  ``BaseMemoryService``, ``BaseArtifactService``, the HITL ``ApprovalStore``,
+  ``BaseMemoryService``, ``BaseArtifactService``, the approval ``CaseStore``,
   and the A2A ``TaskStore``
   (in-memory by default, durable backends via env — see
   ``app/cluster/session.py``, ``app/cluster/artifacts.py``,
@@ -55,9 +55,9 @@ from google.adk.memory import BaseMemoryService
 from google.adk.sessions import BaseSessionService
 from injector import Module, provider, singleton
 
-from app.agents import AGENTS, DEFAULT_AGENT
-from app.cluster.approvals import ApprovalStore, build_approval_store
+from app.agents import AGENTS, DEFAULT_AGENT, PAYLOADS
 from app.cluster.artifacts import build_artifact_service
+from app.cluster.cases import CaseStore, build_case_store
 from app.cluster.config import AGENT_NAME_ENV, ClusterConfig
 from app.cluster.db import Database, build_database
 from app.cluster.resolver import AgentResolver
@@ -92,13 +92,16 @@ class ClusterModule(Module):
     def provide_resolver(self, config: ClusterConfig) -> AgentResolver:
         """Provide the (singleton) peer resolver.
 
+        The payload contracts are handed over here rather than imported by the
+        resolver, so ``app/cluster`` keeps knowing nothing about ``app.agents``.
+
         Args:
             config: The injected cluster configuration.
 
         Returns:
             An :class:`AgentResolver` bound to the configuration.
         """
-        return AgentResolver(config)
+        return AgentResolver(config, payload_schemas=PAYLOADS)
 
 
 class SessionModule(Module):
@@ -142,21 +145,21 @@ class SessionModule(Module):
 
     @singleton
     @provider
-    def provide_approval_store(self, database: Database) -> ApprovalStore:
-        """Provide the (singleton) HITL approval store.
+    def provide_case_store(self, database: Database) -> CaseStore:
+        """Provide the (singleton) approval case store.
 
-        Durable on the ``hitl_approvals`` table when a database is configured,
+        Durable on the ``approval_cases`` table when a database is configured,
         per-pod memory otherwise. Singleton is load-bearing rather than an
         optimisation: with the in-memory backend a second instance is a second
-        dict, so approvals would split between them with no visible error.
+        dict, so cases would split between them with no visible error.
 
         Args:
             database: The injected shared engine holder.
 
         Returns:
-            The configured :class:`~app.cluster.approvals.ApprovalStore`.
+            The configured :class:`~app.cluster.cases.CaseStore`.
         """
-        return build_approval_store(database)
+        return build_case_store(database)
 
     @singleton
     @provider

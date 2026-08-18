@@ -20,19 +20,22 @@ code path: an agent that coordinates others is simply one whose `peers` is
 non-empty. So adding an agent is mostly declaration, not implementation.
 
 **What you will write:** three small files under `app/agents/<name>/`, one line
-in a registry, one entry in the delegating agent's `peers`, and two test
-updates. That is a complete, working agent you can exercise locally.
+in a registry, **one request contract** (optional, but expected here), one entry
+in the delegating agent's `peers`, and two test updates. That is a complete,
+working agent you can exercise locally.
 
 **How far you need to go.** Steps 0–5 are the whole job if you run locally —
 stop there. Steps 6–8 are cluster-only: five infrastructure files, a Terraform
 apply and a deploy. The [checklist](#checklist) at the end is split the same way.
 
-**One variation to know about.** A spec can set `root_node` to serve a fixed
-graph instead of a model-driven agent — that is what the `planner` agent in this
-repo does, and it is how you build a pipeline with a human approval step. Such
-an agent cannot declare peers. See
-[human-in-the-loop.md](human-in-the-loop.md#c-a-graph-agent-with-a-human-step).
-Everything else below applies unchanged.
+**The one rule that is not obvious.** Your agent will be called with an
+explicit payload and **nothing else** — no conversation history, no shared
+state. The default payload is a single free-text task; declaring a contract in
+`app/agents/contracts.py` (step 2b) upgrades that to named, validated fields,
+and is optional in the mechanism but expected of every agent this repo owns.
+Either way, everything your agent needs has to arrive in that payload. If your agent needs to gate an action behind
+a human, see [human-in-the-loop.md](human-in-the-loop.md#writing-a-gated-action);
+it is two ordinary functions, not a framework feature.
 
 For standing the whole system up in a fresh Google Cloud project, read
 [`deploy-to-another-project.md`](deploy-to-another-project.md) instead.
@@ -129,18 +132,21 @@ A focused leaf agent (no peers) that reports weather conditions.
 from __future__ import annotations
 
 from app.agents.base import AgentSpec
-from app.agents.common import recall, remember
 from app.agents.weather.tools import forecast
 
 SPEC = AgentSpec(
     name="weather",
     description="Reports current conditions and forecasts for a location.",
     instruction=(
-        "You are a weather specialist. Use the `forecast` tool rather than "
-        "answering from memory, then summarize briefly."
+        "You are a weather specialist. You receive a JSON request with a "
+        "`location`, an optional `when` field, and a `case_id`.\n\n"
+        "- Use the `forecast` tool rather than answering from memory, then "
+        "summarize briefly.\n"
+        "- The request is all the context you have: you cannot see the "
+        "conversation it came from."
     ),
-    tier="fast",
-    tools=(forecast, remember, recall),
+    tier="balanced",
+    tools=(forecast,),
 )
 ```
 
@@ -151,10 +157,15 @@ Notes on the fields:
   whether to delegate here. A vague description is the most common reason a new
   agent never gets called. Write it as a capability statement.
 - **`tier`** is one of `fast` / `balanced` / `capable`, resolved to a live Gemini
-  model at startup. Start at `fast` for a narrow tool-driven specialist; reach
-  for `capable` only for planning or multi-step reasoning.
-- **`tools`** — include `remember`/`recall` from `app.agents.common` unless you
-  have a reason not to; they are the shared-context convention here.
+  model at startup. **Every agent in this repo currently uses `balanced`**, after
+  `fast` was measured proposing a gated action only 3/5 times when asked
+  ([`design-decisions.md`](design-decisions.md)). Drop to `fast` only for an agent
+  that calls no tools, and verify it still does what you asked.
+- **`tools`** — this agent's own tools only. There is deliberately no
+  shared-context tool: context arrives in the payload.
+- **`instruction`** — say what the payload fields are and that the agent cannot
+  see the caller's conversation. A specialist that asks the caller to clarify
+  something it was not sent will simply stall.
 - **`peers`** — leave unset for a leaf agent. Set it only if *this* agent
   delegates onward (see [step 3](#3-wire-up-delegation)).
 
@@ -175,8 +186,66 @@ AGENTS: dict[str, AgentSpec] = {
 }
 ```
 
-Nothing else in the application needs to change. `AGENT_NAME` selects the agent
-at startup, and the same container image already runs all of them.
+`AGENT_NAME` selects the agent at startup, and the same container image already
+runs all of them.
+
+---
+
+## 2b. Declare its request contract (optional, but do it)
+
+**Optional in the mechanism, required by this repo's policy.** The default
+contract between two agents here is *one free-text task plus a `case_id`*: an
+agent with no entry in `PAYLOADS` is still reachable and still answers, its tool
+falling back to `UnknownPeerRequest`. Declaring a model is how you opt into
+something stricter — named parameters, validation before the call leaves the
+pod, and a JSON Schema published in the agent's card.
+
+Do it for an agent you own. A single free-text field is where a caller quietly
+starts pasting conversation context back in — the transcript returning a
+paragraph at a time, which is the thing explicit delegation exists to prevent.
+Leave it undeclared only for a peer another squad owns, whose real schema lives
+in its own agent card. `app/agents/contracts.py`'s module docstring lays out all
+three tiers.
+
+**It also fails quietly**, which is why it is the step people forget: nothing
+errors, the caller just sends prose.
+
+`app/agents/contracts.py`:
+
+```python
+class WeatherRequest(PeerRequest):
+    """Ask the weather specialist about conditions at a location."""
+
+    location: str = Field(
+        description=(
+            "The place to report on, e.g. 'Dublin, IE'. Be specific: the "
+            "specialist cannot ask which Dublin you meant."
+        )
+    )
+    when: str = Field(
+        default="",
+        description="Optional day or range, e.g. 'tomorrow' or '2026-08-20'.",
+    )
+
+
+PAYLOADS: dict[str, type[PeerRequest]] = {
+    ...,
+    "weather": WeatherRequest,
+}
+```
+
+Two things matter here:
+
+- **Every field needs a `description`.** It is compiled into the tool
+  declaration the *calling* model sees, and published as JSON Schema in this
+  agent's A2A card. It is the only instruction a caller gets about how to call
+  you, so an undescribed field is a silently mis-filled one.
+- **`case_id` and `document_refs` come free** from `PeerRequest`. Do not
+  redeclare them, and never add a field for a document's *contents* — pass the
+  reference and read it with `read_document`.
+
+`test_agents.py::test_every_delegatable_agent_declares_a_contract` fails if you
+skip this — the test is what makes a repo policy out of an optional mechanism.
 
 ---
 
@@ -443,9 +512,12 @@ delegation in Cloud Trace — one trace spans every A2A hop.
 [ ] tools.py: Google-style docstrings; ToolContext imported at runtime
 [ ] agent.py: SPEC with a capability-style description
 [ ] Registered in app/agents/__init__.py
+[ ] Request contract added to app/agents/contracts.py + PAYLOADS
+[ ] Every contract field has a Field(description=...)
 [ ] Added to the delegating agent's AgentSpec.peers
 [ ] test_registry_lists_expected_agents updated
 [ ] test_orchestrator_declares_peers_others_do_not updated
+[ ] Instruction tells the agent it cannot see the caller's conversation
 [ ] Tool tests added
 [ ] pytest + agents-cli lint green
 [ ] Exercised locally over a real A2A hop
@@ -468,6 +540,9 @@ delegation in Cloud Trace — one trace spans every A2A hop.
 | --- | --- | --- |
 | `KeyError: Unknown AGENT_NAME 'weather'` at startup | Not registered | Add it to `AGENTS` in `app/agents/__init__.py` |
 | Orchestrator never delegates to it | `description` too vague, or not in `peers` | Rewrite as a capability statement; check `AgentSpec.peers` / `A2A_PEERS` |
+| Caller sends one vague `request` string | No entry in `PAYLOADS` | Add the contract (step 2b); the tool fell back to `UnknownPeerRequest` |
+| Agent replies asking for context it was never sent | Its instruction assumes a conversation | It only ever sees the payload — add the missing field to its contract |
+| `Invalid payload for peer '<name>'` | Caller omitted a required field | Give the field a default, or make its `description` clearer |
 | Delegation hangs, then times out | Missing from `networkpolicy.yaml` | Add the name to the workers allow-list (step 6d) |
 | Delegation hangs, agent looks healthy | `APP_URL` wrong | Must equal `http://<service>.<namespace>.svc.cluster.local` |
 | Peer agent card `404` | Card is at `<svc>/a2a/app/.well-known/agent-card.json`, not the service root | Check `A2A_RPC_PATH` and that `App(name=...)` is still `"app"` |

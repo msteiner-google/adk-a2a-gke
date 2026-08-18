@@ -1,7 +1,7 @@
 # Inspecting the database
 
 How to look at what the agents have actually stored in AlloyDB — sessions,
-events, A2A tasks and pending human approvals.
+events, A2A tasks and pending approval cases.
 
 ## What is in there
 
@@ -16,10 +16,10 @@ Each schema holds the same four tables:
 
 | Table | What it holds | Owned by |
 | --- | --- | --- |
-| `sessions` | One row per conversation, including the shared state `remember` writes | ADK |
+| `sessions` | One row per conversation, including its ADK session state | ADK |
 | `events` | Every turn, tool call and tool result within a session | ADK |
 | `tasks` | A2A tasks — the unit of work when one agent calls another | the a2a SDK |
-| `hitl_approvals` | Captured [human-in-the-loop](human-in-the-loop.md) pauses awaiting or undergoing a decision | this repo |
+| `approval_cases` | Proposed actions awaiting, or having received, a [human decision](human-in-the-loop.md) | this repo |
 
 Plus `alembic_version`, which is per-schema: each agent is migrated
 independently.
@@ -31,7 +31,7 @@ Two things follow that are worth knowing before you go looking for data:
   how to join them.
 - **An approval raised inside a delegated agent is stored on the *caller*.** If
   the orchestrator asked `math` to do something gated, the row is in
-  `orchestrator.hitl_approvals`, not `math`'s.
+  `orchestrator.approval_cases`, not `math`'s.
 
 An agent deployed without a database (`DB_BACKEND=none`) has no schema at all —
 its state is per-pod and nothing here applies to it.
@@ -213,42 +213,30 @@ any depth (`orchestrator → research → …`), not just one hop.
 across `orchestrator.events` and `math.sessions`. With a database per agent it
 would be impossible without FDW or dblink.
 
-### What it looks like
+### What the queries return
 
-Running `request_path.sql` against the verified deployment:
+`request_path.sql` gives one row per event, depth-indented by hop — `depth`,
+`agent`, `timestamp`, `author`, `session_id`, `invocation_id`, and a `what`
+column rendering whichever kind of event it is:
 
-```
-d  agent                what
-------------------------------------------------------------------------------------
-0  orchestrator         Please compute (17 * 23) + 6 using the math specialist, and…
-0  orchestrator         -> call transfer_to_agent({"agent_name": "math"})
-0  orchestrator         <- transfer_to_agent returned {"result": null}
-1      math             Please compute (17 * 23) + 6 using the math specialist, and…
-1      math             -> call calculate({"expression": "17 * 23"})
-1      math             <- calculate returned {"result": "391.0", "status": "ok", …}
-1      math             -> call calculate({"expression": "391 + 6"})
-1      math             <- calculate returned {"result": "397.0", "status": "ok", …}
-1      math             -> call remember({"key": "final_total", "value": "397"})
-1      math             <- remember returned {"key": "final_total", …, "status": "stored"}
-1      math             First, I calculated $17 \times 23$, which equals $391$…
-0  orchestrator         <= A2A response from math (task 484a092e)
-```
+| Event | `what` renders as |
+| --- | --- |
+| user or agent text | the first 110 characters |
+| tool call | `-> call math({"case_id": …, "expression": …})` |
+| tool result | `<- calculate returned {"result": "391.0", …}` |
+| A2A reply, on the caller's side | `<= A2A response from math (task 484a092e)` |
 
-and `request_hops.sql`:
+Delegation appears as a call to the peer's **own name**, because a peer is a
+tool here — there is no `transfer_to_agent` row to look for.
 
-```
-hop                  = orchestrator -> math
-callee_task_state    = completed
-callee_duration      = 0:00:07.863790
-callee_tokens        = 663
-callee_events        = 8
-callee_session_state = {'shared:final_total': '397'}
-```
+`request_hops.sql` gives one row per delegation: `hop` (`orchestrator -> math`),
+`callee_session`, `callee_task_state`, `callee_duration`, `callee_tokens`,
+`callee_events` and `callee_session_state`.
 
-That last line is also the clearest illustration of a subtlety worth
-internalising: `shared:final_total` lives in **math's** session, not the
-orchestrator's. Session state does not propagate back across an A2A hop — only
-message content does.
+That last column is worth reading once, because it makes the share-nothing
+property concrete: whatever it holds lives in the **callee's** session and never
+crossed the hop in either direction. Only message content does
+([`design-decisions.md`](design-decisions.md), D3).
 
 ### Adding an agent
 
@@ -296,7 +284,7 @@ SELECT 'orchestrator' AS agent, count(*) FROM orchestrator.sessions
 UNION ALL SELECT 'research', count(*) FROM research.sessions
 UNION ALL SELECT 'math',     count(*) FROM math.sessions;
 
--- Recent sessions and their shared state (what `remember` wrote).
+-- Recent sessions and their ADK session state.
 SELECT id, user_id, state, update_time
 FROM math.sessions ORDER BY update_time DESC LIMIT 10;
 
@@ -315,31 +303,40 @@ FROM orchestrator.tasks ORDER BY updated_at DESC LIMIT 10;
 SELECT count(*) FROM math.sessions WHERE update_time < now() - interval '30 days';
 ```
 
-### Human-in-the-loop approvals
+### Approval cases
 
-Remember these live in the schema of the agent that *received* the request, even
-when the pause was raised in a peer it delegated to.
+These live in the schema of the agent that asked the human — normally the
+orchestrator — not the specialist that proposed the action.
 
 ```sql
 -- What is waiting for a human right now?
-SELECT approval_id, kind, tool_name, author AS paused_agent, created_at
-FROM orchestrator.hitl_approvals
+SELECT proposal_id, agent, action, summary, created_at
+FROM orchestrator.approval_cases
 WHERE status = 'pending'
 ORDER BY created_at;
 
--- Approvals whose decision was applied but whose answer never reached the user.
--- This is the documented failure mode when a resume crashes and the A2A task it
--- needs to reply on has already completed -- see docs/human-in-the-loop.md.
-SELECT approval_id, status, decided_by, decided_at
-FROM orchestrator.hitl_approvals
-WHERE resumed_at IS NULL AND status IN ('approved', 'rejected');
+-- THE reconciliation query: approved, but the action never completed. Served by
+-- idx_approval_cases_unexecuted. Every row here is actionable -- re-drive it
+-- with POST /cases/{proposal_id}.
+SELECT proposal_id, agent, action, proposal, decided_by, decided_at
+FROM orchestrator.approval_cases
+WHERE status = 'approved'
+ORDER BY decided_at;
 
--- Stuck mid-decision: a resume that stopped heartbeating its lease. A live pod
--- reclaims these automatically within HITL_LEASE_TTL_SECONDS (default 30).
-SELECT approval_id, deciding_by, deciding_since
-FROM orchestrator.hitl_approvals
-WHERE status = 'deciding'
-  AND deciding_since < now() - interval '2 minutes';
+-- The audit trail for one case: what was proposed, what was signed off, by
+-- whom, and what actually ran. `proposal` is the anchor -- it is exactly what
+-- the human was shown, and `result` is what came back when it ran.
+SELECT proposal_id, action, proposal, status,
+       decided_by, note, decided_at, result, executed_at
+FROM orchestrator.approval_cases
+WHERE case_id = '<case-id>'
+ORDER BY created_at;
+
+-- Anything whose execution did not confirm the approved proposal.
+SELECT proposal_id, agent, action, result->>'reason' AS reason, executed_at
+FROM orchestrator.approval_cases
+WHERE status = 'failed'
+ORDER BY executed_at DESC;
 ```
 
 Note `sessions.state` is `JSONB` (ADK) while `tasks.status` is plain `json`
@@ -373,7 +370,7 @@ alembic revision, recent sessions and tasks). Same injection pattern as above bu
 with no `DB_READERS`. Good for a quick "did anything land?" check from the
 terminal. It reports on `CHECK_SCHEMAS` (whitespace-separated, default
 `orchestrator research math`), so set that variable if your set of agents
-differs. Note it summarises sessions and tasks only — for approvals, use the
+differs. Note it summarises sessions and tasks only — for approval cases, use the
 queries above.
 
 **psql from a pod** — for anything Studio's 10 MB / five-minute limits get in the

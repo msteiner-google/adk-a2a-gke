@@ -5,26 +5,40 @@ remove the need to re-scan the tree.
 
 ## What this project is
 
-A **multi-agent system (MAS) for GKE**: a planner/orchestrator agent that
-delegates sub-tasks to specialist worker agents, each deployed as its own
-Kubernetes Deployment/Service and reached over the **A2A** protocol.
+A **multi-agent system (MAS) for GKE**: an orchestrator agent that delegates
+sub-tasks to specialist worker agents, each deployed as its own Kubernetes
+Deployment/Service and reached over the **A2A** protocol.
 
 Built on Google **ADK** (`google-adk>=2.2.0`) and the **a2a** SDK, deployed to
 GKE Autopilot with Terraform + Kustomize.
 
 ```
                        ┌───────────────────┐
-   user ───────────▶   │   orchestrator    │  planner, tier=capable
-                       │  Deployment/Svc   │
+   user ───────────▶   │   orchestrator    │  tier=balanced
+                       │  Deployment/Svc   │  holds the conversation
                        └─────────┬─────────┘
-              A2A (RemoteA2aAgent, well-known agent card)
+        A2A — one typed payload per call, never the transcript
                  ┌───────────────┴───────────────┐
                  ▼                               ▼
         ┌────────────────┐              ┌────────────────┐
         │    research    │              │      math      │  leaf specialists
-        │ Deployment/Svc │              │ Deployment/Svc │  tier=balanced/fast
+        │ Deployment/Svc │              │ Deployment/Svc │  tier=balanced
         └────────────────┘              └────────────────┘
 ```
+
+**The agents share no runtime state.** A specialist is reached with an explicit
+request and sees nothing else — no conversation history, no shared session
+state, no shared artifact handles. The *default* request is a single free-text
+task; every agent here opts into a typed contract from
+`app/agents/contracts.py` instead, which is a choice you can make per peer. Large
+inputs travel as object-store references it reads itself, and an action needing
+human sign-off is a proposal plus a durable case record rather than a suspended
+invocation. See [`docs/design-decisions.md`](docs/design-decisions.md) for the
+reasoning and the measurements behind it.
+
+**Shared *code* is fine and encouraged** — `app/shared/**` is a library every
+agent imports, and one another squad could vendor. The rule is about shared
+*state*.
 
 **One container image runs every agent.** `AGENT_NAME` selects which agent from
 the registry this process becomes at startup. There is no orchestrator-specific
@@ -35,7 +49,7 @@ code path.
 All of these were run in this repo and pass as of the last update to this file.
 
 ```bash
-# Unit tests — 259 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
+# Unit tests — 260 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
 # (see "Importing app hits the network" below).
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite \
 GEMINI_BALANCED_MODEL=gemini-2.5-flash \
@@ -60,6 +74,9 @@ Other commands (require a server / GCP creds, not part of the fast loop):
 
 | Command | Purpose |
 | --- | --- |
+| `make up` / `make down` | Start or stop all four agents locally, peers wired (see the Makefile) |
+| `make check` | Preflight: ADC, project, location, model reachability |
+| `make demo` | Drive the approval flow end to end and assert it worked |
 | `uv sync` | Install deps (or `agents-cli install`) |
 | `agents-cli playground` | Interactive local UI |
 | `uv run adk web` | ADK dev UI (becomes `DEFAULT_AGENT` unless `AGENT_NAME` set) |
@@ -83,14 +100,15 @@ Read the module docstrings; they are thorough. This is the index.
 | `app/agent.py` | Entry point. Calls `configure_observability()`, builds the `Injector`, selects this process's agent by `AGENT_NAME`, exports `root_agent` and `app = App(name="app")`. |
 | `app/agents/__init__.py` | **The registry.** `AGENTS: dict[str, AgentSpec]` + `DEFAULT_AGENT`. Single source of truth for which agents exist. |
 | `app/agents/base.py` | `AgentSpec` (frozen dataclass: name, description, instruction, tier, tools, peers) and the single `build_agent()`. `TIERS = ("fast","balanced","capable")`. |
-| `app/agents/common.py` | `remember` / `recall` tools — shared session-state context that propagates across A2A hops. State keys prefixed `shared:`. |
-| `app/agents/orchestrator/agent.py` | `SPEC` with `peers=("research","math")`, `tier="capable"`. |
+| `app/agents/contracts.py` | **The wire contracts.** One pydantic model per delegatable agent + `PAYLOADS`. The interface both a caller and a specialist agree on. Opt-in per agent: a peer with no model here is delegated to with a single free-text `task` instead (see its module docstring for the tiers). |
+| `app/agents/documents.py` | `read_document` — reads a claim-check reference (`gs://…`) the caller passed in `document_refs`. |
+| `app/agents/reporting.py` | `restate_structured_results` — the after-agent callback that makes a proposal survive the A2A text boundary instead of being paraphrased. |
+| `app/agents/orchestrator/agent.py` | `SPEC` with `peers=("research","math","planner")`, `tier="balanced"`. |
 | `app/agents/research/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, tool `web_search`. |
-| `app/agents/math/agent.py` + `tools.py` | Leaf agent, `tier="fast"`, tool `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. |
-| `app/agents/planner/` | **Graph agent**: `SPEC` carries `root_node=planner_workflow`, an ADK `Workflow` (draft → human `RequestInput` → apply). No model, no peers. |
-| `app/agents/hitl_strategies.py` | The HITL tool strategies: `publish_result_tool` (`require_confirmation`) and a re-export of ADK's `request_input`. |
-| `app/cluster/hitl.py` | HITL plumbing: the capture plugin, `resume()` with the ADK routing workaround (and the re-drive guard), and `redrive_abandoned()`. |
-| `app/cluster/approvals.py` | The approval store and its state machine (`pending → deciding → approved/rejected`), the heartbeated lease that lets agents scale out, and both backends (in-memory / `hitl_approvals` table). |
+| `app/agents/math/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, tool `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. |
+| `app/agents/planner/` | Leaf agent, `tier="balanced"`, no tools. Drafts a plan and returns it for review. |
+| `app/cluster/peer_tool.py` | `PeerTool` — an `AgentTool` that gives a remote peer a **typed payload declaration**, so delegation sends an explicit request instead of the transcript. |
+| `app/cluster/cases.py` | The approval case store (`pending → approved → executed`), both backends (in-memory / `approval_cases`), and the helpers that read a proposal back out of a peer's text reply. |
 | `app/cluster/config.py` | **Pure stdlib** (no ADK/genai imports). `PeerSpec`, `ClusterConfig.from_env()`, `service_dns_url()`. Parses `AGENT_NAME` / `A2A_*`. |
 | `app/cluster/resolver.py` | `AgentResolver` — turns peers into `RemoteA2aAgent`s pointed at their well-known agent cards. No network I/O at construction (ADK resolves cards lazily). |
 | `app/cluster/di.py` | `ClusterModule` (config + resolver) and `SessionModule` (`Database`, session + memory + artifact services, A2A `TaskStore`). |
@@ -130,11 +148,14 @@ Read the module docstrings; they are thorough. This is the index.
   `test_migrations.py` renders the Alembic migrations **offline** (no database)
   and diffs them against ADK's and the a2a SDK's own metadata — it is the guard
   that catches a library adding a column.
-- `tests/unit/test_approvals.py` — the store's state machine, run against
-  **both** backends (in-memory and SQLAlchemy-on-SQLite); set `HITL_TEST_PG_DSN`
-  to add real PostgreSQL as a third.
-- `tests/unit/test_hitl.py` — pause capture, response shapes (`{"result": …}`),
-  the graph-agent builder rules, and the resume/claim ordering.
+- `tests/unit/test_cases.py` — the approval case state machine, run against
+  **both** backends (in-memory and SQLAlchemy-on-SQLite), plus recovering a
+  proposal from a peer's text reply.
+- `tests/unit/test_peer_tool.py` — the D1 guards: a peer sees the payload and
+  not the transcript, and session state never reaches the wire.
+- `tests/unit/test_two_phase_approval.py` — propose causes no effect, a tampered
+  proposal is refused, and the approval survives serialization.
+- `tests/unit/test_documents.py` — claim-check reads against `tmp_path`.
 - `tests/integration/` — `test_agent.py`, `test_server_e2e.py`. Needs a server.
 - `tests/eval/` — `eval_config.yaml`, `response_quality.py`, `datasets/`. Needs GCP creds.
 
@@ -195,27 +216,50 @@ Violating these is how this codebase breaks. They are deliberate.
    the agent whose spec declares `peers`; `build_agent` attaches whatever peers
    the cluster config resolved (empty for a leaf). **Do not reintroduce a
    per-role builder or an orchestrator subclass.**
-   *Relaxed (deliberately):* a spec may set `root_node` to serve an ADK
-   `Workflow` instead of an `LlmAgent` (`app/agents/planner`). This is still one
-   spec shape and one builder — the graph is data on the spec, not a second code
-   path — but such an agent **cannot declare peers** (a graph has no
-   `sub_agents`; `build_agent` raises) and its last node must return
-   `types.Content` or callers receive nothing. See `docs/human-in-the-loop.md`.
-2. **`agents/` = who the agents are. `cluster/` = the plumbing.** Keep config,
+2. **Peers are TOOLS, never `sub_agents`.** `build_agent` puts resolved peers in
+   `tools` and leaves `sub_agents` empty. A peer in `sub_agents` is reached with
+   `transfer_to_agent`, and `RemoteA2aAgent` then rebuilds the outbound message
+   from the caller's **session events** — measured at ten message parts,
+   including the user's phone number and a different specialist's answer, where
+   the task needed one (`docs/design-decisions.md`, D1). A peer
+   in `tools` gets only the payload the caller composed. This looks like a
+   harmless wiring detail and is the most damaging thing in the repo to undo;
+   `tests/unit/test_peer_tool.py` guards it.
+3. **Every delegatable agent declares a contract in `app/agents/contracts.py` —
+   a policy of this repo, not a requirement of the mechanism.** Contracts are
+   **optional**. A peer with no entry in `PAYLOADS` is still reachable and still
+   answers; its tool falls back to `UnknownPeerRequest` (a `case_id` plus one
+   free-text `task`), which is the honest tier for a peer another squad owns
+   whose schema lives in its own agent card. Declare the contract for an agent
+   this repo owns: one free-text field is where a caller starts pasting the
+   conversation back in, which erodes invariant 2. The three tiers — session
+   transcript, free text, declared contract — are laid out in the
+   `app/agents/contracts.py` module docstring.
+   `test_agents.py::test_every_delegatable_agent_declares_a_contract` enforces
+   the policy; it is a repo convention you could drop, unlike invariant 2.
+4. **No implicit cross-agent context.** No shared session state, no shared
+   artifact handles, no transcript forwarding. Anything a specialist needs is a
+   field in its contract; large inputs travel as `document_refs` pointers, never
+   as content. A tool that stashes state for another agent to pick up is the
+   thing to reject in review — D3 measured that the transport does not carry it,
+   so it cannot work as advertised.
+5. **`agents/` = who the agents are. `cluster/` = the plumbing.** Keep config,
    resolution, DI, and session backends out of `agents/`.
-3. **`app/cluster/config.py` must NOT import `app.agents`.** It would cycle:
+6. **`app/cluster/config.py` must NOT import `app.agents`.** It would cycle:
    `di → agents → agents.base → cluster.resolver → cluster.config`. That is why
    it keeps a plain `DEFAULT_AGENT_NAME = "orchestrator"` string mirroring
-   `agents.DEFAULT_AGENT`. Keep those two in sync manually.
-4. **Peers are declared in code, resolved by env.** Defaults live in
+   `agents.DEFAULT_AGENT`. Keep those two in sync manually. (`cluster/cases.py`
+   *does* import `app.agents.contracts`, which is safe: contracts imports
+   nothing from `cluster`.)
+7. **Peers are declared in code, resolved by env.** Defaults live in
    `AgentSpec.peers`; `di.py` feeds them to `ClusterConfig.from_env(default_peers=...)`;
    `A2A_PEERS` overrides at deploy time.
-5. **Agent name = folder name = `AgentSpec.name` = Kubernetes Service name =
+8. **Agent name = folder name = `AgentSpec.name` = Kubernetes Service name =
    `AGENT_NAME` value.** ADK requires a valid Python identifier (no hyphens);
    K8s DNS labels forbid underscores. Use a single lowercase word (`research`,
    `math`). The Service name must equal the agent name or DNS resolution
    (`<name>.<namespace>.svc.cluster.local`) fails.
-6. **`App(name=...)` must equal the agent directory** (`"app"`). It determines
+9. **`App(name=...)` must equal the agent directory** (`"app"`). It determines
    the A2A mount path `/a2a/app`. Renaming one without the other breaks peer
    discovery.
 
@@ -229,7 +273,7 @@ These are real traps that have bitten this codebase.
   `TYPE_CHECKING`-only import raises `NameError: name 'ToolContext' is not
   defined` at request time, breaking *every* tool in the module. Import from
   `google.adk.tools.tool_context`, **not** the `google.adk.tools` re-export
-  (`ty` rejects the latter). See the comment block in `app/agents/common.py:17`.
+  (`ty` rejects the latter). See the comment block in `app/cluster/peer_tool.py`.
   Same class of bug applies to injector bindings (e.g. OTel `Tracer`): **any
   type a runtime framework reflects over must be imported at runtime.**
 
@@ -332,36 +376,45 @@ These are real traps that have bitten this codebase.
   live AlloyDB cluster. Adding an agent to `var.agents` is not automatically a
   safe, additive apply. Never blind-apply.
 
-- **HITL: a plausible answer is not proof the flow ran.** Two separate failures
-  (a skipped graph node, a graph output that never reached the caller) both
-  produced confident, sensible replies. Assert on a marker the code emits.
+- **A plausible answer is not proof the flow ran.** Three separate failures
+  (a skipped graph node, a graph output that never reached the caller, an A2A
+  reply that could not be replayed) all produced confident, sensible replies.
+  Assert on a marker the code emits. The `/cases` endpoint applies the same
+  rule: it confirms an execution by matching the result against the **approved
+  proposal**, and reports `approved_not_confirmed` rather than assuming success.
 
-- **HITL approvals are durable, but only with a database.** `hitl_approvals`
-  (migration `0004`, `app/cluster/approvals.py`) survives a restart when
+- **A specialist's structured reply arrives as TEXT.** ADK's `AgentTool` reduces
+  a peer's response to its merged text parts, so a dict a specialist's tool
+  returned is not a dict by the time the caller sees it. That is why
+  `app/cluster/cases.py` parses JSON back out of prose, and why a specialist's
+  instruction has to demand verbatim reporting. Do not "simplify" the parser
+  into `json.loads(reply)`.
+
+- **Approval cases are durable, but only with a database.** `approval_cases`
+  (migration `0005`, `app/cluster/cases.py`) survives a restart when
   `DB_BACKEND` is `alloydb`/`url`; with `none` — the default, and what `planner`
-  runs on — the store is per-pod memory and a restart still loses every pending
-  approval (`docs/plans/hitl/results.md` R6). A pause raised inside an A2A peer
-  is captured on the **caller**, so in the cluster approvals live in the
+  runs on — the store is per-pod memory, so a restart loses every pending
+  approval and only the replica that recorded a case can act on it. A case
+  belongs to the agent that asked the human, so in the cluster they live in the
   orchestrator's schema.
 
-- **Agents scale out; a pause is not pod-local.** A paused invocation is rebuilt
-  from the session, so any replica can answer any approval — measured, not
-  assumed: at 2 replicas a pause raised on one pod resumed when the decision
-  arrived at the other. Three things keep that safe: approval and session are
-  both in the database, the claim is a single conditional `UPDATE`, and a
-  running resume heartbeats its lease so no peer's sweep can take it. The
-  manifests stay at `replicas: 1` for cost, not correctness.
+- **Approving and executing are separate writes, in that order.** The decision
+  lands on the row before the action is attempted, so a pod that dies
+  mid-execution leaves a re-drivable `approved` case rather than an
+  unanswerable one. Reconcile with `status = 'approved'` (indexed by `0005`) and
+  re-drive by calling `POST /cases/{proposal_id}` again — unlike the mechanism
+  this replaced, every such row is actionable.
 
-- **A crashed resume recovers the decision, not necessarily the answer.** The
-  decision is written by the *claim*, so the startup sweep re-drives it without
-  asking the human twice. But if the pause was inside an A2A peer that already
-  finished, its task is terminal (`Task <id> is in terminal state: completed`)
-  and the reply cannot be replayed. ADK reports that as an error **event**, not
-  an exception — so `run_async` returns normally with no answer, and treating
-  "no exception" as success is a bug this repo already shipped once
-  (`results.md` R10). Such a row is closed with `resumed_at` left **NULL** plus a
-  warning; query `resumed_at IS NULL AND status IN ('approved','rejected')` for
-  approvals whose effect happened but whose answer never reached the user.
+- **The gate is that the effect is unreachable without an approver**, not an
+  instruction the model is asked to follow. `publish_result` returns a proposal
+  when `approved_by` is empty and only performs the write when it is set. Adding
+  a second code path that publishes without that check removes the guarantee
+  entirely, however well the prompt is worded.
+
+- **Execution is confirmed by comparing content, not by trusting prose.**
+  `cases.find_execution` accepts a result only if the values it reports match
+  the approved proposal, so a specialist that publishes something *else* is
+  reported as `approved_not_confirmed` rather than recorded as success.
 
 - **`agents-cli` uses `uv`.** Run Python as `uv run python ...`, never bare
   `python`.
@@ -405,8 +458,8 @@ LSP; it also beats any `[tool.basedpyright]` section). Three things to know:
   `>=3.14,<3.15`, the Dockerfile is `python:3.14-slim`, and the dev venv is
   3.14 — there is no older interpreter to stay compatible with, so the full
   3.14 stdlib and syntax are fair game (`typing.override`, PEP 695 type params
-  included). This replaces the old "floor, not runtime" rule; the codebase no
-  longer supports a range.
+  included). It is a pin, not a floor: the codebase does not support a range,
+  so there is no need to keep anything back-compatible.
   - Changing the version means changing **five** files together:
     `pyproject.toml` (`requires-python`), `Dockerfile` (`FROM python:`),
     `ruff.toml`, `ty.toml`, `pyrightconfig.json`.
@@ -467,9 +520,8 @@ The handful that bite most often:
 | `APP_URL` | `http://0.0.0.0:8000` | The default is unreachable from other pods — delegation hangs while probes stay green. Set it per agent |
 | `GEMINI_*_MODEL` | *(live Vertex catalog)* | Unset means a network call at import. Pin all four for hermetic tests |
 | `A2A_PEERS` | *(agent's `AgentSpec.peers`)* | Comma-separated `name` or `name=url`; the url is a service **root** |
-| `DB_BACKEND` | `none` | Gates the session, task and HITL approval stores all at once |
-| `ARTIFACT_STORAGE_URI` | *(unset → in-memory)* | The scheme *is* the backend; a typo'd scheme silently writes to local disk |
-| `HITL_LEASE_TTL_SECONDS` | `30` | Lease liveness timeout, heartbeat interval (TTL/3) and recovery sweep interval |
+| `DB_BACKEND` | `none` | Gates the session, task and approval-case stores all at once |
+| `ARTIFACT_STORAGE_URI` | *(unset → in-memory)* | The scheme *is* the backend; a typo'd scheme silently writes to local disk. Need not match across agents |
 
 Local development reads a gitignored `.env`; copy `.env.example` and set at
 least `GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, and
@@ -484,15 +536,20 @@ Full walkthrough, checklist, and troubleshooting table:
 [`docs/adding-an-agent.md`](docs/adding-an-agent.md). The short version:
 
 1. `app/agents/<name>/` with `__init__.py` (**needs a docstring** — `D104`),
-   `tools.py`, and `agent.py` exposing `SPEC = AgentSpec(...)`. Cross-agent tools
-   go in `app/agents/common.py`.
+   `tools.py`, and `agent.py` exposing `SPEC = AgentSpec(...)`.
 2. Register it in `app/agents/__init__.py` (`AGENTS`).
-3. If an existing agent should delegate to it, add the name to that agent's
+3. **Declare its contract** in `app/agents/contracts.py`: a `PeerRequest`
+   subclass with a `Field(description=...)` on every field, added to `PAYLOADS`.
+   Those descriptions are the only instructions a caller's model gets about how
+   to call it. Optional in the mechanism — skip it and the agent is delegated to
+   with a single free-text `task` — but required by this repo's policy and its
+   test (invariant 3).
+4. If an existing agent should delegate to it, add the name to that agent's
    `AgentSpec.peers`.
-4. Update **two** tests in `tests/unit/test_agents.py`:
+5. Update **two** tests in `tests/unit/test_agents.py`:
    `test_registry_lists_expected_agents` and
    `test_orchestrator_declares_peers_others_do_not`.
-5. Cluster only — five files:
+6. Cluster only — five files:
    - `infra/terraform/variables.tf` → add to `var.agents`, then `terraform apply`
      (creates the GSA, IAM roles, WI binding, and AlloyDB user via `for_each`).
    - `serviceaccounts.yaml` → KSA `agent-<name>` + its GSA annotation.
@@ -506,7 +563,7 @@ Full walkthrough, checklist, and troubleshooting table:
 No new migration and no new database are needed: every agent gets the same
 tables in its own schema, and `DB_SCHEMA` defaults to `AGENT_NAME`.
 
-Name it a single lowercase word (invariant 5).
+Name it a single lowercase word (invariant 8).
 
 ### Add a tool
 
@@ -617,13 +674,13 @@ Three rules worth stating outright:
   3.11 so it can be reused by other services. Project-specific logic belongs in
   `app/agents/` or `app/cluster/`.
 - **Cluster services come from the injector, not module globals.** `Database`,
-  the session/memory/artifact services, the A2A task store and the HITL
-  `ApprovalStore` are all `@singleton` providers in `app/cluster/di.py`;
+  the session/memory/artifact services, the A2A task store and the
+  `CaseStore` are all `@singleton` providers in `app/cluster/di.py`;
   `app/agent.py` is the composition root that resolves them and hands them to
   the serving layer and the capture plugin. Do not reintroduce a cached
-  `get_*()` accessor: for the approval store in particular, a second instance is
-  a second dict under `DB_BACKEND=none`, and approvals split between them with
-  no error. Two module-level flags remain on purpose — `_configured` in
+  `get_*()` accessor: for the case store in particular, a second instance is a
+  second dict under `DB_BACKEND=none`, and approvals split between them with no
+  error. Two module-level flags remain on purpose — `_configured` in
   `shared/telemetry.py` and `shared/logging.py` — because they guard idempotent
   bootstrap rather than holding a dependency.
 
@@ -652,5 +709,6 @@ Three rules worth stating outright:
   change** — it is the only inventory, and nothing validates it.
 - `GKE.md` and `README.md` are the human-facing docs; keep them in sync when
   changing architecture or commands. `docs/environment-variables.md` is the
-  configuration reference; `docs/human-in-the-loop.md` is the HITL guide (which
-  mechanism, when); `docs/plans/` holds planned work and the evidence behind it.
+  configuration reference; `docs/human-in-the-loop.md` is the approval guide;
+  `docs/design-decisions.md` records why the architecture is what it is, with
+  the measurements and the rejected alternatives behind each choice.

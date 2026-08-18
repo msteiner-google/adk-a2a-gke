@@ -6,17 +6,16 @@ metadata:
     app: orchestrator
     app.kubernetes.io/component: orchestrator
 spec:
-  # Safe to scale. HITL used to pin this to one replica; it no longer does.
-  # Approvals live in AlloyDB (migration 0004), a paused invocation is rebuilt
-  # from the session rather than held in memory, the claim is a single
-  # conditional UPDATE so two deciders cannot both win, and an in-flight resume
-  # heartbeats its lease so no peer's sweep can take it. Verified in-cluster at
-  # 2 replicas: a pause raised on one pod resumed when the decision arrived at
-  # the other, and a dead owner's work was recovered by a live peer within
-  # HITL_LEASE_TTL_SECONDS, with no restart (docs/plans/hitl/results.md R11).
+  # Safe to scale, and now trivially so. Human approval is business state rather
+  # than a suspended invocation: a specialist proposes and finishes, this agent
+  # writes an `approval_cases` row (migration 0005), and the approved action is
+  # an ordinary later call. Nothing is held in memory in between, so there is no
+  # lease to reclaim and no recovery sweep to run -- any replica can decide any
+  # case, because the only thing shared between them is the row.
   #
-  # Kept at 1 as a cost default, not a correctness one. Scaling does still need
-  # a database: with DB_BACKEND=none the store is per-pod memory again.
+  # Kept at 1 as a cost default. Scaling does still need a database: with
+  # DB_BACKEND=none the case store is per-pod memory, so a pending approval is
+  # visible only to the replica that recorded it.
   replicas: 1
   selector:
     matchLabels:
