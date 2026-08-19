@@ -29,6 +29,14 @@
 # 430 MB -- measured by running `uv sync --frozen --no-dev` into a scratch
 # environment before and after, not estimated.
 #
+# Be careful which number you quote. The COMPRESSED image, which is what a node
+# actually pulls, went 286 MB -> 266 MB: a far smaller win, because the old
+# single-stage build hardlinked the uv cache into the venv and Docker stores
+# those as links rather than copies, and because what remains does not compress
+# well. `pyarrow` alone is 152 MB of the 474 MB installed here, and it stays --
+# google-adk[gcp] needs it. The win is real but it is in disk footprint and
+# attack surface, not in pull time.
+#
 # Prefer Cloud Build over building this on a workstation (`make image`, see
 # ./cloudbuild.yaml): the wheels come down, and the layers go up, over Google's
 # network instead of yours.

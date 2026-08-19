@@ -631,6 +631,14 @@ tiktoken and huggingface_hub go with it; `agents-cli eval` still requests it
 through the `eval` group), the installed runtime tree went from **702 MB to
 430 MB**, measured by syncing into a scratch environment before and after.
 
+Quote that number carefully. The **compressed image a node pulls** went only
+286 MB -> 266 MB, because the old single-stage build hardlinked uv's cache into
+the venv (Docker stores those as links, not copies) and because what is left
+compresses badly -- `pyarrow` is 152 MB of the 474 MB installed, and it stays,
+since `google-adk[gcp]` requires it. The gain is in disk footprint and attack
+surface rather than in pull time. Verified on the running image: no `uv`, no
+pandas/scipy/scikit-learn/litellm/openai, and uid 1001 rather than root.
+
 > **If you must build on a workstation**, `--platform linux/amd64` is
 > **required**. The Autopilot nodes these manifests target are amd64, so on an
 > arm64 machine a native build produces an image whose pods fail with `exec
