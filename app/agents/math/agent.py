@@ -14,14 +14,29 @@
 
 """The math agent.
 
-A focused leaf agent (no peers) that performs precise arithmetic. It runs as its
-own Deployment/Service in the cluster and is reached over A2A by any agent that
-lists it as a peer (by default, the orchestrator).
+Performs precise arithmetic, and is reached over A2A by any agent that lists it
+as a peer (by default, the orchestrator). It is delegated to **functionally**: a
+caller sends a :class:`~app.agents.contracts.MathRequest` and nothing else. It
+is also this repo's example of a specialist that gates an effect behind human
+approval — see ``app/agents/math/tools.py`` and ``docs/human-in-the-loop.md``.
 
-It is delegated to **functionally**: a caller sends a
-:class:`~app.agents.contracts.MathRequest` and nothing else. It is also this
-repo's example of a specialist that gates an effect behind human approval — see
-``app/agents/math/tools.py`` and ``docs/human-in-the-loop.md``.
+It is no longer a leaf. Its spec declares ``currency`` as a peer, so when a
+request carries ``target_currency`` this agent delegates each conversion instead
+of applying a rate itself — and it is delegating under exactly the rules that
+apply to its own caller. It composes a
+:class:`~app.agents.contracts.CurrencyRequest` per amount; the currency
+specialist sees that payload and nothing about the sum being computed, let alone
+the conversation the orchestrator is holding.
+
+Nothing in ``build_agent`` had to change for that. An agent that coordinates is
+one whose spec is non-empty in ``peers``, at any depth (see
+``app/agents/base.py``).
+
+**The division of labour is deliberate.** The rate belongs to the specialist
+that owns rates; the arithmetic belongs here. Letting this agent multiply by a
+rate it recalled would put an unversioned, unattributed number into a financial
+answer — which is the failure the split exists to prevent, not a round trip it
+would be clever to save.
 """
 
 from __future__ import annotations
@@ -32,26 +47,46 @@ from app.agents.math.tools import calculate, publish_result
 SPEC = AgentSpec(
     name="math",
     description=(
-        "Performs precise arithmetic and quantitative reasoning, and can "
-        "publish a result once a human has approved it."
+        "Performs precise arithmetic and quantitative reasoning, converts "
+        "between currencies, and can publish a result once a human has "
+        "approved it."
     ),
     instruction=(
         "You are a math specialist. You receive a JSON request with an "
-        "`expression`, a `case_id`, and optionally `publish_as`, `approved_by` "
-        "and `decision_note`.\n\n"
+        "`expression`, a `case_id`, and optionally `target_currency`, "
+        "`publish_as`, `approved_by` and `decision_note`.\n\n"
         "1. Always use the `calculate` tool for the arithmetic rather than "
         "computing in your head.\n"
-        "2. If `publish_as` is set, call `publish_result` with the calculated "
+        "2. If `target_currency` is set, the amounts in `expression` are "
+        "tagged with their own ISO-4217 codes (e.g. '250 EUR + 300 GBP'). "
+        "Before calculating:\n"
+        "   a. For EACH tagged amount whose code differs from "
+        "`target_currency`, call the `currency` specialist once, with that "
+        "amount, its code as `from_currency`, `target_currency` as "
+        "`to_currency`, and the SAME `case_id` as the request. Never convert "
+        "using a rate of your own -- you do not have one, and a rate you "
+        "recall is not a rate anyone can audit.\n"
+        "   b. Substitute each converted number back into the expression, "
+        "leaving the operators untouched, so what remains is plain arithmetic "
+        "with no currency codes in it.\n"
+        "   c. Call `calculate` on that expression. `calculate` rejects "
+        "anything that is not arithmetic, so a leftover currency code is an "
+        "error, not a rounding detail.\n"
+        "   d. Report the result in `target_currency`, and pass on what the "
+        "currency specialist said about the rate -- the rate used and the date "
+        "it is from. Do not present a converted figure as a live market rate.\n"
+        "3. If `publish_as` is set, call `publish_result` with the calculated "
         "value, that label, and `approved_by`/`decision_note` exactly as they "
         "appear in the request (pass empty strings if they are absent).\n"
-        "3. `publish_result` decides what happens: with no approver it returns "
+        "4. `publish_result` decides what happens: with no approver it returns "
         "a proposal and publishes nothing, so say plainly that nothing has been "
         "published and what would be. With an approver it publishes, so report "
         "that it is done.\n"
-        "4. If `publish_as` is absent, just report the calculated result.\n\n"
+        "5. If `publish_as` is absent, just report the calculated result.\n\n"
         "The request is all the context you have: you cannot see the "
         "conversation it came from. Return your answer as plain text."
     ),
     tier="balanced",
+    peers=("currency",),
     tools=(calculate, publish_result),
 )

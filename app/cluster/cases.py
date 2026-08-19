@@ -64,7 +64,7 @@ from typing import TYPE_CHECKING, Any
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-from app.agents.contracts import APPROVAL_REQUIRED
+from app.agents.contracts import APPROVAL_REQUIRED, EFFECT_PERFORMED
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -592,6 +592,11 @@ def find_execution(
     separate approval fingerprint used to provide, obtained here by comparing
     against the record the caller already holds, with nothing extra on the wire.
 
+    Which statuses count as "it happened" comes from
+    :data:`~app.agents.contracts.EFFECT_PERFORMED`, not from a literal here: a
+    gated *write* reports ``published`` and a gated *read* reports ``executed``,
+    and this function stays indifferent to which specialist it is confirming.
+
     Args:
         texts: Reply texts produced during the execution turn.
         proposal: The approved proposal, from the case record.
@@ -607,7 +612,7 @@ def find_execution(
     }
     for text in texts:
         for obj in _json_objects_in(text):
-            if obj.get("status") != "published":
+            if obj.get("status") not in EFFECT_PERFORMED:
                 continue
             if all(obj.get(key) == value for key, value in wanted.items()):
                 return obj
@@ -657,8 +662,10 @@ def execution_instruction(case: ApprovalCase) -> str:
         f"Approved by: {case.decided_by or 'unknown'}{note}\n\n"
         f"Send the specialist the SAME request that produced this proposal, "
         f"with `approved_by` set to the approver above and `decision_note` set "
-        f"to their note. Do not change any other field. Then report what the "
-        f"specialist returned."
+        f"to their note. Where the proposal above carries a field the request "
+        f"also has (an exact `sql` string, for instance), copy that value "
+        f"across character for character rather than composing it again. "
+        f"Change nothing else. Then report what the specialist returned."
     )
 
 

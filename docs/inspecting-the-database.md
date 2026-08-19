@@ -124,7 +124,7 @@ MIGRATOR=${MIGRATOR%.gserviceaccount.com}
 cd -
 
 READERS="someone@example.com"                              # comma-separated
-SCHEMAS="orchestrator research math"                       # every agent with a schema
+SCHEMAS="orchestrator research math trades currency"       # every agent with a schema
 B64=$(base64 < scripts/grant_readers.py | tr -d '\n')
 
 # Unquoted heredoc: the shell substitutes the variables above.
@@ -137,7 +137,7 @@ cat > /tmp/ov.json <<JSON
          {"name":"DB_READER_SCHEMAS","value":"$SCHEMAS"},
          {"name":"OTEL_SDK_DISABLED","value":"true"},
          {"name":"LOG_LEVEL","value":"WARNING"}],
-  "command":["sh","-c","echo $B64 | base64 -d > /tmp/g.py && uv run python /tmp/g.py"],
+  "command":["sh","-c","echo $B64 | base64 -d > /tmp/g.py && python /tmp/g.py"],
   "resources":{"requests":{"cpu":"500m","memory":"1Gi"}}}]}}
 JSON
 
@@ -369,8 +369,8 @@ ORDER BY 1, 2;
 alembic revision, recent sessions and tasks). Same injection pattern as above but
 with no `DB_READERS`. Good for a quick "did anything land?" check from the
 terminal. It reports on `CHECK_SCHEMAS` (whitespace-separated, default
-`orchestrator research math`), so set that variable if your set of agents
-differs. Note it summarises sessions and tasks only — for approval cases, use the
+`orchestrator research math` — it predates `trades` and `currency`, so pass
+them explicitly), so set that variable if your set of agents differs. Note it summarises sessions and tasks only — for approval cases, use the
 queries above.
 
 **psql from a pod** — for anything Studio's 10 MB / five-minute limits get in the

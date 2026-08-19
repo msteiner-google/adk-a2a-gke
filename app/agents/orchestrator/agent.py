@@ -84,5 +84,5 @@ SPEC = AgentSpec(
     ),
     instruction=_INSTRUCTION,
     tier="balanced",
-    peers=("research", "math", "planner"),
+    peers=("research", "math", "planner", "trades"),
 )

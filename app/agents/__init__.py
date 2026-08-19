@@ -26,9 +26,13 @@ source of truth for *which* agents exist and their default peer topology.
   request contract that agent accepts. Every agent that can be delegated to
   needs an entry, or callers fall back to an untyped request.
 
-There is no special "orchestrator" type: the orchestrator is simply the agent
-whose spec lists ``peers``, and those peers are attached as typed tools rather
-than sub-agents (see ``app/cluster/peer_tool.py``).
+There is no special "orchestrator" type: an agent that coordinates others is
+simply one whose spec lists ``peers``, and those peers are attached as typed
+tools rather than sub-agents (see ``app/cluster/peer_tool.py``). Delegation is
+not limited to one level, and the registry below is not a tree: ``math``
+declares ``currency`` as a peer, so ``orchestrator -> math -> currency`` is an
+ordinary chain of A2A calls with no special handling anywhere. Each hop carries
+its own typed request; depth changes nothing about what a specialist can see.
 
 To add an agent, create ``app/agents/<name>/`` with an ``agent.py`` exposing a
 ``SPEC``, register it below, add its request contract to
@@ -40,14 +44,17 @@ from __future__ import annotations
 
 from app.agents.base import AgentSpec, build_agent
 from app.agents.contracts import PAYLOADS
+from app.agents.currency.agent import SPEC as CURRENCY
 from app.agents.math.agent import SPEC as MATH
 from app.agents.orchestrator.agent import SPEC as ORCHESTRATOR
 from app.agents.planner.agent import SPEC as PLANNER
 from app.agents.research.agent import SPEC as RESEARCH
+from app.agents.trades.agent import SPEC as TRADES
 
 # Registered agents, keyed by name. Order is preserved for stable listings.
 AGENTS: dict[str, AgentSpec] = {
-    spec.name: spec for spec in (ORCHESTRATOR, RESEARCH, MATH, PLANNER)
+    spec.name: spec
+    for spec in (ORCHESTRATOR, RESEARCH, MATH, PLANNER, TRADES, CURRENCY)
 }
 
 # The agent a process becomes when AGENT_NAME is unset.

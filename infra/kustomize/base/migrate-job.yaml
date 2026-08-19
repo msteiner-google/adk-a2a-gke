@@ -69,7 +69,7 @@ spec:
             # The agents to migrate. Must match var.agents in Terraform and the
             # registry in app/agents/__init__.py.
             - name: MIGRATE_AGENTS
-              value: "orchestrator research math"
+              value: "orchestrator research math trades currency"
             # Used to derive each agent's database role below. Must match
             # var.service_account_prefix and the project the GSAs live in.
             - name: AGENT_ROLE_PREFIX
@@ -81,8 +81,13 @@ spec:
             - |
               set -eu
 
+              # `python` and `alembic`, not `uv run ...`. The image is
+              # multi-stage now and carries no uv -- the virtualenv's bin
+              # directory is on PATH instead (see the Dockerfile). Leaving
+              # `uv run` here fails with "command not found", which reads like a
+              # broken image rather than a stale command line.
               echo "==> ensuring database '${DB_NAME}' exists"
-              uv run python -m app.cluster.bootstrap
+              python -m app.cluster.bootstrap
 
               for agent in ${MIGRATE_AGENTS}; do
                 echo "==> migrating schema '${agent}'"
@@ -92,7 +97,7 @@ spec:
                 # the grant and the agent could not read its own tables.
                 DB_SCHEMA="${agent}" \
                 DB_AGENT_ROLE="${AGENT_ROLE_PREFIX}-${agent}@${AGENT_ROLE_SUFFIX}" \
-                  uv run alembic -c app/migrations/alembic.ini upgrade head
+                  alembic -c app/migrations/alembic.ini upgrade head
               done
 
               echo "==> all schemas at head"

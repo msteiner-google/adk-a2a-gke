@@ -223,7 +223,20 @@ No `PROJECT_ID` or `REGION` placeholder should survive.
 
 ## 5. Build and push the image
 
-One image serves all three agents; `AGENT_NAME` selects the role at startup.
+One image serves every agent; `AGENT_NAME` selects the role at startup.
+
+```bash
+cd ../..                                  # repo root, where the Makefile lives
+make image TAG=demo-1 BUILD_PROJECT=<your-project>
+```
+
+That submits `cloudbuild.yaml` as the `agent-builder` service account created in
+step 3, so there is no registry login, no local builder, and nothing to get
+wrong about architecture — Cloud Build's workers are amd64. Only the source
+tarball leaves your machine; `.gcloudignore` keeps it to a few hundred KB.
+`tofu output -raw build_command` prints the equivalent `gcloud` invocation.
+
+### If you build on a workstation instead
 
 ```bash
 REPO=$(cd infra/terraform && tofu output -raw artifact_registry_repo)
@@ -231,8 +244,8 @@ REPO=$(cd infra/terraform && tofu output -raw artifact_registry_repo)
 # Auth the builder to Artifact Registry (avoids the gcloud credential helper).
 podman login -u oauth2accesstoken -p "$(gcloud auth print-access-token)" "${REPO%%/*}"
 
-podman build --platform linux/amd64 -t "$REPO/agent:latest" .
-podman push "$REPO/agent:latest"
+podman build --platform linux/amd64 -t "$REPO/agent:demo-1" .
+podman push "$REPO/agent:demo-1"
 ```
 
 **`--platform linux/amd64` is mandatory on Apple Silicon.** GKE Autopilot nodes
@@ -244,7 +257,7 @@ an application bug rather than a build one. The cross-build works (the
 Confirm before pushing:
 
 ```bash
-podman image inspect "$REPO/agent:latest" --format '{{.Os}}/{{.Architecture}}'   # linux/amd64
+podman image inspect "$REPO/agent:demo-1" --format '{{.Os}}/{{.Architecture}}'   # linux/amd64
 ```
 
 Substitute `docker` freely — the flags are identical.
@@ -256,7 +269,7 @@ Substitute `docker` freely — the flags are identical.
 ```bash
 kubectl apply -k infra/kustomize/overlays/dev
 
-for d in orchestrator research math; do
+for d in orchestrator research math planner trades currency; do
   kubectl -n agents rollout status deploy/$d --timeout=420s
 done
 ```
@@ -269,7 +282,7 @@ window are normal and resolve themselves.
 kubectl -n agents get pods,svc
 ```
 
-All three pods should be `1/1 Running`.
+Every pod should be `1/1 Running`.
 
 ---
 

@@ -72,10 +72,32 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-# Status a specialist returns instead of performing an action that needs a
-# human's sign-off. Part of the contract: a caller keys its business workflow on
-# this string, and a specialist on any framework can produce it.
+# --- The approval vocabulary --------------------------------------------------
+#
+# Three strings, and they are as much a part of the wire contract as any field
+# below: a caller keys its business workflow on them, and a specialist written
+# on another framework produces them without importing anything from here.
+
 APPROVAL_REQUIRED = "approval_required"
+"""Returned INSTEAD of performing an action that needs a human's sign-off."""
+
+PUBLISHED = "published"
+"""A gated write happened (``app/agents/math/tools.py``)."""
+
+EXECUTED = "executed"
+"""A gated read happened (``app/agents/trades/tools.py``)."""
+
+#: Every status meaning "the gated effect actually happened". The caller scans a
+#: specialist's reply for one of these and then checks the values against the
+#: approved proposal (``app.cluster.cases.find_execution``); a status outside
+#: this set is not treated as confirmation, so a new gated action MUST add its
+#: status here or its executions are reported as `approved_not_confirmed`.
+#:
+#: Two spellings rather than one because the status names the effect, and
+#: "published" is not a truthful description of running a query. The set is the
+#: seam that lets each specialist say what it did while the caller stays
+#: generic.
+EFFECT_PERFORMED: frozenset[str] = frozenset({PUBLISHED, EXECUTED})
 
 
 class PeerRequest(BaseModel):
@@ -143,8 +165,19 @@ class MathRequest(PeerRequest):
     expression: str = Field(
         description=(
             "The arithmetic expression to evaluate, e.g. '(2 + 3) * 4'. "
-            "Supports + - * / // % ** and parentheses only."
+            "Supports + - * / // % ** and parentheses only. When "
+            "`target_currency` is set, tag each amount with its own ISO-4217 "
+            "code instead, e.g. '250 EUR + 300 GBP'."
         )
+    )
+    target_currency: str = Field(
+        default="",
+        description=(
+            "Optional ISO-4217 code the answer must be expressed in, e.g. "
+            "'USD'. Set it when the amounts in `expression` are not all in the "
+            "same currency: the specialist converts each one first, then "
+            "evaluates. Leave empty for plain arithmetic."
+        ),
     )
     publish_as: str = Field(
         default="",
@@ -181,6 +214,76 @@ class PlannerRequest(PeerRequest):
     )
 
 
+class CurrencyRequest(PeerRequest):
+    """Ask the currency specialist to convert one amount between currencies.
+
+    One conversion per call, on purpose: a list of conversions would leave the
+    caller deciding how to correlate results back to inputs, and a specialist
+    call is cheap.
+    """
+
+    amount: float = Field(
+        description="How much to convert, expressed in `from_currency`."
+    )
+    from_currency: str = Field(
+        description="ISO-4217 code of the currency the amount is in, e.g. 'EUR'."
+    )
+    to_currency: str = Field(
+        description="ISO-4217 code of the currency to convert to, e.g. 'USD'."
+    )
+
+
+class TradesRequest(PeerRequest):
+    """Ask the trades specialist a question about Cymbal Investments trades.
+
+    Running the query is the gated action: with no ``approved_by`` the
+    specialist replies with the SQL it proposes to run and queries nothing.
+    Re-send with ``approved_by`` set **and the approved ``sql`` copied in
+    verbatim** once a human has said yes.
+
+    The ``sql`` round trip is what makes this different from
+    :class:`MathRequest`. Arithmetic is reproducible from ``expression``, so the
+    math specialist recomputes; SQL generation is not, so the approved text has
+    to travel back rather than be regenerated from the question.
+    """
+
+    question: str = Field(
+        description=(
+            "The trade question to answer, stated in full — the specialist "
+            "cannot see the conversation it came from. It writes the SQL "
+            "itself; describe what you want to know, not how to query it."
+        )
+    )
+    sql: str = Field(
+        default="",
+        description=(
+            "Leave EMPTY on a first request. On an approved re-send, the exact "
+            "`sql` string from the approved proposal, copied character for "
+            "character: the specialist will not regenerate it, and a query "
+            "that differs from the approved one is refused."
+        ),
+    )
+    row_limit: int = Field(
+        default=20,
+        description=(
+            "Maximum rows to return, capped by the specialist. Ask for an "
+            "aggregate rather than raising this: the rows cross the wire as "
+            "text."
+        ),
+    )
+    approved_by: str = Field(
+        default="",
+        description=(
+            "Who approved running the query. Set this ONLY after a human "
+            "approved, and send the approved `sql` alongside it."
+        ),
+    )
+    decision_note: str = Field(
+        default="",
+        description="Optional feedback the approver attached, recorded for audit.",
+    )
+
+
 # Which contract each agent accepts. `app/cluster/resolver.py` reads this to give
 # a peer's tool a typed declaration; a peer absent from this mapping (an agent
 # owned by another squad, reached by URL) falls back to an untyped request and
@@ -189,13 +292,20 @@ PAYLOADS: dict[str, type[PeerRequest]] = {
     "research": ResearchRequest,
     "math": MathRequest,
     "planner": PlannerRequest,
+    "currency": CurrencyRequest,
+    "trades": TradesRequest,
 }
 
 __all__ = [
     "APPROVAL_REQUIRED",
+    "EFFECT_PERFORMED",
+    "EXECUTED",
     "PAYLOADS",
+    "PUBLISHED",
+    "CurrencyRequest",
     "MathRequest",
     "PeerRequest",
     "PlannerRequest",
     "ResearchRequest",
+    "TradesRequest",
 ]

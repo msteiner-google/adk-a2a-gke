@@ -40,7 +40,7 @@ variable "agents" {
     hyphens) and Kubernetes DNS labels forbid underscores.
   EOT
   type        = list(string)
-  default     = ["orchestrator", "research", "math", "planner"]
+  default     = ["orchestrator", "research", "math", "planner", "trades", "currency"]
 
   validation {
     condition     = alltrue([for name in var.agents : can(regex("^[a-z][a-z0-9]*$", name))])
@@ -77,14 +77,49 @@ variable "agent_extra_iam_roles" {
 
     This is the payoff of per-agent identities: widen one agent without widening
     the rest. Keep var.agent_iam_roles as the minimal shared baseline.
+
+    The default below is the worked example. `trades` runs BigQuery jobs, so it
+    needs roles/bigquery.jobUser -- and it is the ONLY agent that does. Putting
+    it here rather than in the baseline is what stops `research`, the agent that
+    ingests untrusted web content, from also being able to start a query job.
+
+    Note what jobUser does NOT include: permission to read data. The trades
+    agent holds bigquery.dataViewer on nothing, so it can only query datasets
+    that are already public -- which is exactly the one table it is pointed at.
   EOT
   type        = map(list(string))
-  default     = {}
+  default = {
+    trades = ["roles/bigquery.jobUser"]
+  }
 
   validation {
     condition     = alltrue([for name in keys(var.agent_extra_iam_roles) : contains(var.agents, name)])
     error_message = "Keys of agent_extra_iam_roles must be names listed in var.agents."
   }
+}
+
+variable "builder_service_account_id" {
+  description = <<-EOT
+    Google Service Account id for Cloud Build image builds (cloudbuild.tf).
+
+    Deliberately separate from Cloud Build's legacy default account, which
+    carries roles/editor on the whole project. This one can push to the agent
+    Artifact Registry repository and write logs, and nothing else.
+  EOT
+  type        = string
+  default     = "agent-builder"
+}
+
+variable "builder_impersonators" {
+  description = <<-EOT
+    Principals allowed to run a build AS the builder service account, in IAM
+    member form ("user:me@example.com", "serviceAccount:ci@...").
+
+    Empty by default: a human with roles/owner can already impersonate it. Add a
+    CI runner here rather than granting it owner.
+  EOT
+  type        = list(string)
+  default     = []
 }
 
 variable "deletion_protection" {

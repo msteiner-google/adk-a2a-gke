@@ -18,13 +18,25 @@ GKE Autopilot with Terraform + Kustomize.
                        │  Deployment/Svc   │  holds the conversation
                        └─────────┬─────────┘
         A2A — one typed payload per call, never the transcript
-                 ┌───────────────┴───────────────┐
-                 ▼                               ▼
-        ┌────────────────┐              ┌────────────────┐
-        │    research    │              │      math      │  leaf specialists
-        │ Deployment/Svc │              │ Deployment/Svc │  tier=balanced
-        └────────────────┘              └────────────────┘
+      ┌──────────────┬───────────┼───────────────┐
+      ▼              ▼           ▼               ▼
+┌──────────┐   ┌──────────┐ ┌─────────┐    ┌──────────┐
+│ research │   │  math    │ │ planner │    │  trades  │  specialists
+│ balanced │   │ balanced │ │balanced │    │ capable  │
+└──────────┘   └────┬─────┘ └─────────┘    └──────────┘
+                    │ A2A                   gated: a query
+                    ▼                       runs only after
+              ┌──────────┐                  a human approves
+              │ currency │  tier=fast
+              └──────────┘  reached ONLY by math
 ```
+
+**Delegation is a graph, not one level.** `math` declares `currency` as a peer,
+so `orchestrator -> math -> currency` is an ordinary chain of A2A calls that
+needed no new machinery: an agent that coordinates is simply one whose
+`AgentSpec.peers` is non-empty, at any depth. The rules do not loosen further
+down — `currency` sees a `CurrencyRequest` and nothing about the sum `math` is
+computing, let alone the conversation the orchestrator is holding.
 
 **The agents share no runtime state.** A specialist is reached with an explicit
 request and sees nothing else — no conversation history, no shared session
@@ -49,7 +61,7 @@ code path.
 All of these were run in this repo and pass as of the last update to this file.
 
 ```bash
-# Unit tests — 260 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
+# Unit tests — 307 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
 # (see "Importing app hits the network" below).
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite \
 GEMINI_BALANCED_MODEL=gemini-2.5-flash \
@@ -74,9 +86,10 @@ Other commands (require a server / GCP creds, not part of the fast loop):
 
 | Command | Purpose |
 | --- | --- |
-| `make up` / `make down` | Start or stop all four agents locally, peers wired (see the Makefile) |
+| `make up` / `make down` | Start or stop all six agents locally, peers wired — including `math -> currency` (see the Makefile) |
 | `make check` | Preflight: ADC, project, location, model reachability |
 | `make demo` | Drive the approval flow end to end and assert it worked |
+| `make image` / `make image TAG=x` | Build + push the image with Cloud Build (`cloudbuild.yaml`) |
 | `uv sync` | Install deps (or `agents-cli install`) |
 | `agents-cli playground` | Interactive local UI |
 | `uv run adk web` | ADK dev UI (becomes `DEFAULT_AGENT` unless `AGENT_NAME` set) |
@@ -85,9 +98,10 @@ Other commands (require a server / GCP creds, not part of the fast loop):
 | `agents-cli eval generate` / `grade` / `compare` / `analyze` / `optimize` | Eval loop; needs GCP creds |
 
 Tooling this repo assumes on your PATH: `agents-cli`, `uv`, `kubectl`,
-`terraform` (>= 1.9, see "Deploy to GKE"), `gcloud`, and an OCI image builder
-(`docker` or `podman`). Read the `--platform` warning in "Deploy to GKE" before
-building an image.
+`terraform` (>= 1.9, see "Deploy to GKE") and `gcloud`. A local OCI image
+builder (`docker` or `podman`) is **optional**: images are built by Cloud Build
+(`make image`). If you do build locally, read the `--platform` warning in
+"Deploy to GKE" first.
 
 ## File map
 
@@ -103,10 +117,12 @@ Read the module docstrings; they are thorough. This is the index.
 | `app/agents/contracts.py` | **The wire contracts.** One pydantic model per delegatable agent + `PAYLOADS`. The interface both a caller and a specialist agree on. Opt-in per agent: a peer with no model here is delegated to with a single free-text `task` instead (see its module docstring for the tiers). |
 | `app/agents/documents.py` | `read_document` — reads a claim-check reference (`gs://…`) the caller passed in `document_refs`. |
 | `app/agents/reporting.py` | `restate_structured_results` — the after-agent callback that makes a proposal survive the A2A text boundary instead of being paraphrased. |
-| `app/agents/orchestrator/agent.py` | `SPEC` with `peers=("research","math","planner")`, `tier="balanced"`. |
+| `app/agents/orchestrator/agent.py` | `SPEC` with `peers=("research","math","planner","trades")`, `tier="balanced"`. |
 | `app/agents/research/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, tool `web_search`. |
-| `app/agents/math/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, tool `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. |
+| `app/agents/math/agent.py` + `tools.py` | `tier="balanced"`, `peers=("currency",)`. Tools: `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. **Not a leaf** — it delegates conversions rather than applying a rate itself. |
 | `app/agents/planner/` | Leaf agent, `tier="balanced"`, no tools. Drafts a plan and returns it for review. |
+| `app/agents/currency/agent.py` + `tools.py` | Leaf agent, `tier="fast"`, reached only by `math`. Hardcoded USD-anchored rate table; every pair is derived from it, so no triangle of rates can disagree with itself. |
+| `app/agents/trades/agent.py` + `tools.py` + `dataset.py` | Leaf agent, `tier="capable"`. Writes SQL against the `cymbal_investments.trade_capture_report` BigQuery public dataset; `run_trade_query` is the **second gated action**. `dataset.py` holds both the schema the instruction is built from and the one-table allow-list the validator enforces. |
 | `app/cluster/peer_tool.py` | `PeerTool` — an `AgentTool` that gives a remote peer a **typed payload declaration**, so delegation sends an explicit request instead of the transcript. |
 | `app/cluster/cases.py` | The approval case store (`pending → approved → executed`), both backends (in-memory / `approval_cases`), and the helpers that read a proposal back out of a peer's text reply. |
 | `app/cluster/config.py` | **Pure stdlib** (no ADK/genai imports). `PeerSpec`, `ClusterConfig.from_env()`, `service_dns_url()`. Parses `AGENT_NAME` / `A2A_*`. |
@@ -155,6 +171,14 @@ Read the module docstrings; they are thorough. This is the index.
   not the transcript, and session state never reaches the wire.
 - `tests/unit/test_two_phase_approval.py` — propose causes no effect, a tampered
   proposal is refused, and the approval survives serialization.
+- `tests/unit/test_trades.py` — the same properties for the gated *read*, plus
+  the SQL validator (a keyword inside a string literal is not a keyword; a
+  comment cannot hide a second statement) and the full propose → approve →
+  re-send → `find_execution` round trip, including the negative case. The one
+  function that would touch BigQuery is stubbed, which is why it exists.
+- `tests/unit/test_currency.py` — the conversions, the no-arbitrage property the
+  USD-anchored table exists to give, and the wiring that lets `math` reach
+  `currency` as a `PeerTool` rather than a sub-agent.
 - `tests/unit/test_documents.py` — claim-check reads against `tmp_path`.
 - `tests/integration/` — `test_agent.py`, `test_server_e2e.py`. Needs a server.
 - `tests/eval/` — `eval_config.yaml`, `response_quality.py`, `datasets/`. Needs GCP creds.
@@ -172,20 +196,27 @@ Terraform for the Google Cloud side, Kustomize for the Kubernetes side.
 | `infra/terraform/main.tf` | GKE Autopilot cluster, Artifact Registry, APIs, **one GSA per agent** + a migrator GSA, IAM roles, Workload Identity bindings. |
 | `infra/terraform/alloydb.tf` | AlloyDB cluster + instance (`c4a-highmem-1`, 1 vCPU / 8 GB), private-services-access peering, IAM database users. |
 | `infra/terraform/artifacts.tf` | GCS bucket for ADK artifacts (uniform access, public-access prevention, 30-day lifecycle) + `roles/storage.objectUser` per agent GSA on that bucket. One shared bucket by design — see the header comment. |
+| `infra/terraform/cloudbuild.tf` | The `agent-builder` GSA that Cloud Build runs as: repository-scoped `artifactregistry.writer`, `logging.logWriter`, `storage.objectUser`. Deliberately **not** Cloud Build's legacy default SA, which carries `roles/editor`. |
 | `infra/kustomize/base/` | `namespace.yaml`, `serviceaccounts.yaml`, `configmap.yaml`, `networkpolicy.yaml`, `migrate-job.yaml`, `orchestrator.yaml`, `workers.yaml`. |
 | `infra/kustomize/overlays/dev/` | Image name/tag overlay. |
-| `Dockerfile` | The single image every agent runs. Copies only `./app`. |
+| `Dockerfile` | The single image every agent runs. **Multi-stage**; the runtime stage carries the venv and `./app` and no `uv`. |
+| `cloudbuild.yaml` + `.gcloudignore` | How the image is built (`make image`). The ignore file keeps the uploaded source to a few hundred KB. |
 
 Key vars in `variables.tf`: `project_id` (required), `region` (default
-`us-central1`), `agents` (default `["orchestrator","research","math"]` — must
-match `app/agents/`), `service_account_prefix` (`agent`), `alloydb_machine_type`
+`us-central1`), `agents` (default
+`["orchestrator","research","math","planner","trades","currency"]` — must match
+`app/agents/`), `agent_extra_iam_roles` (default
+`{ trades = ["roles/bigquery.jobUser"] }` — the one agent that may start a query
+job, and it holds `dataViewer` on nothing), `service_account_prefix` (`agent`),
+`builder_service_account_id` (`agent-builder`), `alloydb_machine_type`
 (`c4a-highmem-1`), `alloydb_database` (`agents`), `artifact_bucket_name`
 (default `<project_id>-agent-artifacts`), `artifact_retention_days` (30).
 
 **Placeholders to fill before `kubectl apply`** (all from
 `terraform output -json kustomize_values`):
 1. `infra/kustomize/base/serviceaccounts.yaml` → the
-   `iam.gke.io/gcp-service-account` annotation on each of the 4 ServiceAccounts.
+   `iam.gke.io/gcp-service-account` annotation on each of the 7 ServiceAccounts
+   (six agents + the migrator).
 2. `infra/kustomize/base/configmap.yaml` → `ALLOYDB_INSTANCE_URI`,
    `ARTIFACT_STORAGE_URI`.
 3. `orchestrator.yaml` / `workers.yaml` → `ALLOYDB_IAM_USER` per agent.
@@ -215,7 +246,9 @@ Violating these is how this codebase breaks. They are deliberate.
    `AgentSpec` built by the single `build_agent()`. The "orchestrator" is just
    the agent whose spec declares `peers`; `build_agent` attaches whatever peers
    the cluster config resolved (empty for a leaf). **Do not reintroduce a
-   per-role builder or an orchestrator subclass.**
+   per-role builder or an orchestrator subclass.** This is also what makes depth
+   free: `math` declares `currency` and becomes a caller as well as a callee,
+   with no new type, no new code path and no change to `build_agent`.
 2. **Peers are TOOLS, never `sub_agents`.** `build_agent` puts resolved peers in
    `tools` and leaves `sub_agents` empty. A peer in `sub_agents` is reached with
    `transfer_to_agent`, and `RemoteA2aAgent` then rebuilds the outbound message
@@ -262,6 +295,16 @@ Violating these is how this codebase breaks. They are deliberate.
 9. **`App(name=...)` must equal the agent directory** (`"app"`). It determines
    the A2A mount path `/a2a/app`. Renaming one without the other breaks peer
    discovery.
+10. **A delegation edge in `AgentSpec.peers` needs a matching rule in
+    `infra/kustomize/base/networkpolicy.yaml`.** The namespace is deny-by-default
+    for ingress, so an edge added in code and missed there fails as a connection
+    **timeout**, not an error — the pods stay green and delegation just hangs.
+    `math -> currency` is the case that makes this more than bookkeeping:
+    "workers accept traffic from the orchestrator" is no longer the whole
+    policy, and `currency` accepts traffic from `math` and from nobody else,
+    including the orchestrator.
+    `test_agents.py::test_declared_peer_topology` pins the shape the policy has
+    to mirror; it cannot check the YAML for you.
 
 ## Gotchas
 
@@ -335,6 +378,13 @@ These are real traps that have bitten this codebase.
   migration Job — which has to run the same image as the agents. Run it with
   `-c app/migrations/alembic.ini`.
 
+- **There is no `uv` in the runtime image, so no `uv run` in a manifest.** The
+  `Dockerfile` is multi-stage: the build stage has uv, the runtime stage gets
+  the finished venv with `/code/.venv/bin` on `PATH` and nothing else. Call
+  `python`, `uvicorn` and `alembic` directly — `migrate-job.yaml` does. `uv run`
+  in a pod fails with `command not found`, which reads as a broken image rather
+  than a stale command line. On a workstation `uv run` is still correct.
+
 - **Never let ADK or a2a create their own tables.** Both would call
   `create_all()` at startup — that races across replicas, needs DDL privileges
   the agent roles deliberately lack, and bypasses the migration history. ADK's
@@ -405,6 +455,23 @@ These are real traps that have bitten this codebase.
   re-drive by calling `POST /cases/{proposal_id}` again — unlike the mechanism
   this replaced, every such row is actionable.
 
+- **A gated action must report a status in `contracts.EFFECT_PERFORMED`.**
+  `cases.find_execution` confirms an execution by scanning the reply for
+  `"published"` or `"executed"` and then matching the values against the
+  approved proposal. A new gated action that invents its own success string runs
+  perfectly and is reported as `approved_not_confirmed` — a vocabulary bug
+  wearing a model bug's clothes. Add the status to the frozenset in
+  `app/agents/contracts.py`.
+
+- **A gated action whose input is not reproducible must carry it back.**
+  `publish_result` recomputes from `expression`; `run_trade_query` cannot,
+  because a model asked the same question twice writes different SQL. So the
+  approved `sql` travels in the re-sent request and the tool refuses to run
+  without it, and the tool canonicalises it so a reflowed re-send still matches
+  what was approved. Do not "fix" a mismatch by loosening the comparison —
+  canonicalise at the source instead, or the check stops catching a genuinely
+  different action.
+
 - **The gate is that the effect is unreachable without an approver**, not an
   instruction the model is asked to follow. `publish_result` returns a proposal
   when `approved_by` is empty and only performs the write when it is set. Adding
@@ -417,7 +484,17 @@ These are real traps that have bitten this codebase.
   reported as `approved_not_confirmed` rather than recorded as success.
 
 - **`agents-cli` uses `uv`.** Run Python as `uv run python ...`, never bare
-  `python`.
+  `python`. (In the container it is the other way round — see the no-`uv`
+  gotcha above.)
+
+- **The trades agent's SQL validator is a guard rail, not the boundary.** It
+  rejects anything that is not a single read-only statement against the one
+  allowed table, and it works on text whose comments and string literals have
+  been masked first — both directions matter, since a keyword in a literal must
+  neither trip it nor evade it. What actually confines the agent is the human
+  who reads the SQL, the pod's IAM (`roles/bigquery.jobUser`, `dataViewer` on
+  nothing) and `maximum_bytes_billed`. Do not add a bypass for a "trusted"
+  caller.
 
 - **Model 404s** are a location problem, not a model-name problem — fix
   `GOOGLE_CLOUD_LOCATION` (`global` usually works). **Never change the model
@@ -522,6 +599,7 @@ The handful that bite most often:
 | `A2A_PEERS` | *(agent's `AgentSpec.peers`)* | Comma-separated `name` or `name=url`; the url is a service **root** |
 | `DB_BACKEND` | `none` | Gates the session, task and approval-case stores all at once |
 | `ARTIFACT_STORAGE_URI` | *(unset → in-memory)* | The scheme *is* the backend; a typo'd scheme silently writes to local disk. Need not match across agents |
+| `TRADES_*` | `US` / 1 GiB / 50 rows | `TRADES_LOCATION`, `TRADES_MAX_BYTES_BILLED`, `TRADES_MAX_ROWS`. Read at call time, and only by the `trades` agent |
 
 Local development reads a gitignored `.env`; copy `.env.example` and set at
 least `GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, and
@@ -547,18 +625,24 @@ Full walkthrough, checklist, and troubleshooting table:
 4. If an existing agent should delegate to it, add the name to that agent's
    `AgentSpec.peers`.
 5. Update **two** tests in `tests/unit/test_agents.py`:
-   `test_registry_lists_expected_agents` and
-   `test_orchestrator_declares_peers_others_do_not`.
+   `test_registry_lists_expected_agents` and `test_declared_peer_topology`.
 6. Cluster only — five files:
    - `infra/terraform/variables.tf` → add to `var.agents`, then `terraform apply`
      (creates the GSA, IAM roles, WI binding, and AlloyDB user via `for_each`).
+     If it needs a role no other agent needs, put that in
+     `var.agent_extra_iam_roles` rather than widening the shared baseline — see
+     `trades` and `roles/bigquery.jobUser`.
    - `serviceaccounts.yaml` → KSA `agent-<name>` + its GSA annotation.
    - `workers.yaml` → copy a Deployment/Service pair; set `AGENT_NAME`,
      `APP_URL`, `ALLOYDB_IAM_USER`, `serviceAccountName`.
-   - `networkpolicy.yaml` → add to the workers allow-list. **Easy to miss:**
-     omitting it leaves the agent with no ingress at all, and delegation fails
-     as a timeout rather than an error.
+   - `networkpolicy.yaml` → allow ingress from **whichever agents call it**, not
+     reflexively from the orchestrator (invariant 10). **Easy to miss:** omitting
+     it leaves the agent with no ingress at all, and delegation fails as a
+     timeout rather than an error.
    - `migrate-job.yaml` → add to `MIGRATE_AGENTS`.
+7. Local dev — `Makefile`: add it to `AGENTS`, give it a `PORT_<name>` and a
+   `PORTS` entry, add a `serve-<name>` target, and if an existing agent should
+   call it, add it to that agent's peer list (`PEERS` / `MATH_PEERS`).
 
 No new migration and no new database are needed: every agent gets the same
 tables in its own schema, and `DB_SCHEMA` defaults to `AGENT_NAME`.
@@ -574,6 +658,8 @@ spec's `tools` tuple.
 
 ### Run two agents locally to exercise A2A
 
+`make up` starts all six with the peers wired. By hand, for two:
+
 ```bash
 # Terminal 1 — the specialist
 AGENT_NAME=math APP_URL=http://127.0.0.1:8091 \
@@ -582,6 +668,17 @@ AGENT_NAME=math APP_URL=http://127.0.0.1:8091 \
 # Terminal 2 — the orchestrator delegating to it
 AGENT_NAME=orchestrator A2A_PEERS=math=http://127.0.0.1:8091 \
   uv run uvicorn app.fast_api_app:app --port 8090
+```
+
+An agent in the middle of the graph needs **both**: an `APP_URL` so its caller
+can reach it, and its own `A2A_PEERS` so it can reach further. Miss the second
+and everything still starts and reports healthy — `math` simply has no currency
+tool.
+
+```bash
+AGENT_NAME=math APP_URL=http://127.0.0.1:8091 \
+  A2A_PEERS=currency=http://127.0.0.1:8095 \
+  uv run uvicorn app.fast_api_app:app --port 8091
 ```
 
 ### Deploy to GKE
@@ -593,29 +690,36 @@ terraform init
 terraform plan -var-file=terraform.tfvars   # READ THE PLAN, see gotchas
 terraform apply -var-file=terraform.tfvars
 eval "$(terraform output -raw get_credentials_command)"
+cd -
 
-REPO=$(terraform output -raw artifact_registry_repo)
+# Build the image IN Cloud Build. No local docker/podman, no registry login,
+# no --platform trap: the workers are amd64. Only the source tarball leaves
+# your machine (a few hundred KB -- see .gcloudignore).
+make image TAG=demo-1
+# equivalently: terraform output -raw build_command
 
-# Auth. Either configure the gcloud credential helper once
-# (`gcloud auth configure-docker "${REPO%%/*}"`) or log the builder in directly:
-docker login -u oauth2accesstoken \
-  -p "$(gcloud auth print-access-token)" "${REPO%%/*}"
-
-# --platform linux/amd64 is REQUIRED — see the warning below.
-docker build --platform linux/amd64 -t "$REPO/agent:latest" .
-docker push "$REPO/agent:latest"
-
-# fill the two placeholders, then:
+# set newTag to the same value in the overlay, fill the placeholders, then:
 kubectl apply -k infra/kustomize/overlays/dev
 kubectl -n agents port-forward svc/orchestrator 8080:80
 ```
 
-**Always pass `--platform linux/amd64` when building.** The GKE Autopilot nodes
-these manifests target are **amd64** (nothing sets a `kubernetes.io/arch: arm64`
-nodeSelector), so on an arm64 workstation a native build produces an arm64 image
-whose pods fail on the cluster with `exec format error` — which looks like an app
-bug, not a build bug. The base image (`python:3.14-slim`) is multi-arch, so the
-cross-build works fine; it is just slower under emulation.
+Building locally is still possible and is now the fallback, not the default:
+
+```bash
+REPO=$(cd infra/terraform && terraform output -raw artifact_registry_repo)
+docker login -u oauth2accesstoken \
+  -p "$(gcloud auth print-access-token)" "${REPO%%/*}"
+docker build --platform linux/amd64 -t "$REPO/agent:demo-1" .
+docker push "$REPO/agent:demo-1"
+```
+
+**If you build locally, always pass `--platform linux/amd64`.** The GKE Autopilot
+nodes these manifests target are **amd64** (nothing sets a
+`kubernetes.io/arch: arm64` nodeSelector), so on an arm64 workstation a native
+build produces an arm64 image whose pods fail on the cluster with `exec format
+error` — which looks like an app bug, not a build bug. The base image
+(`python:3.14-slim`) is multi-arch, so the cross-build works fine; it is just
+slower under emulation. `make image` sidesteps the whole question.
 
 **Deploying requires explicit human approval. Never run `terraform apply` or
 `kubectl apply` without being asked.**
@@ -638,8 +742,10 @@ through `uv`. Install it once with `uv tool install google-agents-cli`.
 4. **Pre-deployment checks** — the hermetic unit-test command at the top of this
    file, `agents-cli lint`, then `uv run pytest tests/integration` against a
    running server. Fix until green.
-5. **Deploy** — build the image and apply the Kustomize overlay ("Deploy to GKE").
-   **Requires explicit human approval**; only after the user confirms.
+5. **Deploy** — `make image TAG=...`, then apply the Kustomize overlay ("Deploy
+   to GKE"). **Requires explicit human approval**; only after the user confirms.
+   A build is not a deploy, but it does write to a registry and cost money — ask
+   before running that too.
 
 ### Command reference
 
@@ -664,7 +770,7 @@ through `uv`. Install it once with `uv tool install google-agents-cli`.
 | Cluster plumbing | `app/cluster/**`, `app/migrations/**` | Config, peer resolution, DI, session/artifact/task backends, schema |
 | Serving | `app/fast_api_app.py`, `app/app_utils/**` | The HTTP + A2A surface. `fast_api_app.py` is the seam to edit; `app_utils/` is stable low-level plumbing — wire things up in `fast_api_app.py` rather than changing it |
 | Shared library | `app/shared/**` | Cross-cutting, project-agnostic utilities (models, telemetry, logging, secrets, artifacts) |
-| Infrastructure | `infra/**`, `Dockerfile` | Terraform, Kustomize, the container image |
+| Infrastructure | `infra/**`, `Dockerfile`, `cloudbuild.yaml`, `.dockerignore`, `.gcloudignore` | Terraform, Kustomize, the container image and how it is built |
 | Tooling config | `pyproject.toml`, `ruff.toml`, `ty.toml`, `pyrightconfig.json` | See "Code style" |
 
 Three rules worth stating outright:

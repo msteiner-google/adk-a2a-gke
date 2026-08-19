@@ -63,7 +63,9 @@ Three properties fall out of that shape:
 ## Try it yourself
 
 The transcript below is a real run against four agents (orchestrator + three
-specialists) over live A2A hops, not an illustration.
+specialists) over live A2A hops, not an illustration. It predates the `trades`
+and `currency` agents; the flow is identical for the second gated action, which
+is the point of it being a shape rather than a feature.
 
 ```bash
 uv run uvicorn app.fast_api_app:app --port 8000
@@ -188,6 +190,48 @@ instruction to pass those through from the request. Nothing else is needed:
   from `approved_by`, and the specialist recomputes its result from that same
   input — so there is nothing for a caller to retype incorrectly.
 
+Two things to get right when you add one.
+
+**Say what your effect was, in the vocabulary the caller scans for.**
+`app/agents/contracts.py` defines it: `PUBLISHED` (`"published"`) for a gated
+write, `EXECUTED` (`"executed"`) for a gated read, and `EFFECT_PERFORMED` as the
+set of both. `cases.find_execution` accepts a status in that set and nothing
+else. A new action whose success status is missing from it runs correctly and is
+then reported as `approved_not_confirmed` — a vocabulary bug that presents as a
+model bug, which is why `tests/unit/test_trades.py` asserts the membership
+directly.
+
+**Make the approved request reproducible, or carry it back.** The math
+specialist recomputes its value from `expression` because arithmetic is
+deterministic. `trades` cannot: ask a model the same question twice and the SQL
+differs. So the approved `sql` travels back in the request and the tool refuses
+to run without it (`TradesRequest.sql`). If your action is not reproducible from
+its inputs, the approved artefact has to make the round trip — and be
+canonicalised at the source, so a re-send that differs only in whitespace still
+matches (`trades.tools.canonical_sql`, `math.tools.canonical_value`).
+
+### The second worked example: a gated *read*
+
+`app/agents/trades/tools.py` gates a BigQuery query. The action is read-only, so
+the risk is not corruption — it is that a model composes a query nobody read,
+against a table nobody scoped, billed to an account nobody watched, and returns
+a confident number derived from the wrong rows. Approval puts a human in front
+of the SQL *and* of the number's provenance, which is the review a financial
+answer actually needs. Plenty of actions worth gating are reads.
+
+Same shape as `publish_result`, plus two things worth copying:
+
+- **A validator, so a reviewer is never shown a proposal that could not have
+  run.** `validate_sql` rejects anything that is not a single read-only
+  statement against the one allowed table, working on text whose comments and
+  string literals have been masked out first. It is a guard rail, not the
+  boundary: what confines this agent is the human reading the SQL, plus IAM
+  (`roles/bigquery.jobUser`, and `dataViewer` on nothing), plus
+  `maximum_bytes_billed`.
+- **A failed effect is not a performed effect.** A BigQuery error returns
+  `status: error`, so the case stays approved and re-drivable rather than being
+  closed as done.
+
 ## Proving it actually happened
 
 This repo has twice shipped a bug where a confident, sensible answer hid a flow
@@ -199,8 +243,12 @@ that never ran. The code is built around not repeating it:
   re-drivable — never a case recorded as done. That comparison is also what stops
   a specialist publishing something other than what was approved and having it
   recorded as success.
-- `tests/unit/test_two_phase_approval.py` asserts on the effect
-  (`PUBLICATIONS`), not on a returned string.
+- `tests/unit/test_two_phase_approval.py` and `tests/unit/test_trades.py` assert
+  on the effect (`PUBLICATIONS`, `EXECUTIONS`), not on a returned string. The
+  trades tests go one step further and drive the whole round trip — propose,
+  serialise the way an A2A reply would, approve, re-send, then match with
+  `cases.find_execution` — including the negative case, where a *different*
+  query ran and is correctly not accepted as the approved one.
 
 When you extend this, assert on a marker the code emits.
 

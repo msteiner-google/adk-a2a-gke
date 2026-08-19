@@ -67,15 +67,29 @@ def _resolver(config: ClusterConfig) -> AgentResolver:
 
 
 def test_registry_lists_expected_agents():
-    assert set(AGENTS) == {"orchestrator", "research", "math", "planner"}
+    assert set(AGENTS) == {
+        "orchestrator",
+        "research",
+        "math",
+        "planner",
+        "trades",
+        "currency",
+    }
     assert DEFAULT_AGENT == "orchestrator"
 
 
-def test_orchestrator_declares_peers_others_do_not():
-    assert AGENTS["orchestrator"].peers == ("research", "math", "planner")
+def test_declared_peer_topology():
+    # Delegation is a graph, not a one-deep fan-out: `math` declares `currency`,
+    # so orchestrator -> math -> currency is a live chain with no special
+    # handling anywhere. This asserts the shape the NetworkPolicy has to mirror
+    # (infra/kustomize/base/networkpolicy.yaml) -- an edge added here and missed
+    # there fails as a connection timeout rather than an error.
+    assert AGENTS["orchestrator"].peers == ("research", "math", "planner", "trades")
+    assert AGENTS["math"].peers == ("currency",)
     assert AGENTS["research"].peers == ()
-    assert AGENTS["math"].peers == ()
     assert AGENTS["planner"].peers == ()
+    assert AGENTS["trades"].peers == ()
+    assert AGENTS["currency"].peers == ()
 
 
 def test_every_delegatable_agent_declares_a_contract():

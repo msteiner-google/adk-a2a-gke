@@ -25,6 +25,21 @@ output "artifact_registry_repo" {
   value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.agents.repository_id}"
 }
 
+output "builder_service_account_email" {
+  description = "GSA that Cloud Build runs as. Pass it to `gcloud builds submit --service-account` (which `make image` does)."
+  value       = google_service_account.builder.email
+}
+
+output "build_command" {
+  description = "Build and push the agent image with Cloud Build. Set the tag to match newTag in the kustomize overlay."
+  value = join(" ", [
+    "gcloud builds submit --config cloudbuild.yaml",
+    "--project", var.project_id,
+    "--service-account", "projects/${var.project_id}/serviceAccounts/${google_service_account.builder.email}",
+    "--substitutions", "_REGION=${var.region},_REPO=${google_artifact_registry_repository.agents.repository_id},_TAG=<tag>",
+  ])
+}
+
 output "agent_service_account_emails" {
   description = "Per-agent GSA emails. Each goes in that agent's kustomize ServiceAccount annotation (iam.gke.io/gcp-service-account)."
   value       = { for name, sa in google_service_account.agents : name => sa.email }

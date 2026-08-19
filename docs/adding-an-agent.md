@@ -258,12 +258,22 @@ Add it to the delegating agent's spec — normally the orchestrator, in
 ```python
 SPEC = AgentSpec(
     ...,
-    peers=("research", "math", "planner", "weather"),
+    peers=("research", "math", "planner", "trades", "weather"),
 )
 ```
 
 This is the **default** topology; `A2A_PEERS` overrides it at deploy time
 without a rebuild, which is handy for testing an agent in isolation.
+
+**The orchestrator is not the only agent that may list peers.** `math` declares
+`peers=("currency",)` and delegates conversions on, so
+`orchestrator -> math -> currency` is an ordinary chain of A2A calls. If your
+agent belongs behind a specialist rather than beside one, add it to that
+specialist's spec instead — nothing in `build_agent` treats depth specially, and
+the rules do not loosen further down. Two things then differ from the common
+case: the calling agent needs its own `A2A_PEERS` locally (see the Makefile's
+`MATH_PEERS`), and the NetworkPolicy needs a rule naming *that* caller rather
+than the orchestrator (step 6d).
 
 ---
 
@@ -273,15 +283,30 @@ Exactly two tests assert the registry contents, and both fail until updated
 (verified):
 
 - `tests/unit/test_agents.py::test_registry_lists_expected_agents`
-- `tests/unit/test_agents.py::test_orchestrator_declares_peers_others_do_not`
+- `tests/unit/test_agents.py::test_declared_peer_topology`
 
 ```python
 def test_registry_lists_expected_agents():
-    assert set(AGENTS) == {"orchestrator", "research", "math", "planner", "weather"}
+    assert set(AGENTS) == {
+        "orchestrator",
+        "research",
+        "math",
+        "planner",
+        "trades",
+        "currency",
+        "weather",
+    }
 
 
-def test_orchestrator_declares_peers_others_do_not():
-    assert AGENTS["orchestrator"].peers == ("research", "math", "planner", "weather")
+def test_declared_peer_topology():
+    assert AGENTS["orchestrator"].peers == (
+        "research",
+        "math",
+        "planner",
+        "trades",
+        "weather",
+    )
+    assert AGENTS["math"].peers == ("currency",)
     assert AGENTS["weather"].peers == ()
 ```
 
@@ -343,7 +368,7 @@ Five files, all in `infra/`. Skip this section entirely if you only run locally.
 `infra/terraform/variables.tf`, the `agents` default:
 
 ```hcl
-default = ["orchestrator", "research", "math", "planner", "weather"]
+default = ["orchestrator", "research", "math", "planner", "trades", "currency", "weather"]
 ```
 
 Then `terraform apply`. This creates a **Google service account** (GSA)
@@ -423,12 +448,14 @@ agent absent from the allow-list is simply unreachable:
     matchExpressions:
       - key: app
         operator: In
-        values: ["research", "math", "planner", "weather"]
+        values: ["research", "math", "planner", "trades", "weather"]
 ```
 
 If the new agent is *called by* something other than the orchestrator, add a
 rule rather than widening this one — the policy is meant to mirror
-`AgentSpec.peers`, so keep the two in sync.
+`AgentSpec.peers`, so keep the two in sync. `currency-ingress-from-math` in the
+same file is the worked example: `currency` accepts traffic from `math` and from
+nobody else, the orchestrator included.
 
 ### 6e. `migrate-job.yaml` — give it a schema
 
@@ -436,7 +463,7 @@ Append your agent to the space-separated list — whatever it currently holds:
 
 ```yaml
             - name: MIGRATE_AGENTS
-              value: "orchestrator research math weather"
+              value: "orchestrator research math trades currency weather"
 ```
 
 The Job loops over this list, creating each schema, running every migration in
@@ -516,7 +543,7 @@ delegation in Cloud Trace — one trace spans every A2A hop.
 [ ] Every contract field has a Field(description=...)
 [ ] Added to the delegating agent's AgentSpec.peers
 [ ] test_registry_lists_expected_agents updated
-[ ] test_orchestrator_declares_peers_others_do_not updated
+[ ] test_declared_peer_topology updated
 [ ] Instruction tells the agent it cannot see the caller's conversation
 [ ] Tool tests added
 [ ] pytest + agents-cli lint green
@@ -525,7 +552,7 @@ delegation in Cloud Trace — one trace spans every A2A hop.
 [ ] var.agents updated, terraform apply run
 [ ] serviceaccounts.yaml: KSA agent-<name> + GSA annotation
 [ ] workers.yaml: Deployment + Service (AGENT_NAME, APP_URL, ALLOYDB_IAM_USER)
-[ ] networkpolicy.yaml: added to the workers allow-list
+[ ] networkpolicy.yaml: allowed ingress from whichever agents call it
 [ ] migrate-job.yaml: MIGRATE_AGENTS updated
 [ ] Image rebuilt --platform linux/amd64 and pushed
 [ ] Migration Job completed BEFORE judging the pods
@@ -543,7 +570,7 @@ delegation in Cloud Trace — one trace spans every A2A hop.
 | Caller sends one vague `request` string | No entry in `PAYLOADS` | Add the contract (step 2b); the tool fell back to `UnknownPeerRequest` |
 | Agent replies asking for context it was never sent | Its instruction assumes a conversation | It only ever sees the payload — add the missing field to its contract |
 | `Invalid payload for peer '<name>'` | Caller omitted a required field | Give the field a default, or make its `description` clearer |
-| Delegation hangs, then times out | Missing from `networkpolicy.yaml` | Add the name to the workers allow-list (step 6d) |
+| Delegation hangs, then times out | Missing from `networkpolicy.yaml`, or allowed only from the orchestrator when the caller is another specialist | Add a rule naming the actual caller (step 6d) |
 | Delegation hangs, agent looks healthy | `APP_URL` wrong | Must equal `http://<service>.<namespace>.svc.cluster.local` |
 | Peer agent card `404` | Card is at `<svc>/a2a/app/.well-known/agent-card.json`, not the service root | Check `A2A_RPC_PATH` and that `App(name=...)` is still `"app"` |
 | DNS `NXDOMAIN` for the peer | Service name ≠ agent name | They must be identical |

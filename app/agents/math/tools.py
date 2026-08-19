@@ -37,7 +37,7 @@ import operator
 from collections.abc import Callable
 from typing import Any
 
-from app.agents.contracts import APPROVAL_REQUIRED
+from app.agents.contracts import APPROVAL_REQUIRED, PUBLISHED
 
 # Binary/unary operators allowed in the arithmetic evaluator. Anything outside
 # this set (calls, names, attributes, ...) is rejected, so `calculate` never
@@ -166,4 +166,6 @@ def publish_result(
 
     record = {"value": value, "label": label, "approved_by": approved_by}
     PUBLICATIONS.append(record)
-    return {"status": "published", "action": PUBLISH_ACTION, "note": note, **record}
+    # `status` must stay a member of contracts.EFFECT_PERFORMED: it is what the
+    # caller scans for to confirm the approved action actually ran.
+    return {"status": PUBLISHED, "action": PUBLISH_ACTION, "note": note, **record}

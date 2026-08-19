@@ -13,7 +13,16 @@ dependencies = [
     "opentelemetry-instrumentation-httpx>=0.40b0",
     "cloudpathlib[gs,s3]>=0.20",
     "google-cloud-logging>=3.12.0,<4.0.0",
-    "google-cloud-aiplatform[evaluation]>=1.156.0",
+    # Deliberately WITHOUT the [evaluation] extra. That extra is an
+    # evaluation-time dependency -- it pulls litellm, scipy, scikit-learn,
+    # pandas and openai, ~220 MB of the runtime image -- and nothing under app/
+    # imports any of it. The `eval` optional group below still asks for it, so
+    # `agents-cli eval` is unaffected; the agents' container is not.
+    "google-cloud-aiplatform>=1.156.0",
+    # The trades agent queries BigQuery. It already arrives transitively via
+    # google-cloud-aiplatform, but a module that imports a package should be
+    # the reason that package is installed.
+    "google-cloud-bigquery>=3.34.0,<4.0.0",
     "fastapi>=0.115.8,<1.0.0",
     "uvicorn~=0.34.0",
     "asyncpg>=0.30.0,<1.0.0",
@@ -63,9 +72,9 @@ lint = [
 # pyrightconfig.json for basedpyright). See AGENTS.md "Code style".
 
 [tool.codespell]
-# "notin" is the Kubernetes label-selector operator `NotIn`
-# (infra/kustomize/base/networkpolicy.yaml), not a typo.
-ignore-words-list = "rouge,notin"
+# "notin" is the Kubernetes label-selector operator `NotIn`; "zar" is the
+# ISO-4217 code for the South African rand (app/agents/currency/tools.py).
+ignore-words-list = "rouge,notin,zar"
 skip = "./locust_env/*,uv.lock,.venv,./frontend,**/package-lock.json"
 
 

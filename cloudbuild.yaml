@@ -1,0 +1,67 @@
+# Build and push the agent image with Cloud Build.
+#
+# Why this exists: building locally means pulling ~400 MB of wheels down to a
+# workstation and pushing a ~550 MB image back up. Here both happen inside
+# Google's network, and the only thing that crosses yours is the source tarball
+# -- a few hundred KB, thanks to .gcloudignore. On an unreliable connection that
+# is the difference between a build that finishes and one that does not.
+#
+# It also removes a whole class of local failure. The GKE Autopilot nodes these
+# manifests target are amd64, so an arm64 workstation had to remember
+# `--platform linux/amd64` or ship an image whose pods fail with
+# `exec format error` -- a build bug that reads like an app bug. Cloud Build
+# workers are amd64, so the right thing is now the default.
+#
+# Run it with `make image`, or directly:
+#
+#   gcloud builds submit --config cloudbuild.yaml \
+#     --substitutions=_REGION=europe-west4,_TAG=demo-1
+#
+# The service account is created by infra/terraform/cloudbuild.tf; `make image`
+# passes it. Substitutions are declared with defaults below, so a plain
+# `gcloud builds submit --config cloudbuild.yaml` also works.
+
+substitutions:
+  # Artifact Registry region and repo. Must match var.region and
+  # var.artifact_repo_id in infra/terraform.
+  _REGION: europe-west4
+  _REPO: agents
+  _IMAGE: agent
+  # An explicit tag, not `latest`: it makes the running image identifiable and
+  # guarantees the rollout actually pulls a new one. Keep it in step with
+  # newTag in infra/kustomize/overlays/dev/kustomization.yaml.
+  _TAG: latest
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      # A no-op on Cloud Build's amd64 workers, and kept anyway: it states the
+      # target architecture in the file rather than in someone's shell history.
+      - --platform=linux/amd64
+      - --build-arg=AGENT_VERSION=${_TAG}
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${_TAG}
+      - .
+
+  # A separate push step rather than the top-level `images:` field. `images:`
+  # pushes only after every step succeeds, which is the same thing here, but
+  # doing it explicitly puts the push in the build log where a registry
+  # permission error is legible instead of appearing as a failed post-step.
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_IMAGE}:${_TAG}
+
+options:
+  # The build is dominated by `uv sync` resolving and unpacking ~180 packages,
+  # which parallelises well.
+  machineType: E2_HIGHCPU_8
+  # REQUIRED when the build runs as a user-specified service account: with the
+  # default logging mode Cloud Build wants a logs bucket it owns, and refuses
+  # the build with "service account needs storage.buckets.get" -- which reads
+  # like a missing permission and is a logging-mode problem.
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s
