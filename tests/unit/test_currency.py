@@ -335,3 +335,26 @@ def test_no_contract_on_the_path_to_currency_demands_a_code():
     for field in ("from_currency", "to_currency"):
         described = CurrencyRequest.model_fields[field].description or ""
         assert "own word" in described.lower()
+
+
+def test_money_reaches_the_currency_specialist_even_with_no_conversion():
+    # Regression, found in the cluster. Both of this agent's refusals live
+    # inside `convert_currency`, so an amount that never reaches it is never
+    # checked. `target_currency` used to say "set it when the amounts are not
+    # all in the same currency", which meant "500M dollars" -- one currency, no
+    # conversion needed -- was added up as plain arithmetic: the ambiguous word
+    # was never questioned and the size threshold was never applied.
+    described = MathRequest.model_fields["target_currency"].description or ""
+    assert "money at all" in described.lower()
+    assert "same currency" in described.lower()
+
+
+def test_a_same_currency_call_still_checks_the_amount():
+    # Which is what makes the rule above worth following: converting USD to USD
+    # is arithmetically a no-op and still catches both failures.
+    assert convert_currency(500_000_000.0, "USD", "USD")["status"] == NEEDS_CONFIRMATION
+    assert convert_currency(10.0, "dollars", "dollars")["status"] == NEEDS_INPUT
+    # ...and stays a no-op when there is nothing wrong with it.
+    ok = convert_currency(10.0, "USD", "USD")
+    assert ok["status"] == "ok"
+    assert ok["converted"] == "10.00"

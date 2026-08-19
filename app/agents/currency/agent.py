@@ -80,6 +80,12 @@ SPEC = AgentSpec(
         "The request is all the context you have: you cannot see the "
         "conversation it came from. Return your answer as plain text."
     ),
-    tier="fast",
+    # `balanced`, not `fast`. This agent's job stopped being a table lookup the
+    # moment it had to REFUSE: relay a question verbatim, never resolve an
+    # ambiguous term, never reassure anyone an amount looks fine. That is
+    # instruction-following under pressure to be helpful, which is exactly what
+    # the cheapest tier is worst at. The fast tier was measured doing it
+    # correctly, so this is headroom rather than a fix.
+    tier="balanced",
     tools=(convert_currency, list_supported_currencies),
 )

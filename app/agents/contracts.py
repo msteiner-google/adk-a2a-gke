@@ -197,10 +197,13 @@ class MathRequest(PeerRequest):
     target_currency: str = Field(
         default="",
         description=(
-            "Optional ISO-4217 code the answer must be expressed in, e.g. "
-            "'USD'. Set it when the amounts in `expression` are not all in the "
-            "same currency: the specialist converts each one first, then "
-            "evaluates. Leave empty for plain arithmetic."
+            "The currency the answer must be expressed in, e.g. 'USD'. Set it "
+            "whenever `expression` involves MONEY AT ALL -- including when "
+            "every amount is already in the same currency. The currency "
+            "specialist does not only convert: it is the agent that checks an "
+            "amount is unambiguously denominated and of a plausible size, and "
+            "it cannot do that for amounts it is never shown. Leave empty only "
+            "for arithmetic with no currency in it."
         ),
     )
     currency_confirmed: bool = Field(

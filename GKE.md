@@ -23,7 +23,7 @@ Kubernetes Service and reached over the **A2A** protocol.
                     ┌────────────────┐
                     │    currency    │
                     │ Deployment/Svc │
-                    │ (fast)         │
+                    │ (balanced)     │
                     └────────────────┘
 
 Every arrow above carries ONE typed payload, never the caller's transcript —
