@@ -186,8 +186,12 @@ class MathRequest(PeerRequest):
         description=(
             "The arithmetic expression to evaluate, e.g. '(2 + 3) * 4'. "
             "Supports + - * / // % ** and parentheses only. When "
-            "`target_currency` is set, tag each amount with its own ISO-4217 "
-            "code instead, e.g. '250 EUR + 300 GBP'."
+            "`target_currency` is set, tag each amount with the currency it is "
+            "in instead, e.g. '250 EUR + 300 GBP'. Use the user's OWN wording "
+            "for that tag: write '250 dollars + 300 EUR' if that is what they "
+            "said. Do not resolve a vague word to a code -- 'dollars' is six "
+            "currencies and the currency specialist, which holds the list, "
+            "will ask the user which one they meant."
         )
     )
     target_currency: str = Field(

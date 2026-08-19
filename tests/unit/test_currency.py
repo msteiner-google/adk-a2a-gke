@@ -315,3 +315,23 @@ def test_the_contract_carries_the_users_answer_back_down():
         ).currency_confirmed
         is True
     )
+
+
+def test_no_contract_on_the_path_to_currency_demands_a_code():
+    # Regression, found in the cluster and not by any test here. Both contracts
+    # are instructions to a model, and they contradicted each other: the
+    # currency contract said "pass the user's own word", while
+    # MathRequest.expression said "tag each amount with its own ISO-4217 code".
+    # The orchestrator never calls currency directly -- it calls math -- so the
+    # math wording won, "dollars" was silently resolved to USD one hop above the
+    # only agent holding the list, and the question was never asked.
+    #
+    # Asserting on a description string is unusual and correct here: for a peer
+    # tool these strings ARE the interface, and this one is load-bearing.
+    expression = MathRequest.model_fields["expression"].description or ""
+    assert "own wording" in expression.lower()
+    assert "do not resolve" in expression.lower()
+
+    for field in ("from_currency", "to_currency"):
+        described = CurrencyRequest.model_fields[field].description or ""
+        assert "own word" in described.lower()

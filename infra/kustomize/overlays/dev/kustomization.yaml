@@ -12,7 +12,7 @@ images:
     newName: europe-west4-docker.pkg.dev/msteiner/agents/agent
     # An explicit tag rather than `latest`: it makes the running image
     # identifiable and guarantees the rollout actually pulls a new one.
-    newTag: demo-1
+    newTag: demo-2
 
 # Dev override: keep a single replica per agent.
 replicas:
