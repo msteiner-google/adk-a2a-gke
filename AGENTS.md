@@ -419,12 +419,33 @@ These are real traps that have bitten this codebase.
   the `terraform_version` recorded in an existing state file will refuse that
   state until it is upgraded.
 
-- **Read the plan before applying — it is not purely additive.** Against an
-  already-deployed environment a plan can include **destroys**, notably
-  `google_compute_global_address.alloydb_psa` and
-  `google_service_networking_connection.alloydb_psa` being *replaced* under a
-  live AlloyDB cluster. Adding an agent to `var.agents` is not automatically a
-  safe, additive apply. Never blind-apply.
+- **Read the plan before applying.** It should now be additive against an
+  already-deployed environment — the last measured plan is *48 to add, 1 to
+  change, 0 to destroy* — but that is a property to re-check, not to assume.
+
+- **A `depends_on` on a data source can plan a destroy you never asked for.**
+  `data.google_compute_network.vpc` (`infra/terraform/alloydb.tf`) depends on
+  `google_project_service.services`, so adding *any* API to `local.services`
+  gives that resource pending changes, which defers the data-source read to
+  apply time, which makes its `id` unknown at plan time. That unknown lands on
+  `network` in `google_compute_global_address.alloydb_psa` and
+  `google_service_networking_connection.alloydb_psa`, where it is **ForceNew** —
+  so adding `bigquery.googleapis.com` planned a destroy-and-recreate of the
+  private-services-access peering underneath a live AlloyDB cluster. Replacing
+  that connection either fails half-way or cuts every pod off from the database,
+  and the reserved range could come back as a different /16.
+  - Indexing the dependency does **not** help: the deferral is decided
+    per-resource, not per-instance, so
+    `services["compute.googleapis.com"]` (already applied, unchanged) defers the
+    read just the same. Verified against this state.
+  - The `depends_on` has to stay — enabling the compute API is what auto-creates
+    the `default` network the data source reads, which is what lets a greenfield
+    project apply without pre-enabling anything. So the chain is broken at the
+    other end instead: both PSA resources carry
+    `lifecycle { ignore_changes = [network] }`. A reserved peering range cannot
+    move between VPCs in place anyway, so a real `var.network` change is a
+    manual migration — and the AlloyDB cluster's own `network_config` is
+    deliberately *not* ignored, so such a change still surfaces there.
 
 - **A plausible answer is not proof the flow ran.** Three separate failures
   (a skipped graph node, a graph output that never reached the caller, an A2A
