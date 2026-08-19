@@ -81,6 +81,26 @@ from pydantic import BaseModel, Field
 APPROVAL_REQUIRED = "approval_required"
 """Returned INSTEAD of performing an action that needs a human's sign-off."""
 
+NEEDS_INPUT = "needs_input"
+"""Returned INSTEAD of guessing: the request is ambiguous and only the user can
+resolve it. Distinct from :data:`APPROVAL_REQUIRED` because nothing has been
+proposed — there is no effect to approve, a required *input* is missing. The
+answer is a corrected request, not a decision on a case."""
+
+NEEDS_CONFIRMATION = "needs_confirmation"
+"""Returned INSTEAD of proceeding with something unusual enough to be worth a
+second look. Also not an approval: the action has no side effect, so re-running
+it after the user says yes costs nothing, and there is nothing to record for
+audit. It exists to stop a misplaced decimal point becoming a confident
+answer."""
+
+#: Statuses meaning "a human has to answer before this can continue". A
+#: specialist returning one of these has done nothing and is asking a question;
+#: every agent between it and the user must relay that question rather than
+#: answer it. `app/agents/reporting.py` is what makes them survive the A2A text
+#: boundary intact, at any depth.
+NEEDS_USER: frozenset[str] = frozenset({NEEDS_INPUT, NEEDS_CONFIRMATION})
+
 PUBLISHED = "published"
 """A gated write happened (``app/agents/math/tools.py``)."""
 
@@ -179,6 +199,14 @@ class MathRequest(PeerRequest):
             "evaluates. Leave empty for plain arithmetic."
         ),
     )
+    currency_confirmed: bool = Field(
+        default=False,
+        description=(
+            "Set to true ONLY after the user has confirmed a large conversion "
+            "the currency specialist asked about. The math specialist passes "
+            "it straight through; it does not affect the arithmetic."
+        ),
+    )
     publish_as: str = Field(
         default="",
         description=(
@@ -220,16 +248,39 @@ class CurrencyRequest(PeerRequest):
     One conversion per call, on purpose: a list of conversions would leave the
     caller deciding how to correlate results back to inputs, and a specialist
     call is cheap.
+
+    **Pass the user's own word when they were vague.** "Dollars" is six
+    currencies and "krona" is three, and the agent that owns the rate table is
+    the one that should say so — a caller that helpfully resolves "dollars" to
+    USD has made the decision silently, in the one place with no rate table to
+    justify it. Send the word; the specialist will ask.
     """
 
     amount: float = Field(
         description="How much to convert, expressed in `from_currency`."
     )
     from_currency: str = Field(
-        description="ISO-4217 code of the currency the amount is in, e.g. 'EUR'."
+        description=(
+            "The currency the amount is in. An ISO-4217 code ('EUR') when the "
+            "user was explicit, otherwise their own word ('dollars', 'krona'). "
+            "Do NOT resolve a vague term to a code yourself: the specialist "
+            "will ask the user which one they meant."
+        )
     )
     to_currency: str = Field(
-        description="ISO-4217 code of the currency to convert to, e.g. 'USD'."
+        description=(
+            "The currency to convert to, same rule as `from_currency`: a code "
+            "when the user was explicit, their own word when they were not."
+        )
+    )
+    confirmed: bool = Field(
+        default=False,
+        description=(
+            "Set to true ONLY when the user has answered a "
+            "`needs_confirmation` question from this specialist and said to go "
+            "ahead. Never set it in advance -- it exists to carry the "
+            "user's answer back down, not to skip asking."
+        ),
     )
 
 
@@ -300,6 +351,9 @@ __all__ = [
     "APPROVAL_REQUIRED",
     "EFFECT_PERFORMED",
     "EXECUTED",
+    "NEEDS_CONFIRMATION",
+    "NEEDS_INPUT",
+    "NEEDS_USER",
     "PAYLOADS",
     "PUBLISHED",
     "CurrencyRequest",

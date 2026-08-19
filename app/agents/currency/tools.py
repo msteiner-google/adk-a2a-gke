@@ -35,6 +35,10 @@ everything downstream stay as they are.
 
 from __future__ import annotations
 
+from typing import Any
+
+from app.agents.contracts import NEEDS_CONFIRMATION, NEEDS_INPUT
+
 #: The day these indicative rates were frozen. Reported with every conversion:
 #: a stale rate that says so is usable, one that stays quiet is not.
 RATES_AS_OF = "2026-01-02"
@@ -75,6 +79,87 @@ _USD_PER_UNIT: dict[str, float] = {
 #: Everything else is quoted to 2 decimals.
 _ZERO_DECIMAL = frozenset({"JPY", "KRW", "CLP", "ISK", "VND"})
 
+#: Full names, so a disambiguation question reads like a question a person would
+#: ask rather than a list of three-letter codes.
+_NAMES: dict[str, str] = {
+    "USD": "United States dollar",
+    "EUR": "euro",
+    "GBP": "pound sterling",
+    "CHF": "Swiss franc",
+    "JPY": "Japanese yen",
+    "CNY": "Chinese yuan renminbi",
+    "CAD": "Canadian dollar",
+    "AUD": "Australian dollar",
+    "NZD": "New Zealand dollar",
+    "SEK": "Swedish krona",
+    "NOK": "Norwegian krone",
+    "DKK": "Danish krone",
+    "PLN": "Polish zloty",
+    "CZK": "Czech koruna",
+    "SGD": "Singapore dollar",
+    "HKD": "Hong Kong dollar",
+    "INR": "Indian rupee",
+    "BRL": "Brazilian real",
+    "MXN": "Mexican peso",
+    "ZAR": "South African rand",
+    "AED": "UAE dirham",
+    "TRY": "Turkish lira",
+}
+
+#: Colloquial names and symbols, mapped to every code they could mean *in this
+#: table*. A term with more than one candidate is the whole point: "dollars" is
+#: six currencies and this agent is the only participant holding the list, so it
+#: is the only one entitled to say which. The mapping is scoped to the table on
+#: purpose -- "pound" is unambiguous here and would not be against a rate source
+#: that also carried EGP and LBP, so widening the table means revisiting this.
+_ALIASES: dict[str, tuple[str, ...]] = {
+    "dollar": ("USD", "CAD", "AUD", "NZD", "SGD", "HKD"),
+    "dollars": ("USD", "CAD", "AUD", "NZD", "SGD", "HKD"),
+    "$": ("USD", "CAD", "AUD", "NZD", "SGD", "HKD"),
+    "buck": ("USD", "CAD", "AUD"),
+    "bucks": ("USD", "CAD", "AUD"),
+    "krona": ("SEK", "NOK", "DKK"),
+    "kronor": ("SEK", "NOK", "DKK"),
+    "krone": ("SEK", "NOK", "DKK"),
+    "kroner": ("SEK", "NOK", "DKK"),
+    "crown": ("SEK", "NOK", "DKK"),
+    "crowns": ("SEK", "NOK", "DKK"),
+    "yuan": ("CNY",),
+    "renminbi": ("CNY",),
+    "yen": ("JPY",),
+    # Both the yen and the yuan are written with this symbol.
+    "\u00a5": ("JPY", "CNY"),
+    "euro": ("EUR",),
+    "euros": ("EUR",),
+    "\u20ac": ("EUR",),
+    "pound": ("GBP",),
+    "pounds": ("GBP",),
+    "sterling": ("GBP",),
+    "quid": ("GBP",),
+    "\u00a3": ("GBP",),
+    "franc": ("CHF",),
+    "francs": ("CHF",),
+    "rupee": ("INR",),
+    "rupees": ("INR",),
+    "real": ("BRL",),
+    "reais": ("BRL",),
+    "peso": ("MXN",),
+    "pesos": ("MXN",),
+    "rand": ("ZAR",),
+    "dirham": ("AED",),
+    "dirhams": ("AED",),
+    "lira": ("TRY",),
+    "zloty": ("PLN",),
+    "koruna": ("CZK",),
+}
+
+#: Above this many US dollars, the conversion stops and asks. It is not a limit
+#: and not an approval -- converting has no side effect, so the cost of asking
+#: is one extra turn and the cost of not asking is a misplaced decimal point
+#: reported as a fact. One constant to change if a desk works at a different
+#: scale.
+LARGE_AMOUNT_USD = 1_000_000.0
+
 #: How many decimals a *rate* is quoted to. Deliberately wider than the amount:
 #: a USD/JPY rate rounded to 2 decimals would be 0.01 and useless.
 _RATE_DECIMALS = 6
@@ -89,16 +174,40 @@ def supported_currencies() -> tuple[str, ...]:
     return tuple(sorted(_USD_PER_UNIT))
 
 
-def _normalise(code: str) -> str:
-    """Return a currency code in the canonical form used by the table.
+def _describe(code: str) -> str:
+    """Render a code for a human, e.g. ``"USD (United States dollar)"``.
 
     Args:
-        code: A currency code as the caller wrote it.
+        code: An ISO-4217 code present in the rate table.
 
     Returns:
-        The code uppercased and stripped.
+        The code with its full name, or the bare code if none is known.
     """
-    return code.strip().upper()
+    name = _NAMES.get(code)
+    return f"{code} ({name})" if name else code
+
+
+def resolve_currency(term: str) -> tuple[str, tuple[str, ...]]:
+    """Turn what the caller wrote into a code, or into the choices it could be.
+
+    Args:
+        term: An ISO-4217 code, a colloquial name, or a symbol.
+
+    Returns:
+        ``(code, ())`` when the term resolves to exactly one currency;
+        ``("", candidates)`` when it is ambiguous, candidates in table order;
+        ``("", ())`` when nothing here matches it.
+    """
+    cleaned = term.strip()
+    if cleaned.upper() in _USD_PER_UNIT:
+        return cleaned.upper(), ()
+    candidates = _ALIASES.get(cleaned.lower())
+    if not candidates:
+        return "", ()
+    known = tuple(code for code in candidates if code in _USD_PER_UNIT)
+    if len(known) == 1:
+        return known[0], ()
+    return "", known
 
 
 def _rate(source: str, target: str) -> float:
@@ -133,33 +242,98 @@ def _quantize(amount: float, currency: str) -> str:
     return f"{amount:.{decimals}f}"
 
 
+def _ambiguous(field: str, term: str, candidates: tuple[str, ...]) -> dict[str, Any]:
+    """Build the reply that asks the user which currency they meant.
+
+    Args:
+        field: Which argument was ambiguous (``from_currency``/``to_currency``).
+        term: The word the user actually used.
+        candidates: The codes it could mean.
+
+    Returns:
+        A ``needs_input`` reply. Nothing has been converted.
+    """
+    options = ", ".join(_describe(code) for code in candidates)
+    return {
+        "status": NEEDS_INPUT,
+        "reason": "ambiguous_currency",
+        "field": field,
+        "term": term,
+        "candidates": list(candidates),
+        "question": (
+            f"Which currency does {term!r} mean here? It could be: {options}."
+        ),
+    }
+
+
 def convert_currency(
-    amount: float, from_currency: str, to_currency: str
-) -> dict[str, str]:
+    amount: float, from_currency: str, to_currency: str, confirmed: bool = False
+) -> dict[str, Any]:
     """Convert an amount between currencies at a frozen indicative rate.
 
-    The rates are hardcoded (see the module docstring), so the result carries
-    ``rate_source`` and ``as_of``. Report both: a converted figure presented as
-    a live quote is worse than no conversion at all.
+    Refuses, rather than guesses, in two cases. An ambiguous term ("dollars" is
+    six currencies here) returns ``needs_input``; an amount over
+    :data:`LARGE_AMOUNT_USD` returns ``needs_confirmation`` unless the user has
+    already said to go ahead. Both come back with a ``question`` for the user
+    and no conversion performed.
+
+    Neither is an approval. There is no side effect to gate — the point is that
+    a wrong currency or a misplaced decimal point becomes a confident number
+    that travels onward into arithmetic, a published figure and a report, and
+    the only participant able to notice is the person who typed it.
+
+    The rates are hardcoded (see the module docstring), so a successful result
+    carries ``rate_source`` and ``as_of``. Report both: a converted figure
+    presented as a live quote is worse than no conversion at all.
 
     Args:
         amount: How much to convert, in ``from_currency``.
-        from_currency: ISO-4217 code to convert from, e.g. ``"EUR"``.
-        to_currency: ISO-4217 code to convert to, e.g. ``"USD"``.
+        from_currency: ISO-4217 code, or the user's own word, to convert from.
+        to_currency: ISO-4217 code, or the user's own word, to convert to.
+        confirmed: Whether the user has already confirmed a large conversion.
+            Never suppresses the ambiguity question -- a currency nobody has
+            named cannot be confirmed into existence.
 
     Returns:
-        A mapping with the converted amount and the rate used, or an ``error``
-        status naming the unsupported code.
+        A mapping with the converted amount and the rate used, or a
+        ``needs_input`` / ``needs_confirmation`` / ``error`` status.
     """
-    source = _normalise(from_currency)
-    target = _normalise(to_currency)
+    source, source_options = resolve_currency(from_currency)
+    if source_options:
+        return _ambiguous("from_currency", from_currency.strip(), source_options)
 
-    unknown = [code for code in (source, target) if code not in _USD_PER_UNIT]
+    target, target_options = resolve_currency(to_currency)
+    if target_options:
+        return _ambiguous("to_currency", to_currency.strip(), target_options)
+
+    unknown = [
+        term.strip()
+        for term, code in ((from_currency, source), (to_currency, target))
+        if not code
+    ]
     if unknown:
         return {
             "status": "error",
-            "error": f"Unsupported currency code(s): {', '.join(unknown)}.",
+            "error": f"Unsupported currency: {', '.join(repr(u) for u in unknown)}.",
             "supported": ", ".join(supported_currencies()),
+        }
+
+    usd_value = abs(amount) * _USD_PER_UNIT[source]
+    if usd_value > LARGE_AMOUNT_USD and not confirmed:
+        return {
+            "status": NEEDS_CONFIRMATION,
+            "reason": "large_amount",
+            "amount": _quantize(amount, source),
+            "from_currency": source,
+            "to_currency": target,
+            "usd_equivalent": f"{usd_value:,.2f}",
+            "threshold_usd": f"{LARGE_AMOUNT_USD:,.2f}",
+            "question": (
+                f"That is {_quantize(amount, source)} {source}, about "
+                f"${usd_value:,.2f} -- over the ${LARGE_AMOUNT_USD:,.0f} "
+                f"threshold this desk double-checks. Confirm the amount is "
+                f"right and I should convert it to {target}?"
+            ),
         }
 
     rate = _rate(source, target)
@@ -183,8 +357,9 @@ def list_supported_currencies() -> dict[str, str]:
     """
     return {
         "status": "ok",
-        "supported": ", ".join(supported_currencies()),
+        "supported": ", ".join(_describe(code) for code in supported_currencies()),
         "count": str(len(_USD_PER_UNIT)),
         "rate_source": RATE_SOURCE,
         "as_of": RATES_AS_OF,
+        "threshold_usd": f"{LARGE_AMOUNT_USD:,.2f}",
     }

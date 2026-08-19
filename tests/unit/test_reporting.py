@@ -29,8 +29,18 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.events.event import Event
 from google.genai import types
 
-from app.agents.contracts import APPROVAL_REQUIRED
-from app.agents.reporting import RESULT_HEADER, restate_structured_results
+from app.agents.contracts import (
+    APPROVAL_REQUIRED,
+    EXECUTED,
+    NEEDS_CONFIRMATION,
+    NEEDS_INPUT,
+    PUBLISHED,
+)
+from app.agents.reporting import (
+    AUDITED_STATUSES,
+    RESULT_HEADER,
+    restate_structured_results,
+)
 
 INVOCATION = "inv-1"
 AGENT = "math"
@@ -167,3 +177,87 @@ def test_the_same_result_is_not_restated_twice():
     assert content is not None
     body = "".join(p.text or "" for p in content.parts or [])
     assert body.count('"summary"') == 1
+
+
+# --- Surviving more than one hop ----------------------------------------------
+#
+# A peer reached through PeerTool answers as TEXT, so on the caller its reply is
+# a *string* tool result. Without scanning inside those strings, a question or a
+# proposal raised two levels down (orchestrator -> math -> currency) is invisible
+# here, and reaches the user only if the middle agent's model chooses to repeat
+# it -- the exact dependency this callback exists to remove.
+
+_QUESTION = {
+    "status": NEEDS_INPUT,
+    "reason": "ambiguous_currency",
+    "field": "from_currency",
+    "term": "dollars",
+    "candidates": ["USD", "CAD", "AUD", "NZD", "SGD", "HKD"],
+    "question": "Which currency does 'dollars' mean here?",
+}
+
+
+def _peer_reply(payload: dict[str, Any], prose: str = "") -> str:
+    """The peer's own text. ADK delivers it as {"result": <this string>}."""
+    return f"{prose}\n\nStructured result(s):\n{json.dumps(payload, sort_keys=True)}"
+
+
+def test_a_question_from_a_peer_two_hops_down_is_restated():
+    content = restate_structured_results(
+        _context(
+            [
+                _tool_event("currency", {"result": _peer_reply(_QUESTION, "check")}),
+                _text_event("The currency specialist needs to know which dollar."),
+            ]
+        )
+    )
+    assert content is not None
+    body = "".join(p.text or "" for p in content.parts or [])
+    assert RESULT_HEADER in body
+    # Verbatim, so the orchestrator's scan finds the same object the currency
+    # agent emitted -- candidates included.
+    assert json.dumps(_QUESTION, sort_keys=True) in body
+
+
+def test_a_peer_reply_wrapped_by_adk_is_scanned_too():
+    # ADK routinely wraps a tool's return value as {"result": <string>}.
+    content = restate_structured_results(
+        _context([_tool_event("currency", {"result": _peer_reply(_QUESTION)})])
+    )
+    assert content is not None
+    body = "".join(p.text or "" for p in content.parts or [])
+    assert json.dumps(_QUESTION, sort_keys=True) in body
+
+
+def test_a_confirmation_request_is_restated():
+    payload = {
+        "status": NEEDS_CONFIRMATION,
+        "reason": "large_amount",
+        "question": "That is over the threshold. Confirm?",
+    }
+    content = restate_structured_results(
+        _context([_tool_event("currency", {"result": _peer_reply(payload)})])
+    )
+    assert content is not None
+    body = "".join(p.text or "" for p in content.parts or [])
+    assert json.dumps(payload, sort_keys=True) in body
+
+
+def test_a_gated_read_is_audited_like_a_gated_write():
+    # Regression: AUDITED_STATUSES was {approval_required, published} when the
+    # trades agent landed, so `executed` was silently NOT restated. It survived
+    # only because the model chose to repeat it.
+    assert EXECUTED in AUDITED_STATUSES
+    assert PUBLISHED in AUDITED_STATUSES
+    content = restate_structured_results(
+        _context([_tool_event("run_trade_query", {"status": EXECUTED, "rows": []})])
+    )
+    assert content is not None
+
+
+def test_ordinary_peer_prose_is_still_left_alone():
+    # The scanner must not turn every peer reply into a restatement.
+    content = restate_structured_results(
+        _context([_tool_event("currency", {"result": "250 EUR is 272.50 USD."})])
+    )
+    assert content is None

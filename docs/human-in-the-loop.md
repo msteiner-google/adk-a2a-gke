@@ -232,6 +232,37 @@ Same shape as `publish_result`, plus two things worth copying:
   `status: error`, so the case stays approved and re-drivable rather than being
   closed as done.
 
+## Asking the user is not the same as approving
+
+There is a second, lighter escalation in this cluster and it deliberately does
+**not** use any of the machinery above. The currency specialist returns
+`needs_input` when a currency is ambiguous ("dollars" is six of them here) and
+`needs_confirmation` when an amount is over its threshold. Both mean: nothing
+happened, and only the user can settle this.
+
+They are not approval cases, for three reasons worth being explicit about:
+
+- **There is no effect to gate.** Converting has no side effect, so re-running
+  it after the user answers costs nothing. An approval case buys its complexity
+  by making an irreversible action safe; there is nothing here to make safe.
+- **The answer is an input, not a decision.** "US dollars, not Canadian" belongs
+  in the next request, not in a `decided_by` column. Recording it as an approval
+  would file a typo correction as a compliance event.
+- **Nothing needs to survive a restart.** The question is part of a
+  conversation the session already holds.
+
+What they *do* share with an approval is the hard part: reaching the user
+un-paraphrased, from two hops down. That is `app/agents/reporting.py` — both
+statuses are in `AUDITED_STATUSES`, and the callback scans inside a peer's reply
+as well as its own tool results, so the question survives
+`currency -> math -> orchestrator` as verbatim JSON rather than as whatever the
+middle agent chose to say about it. The instructions at all three levels then
+say the same thing: relay it, do not answer it.
+
+Reach for an approval case when an effect must not happen without sign-off.
+Reach for `needs_input` / `needs_confirmation` when you simply do not know
+enough to proceed.
+
 ## Proving it actually happened
 
 This repo has twice shipped a bug where a confident, sensible answer hid a flow

@@ -121,7 +121,7 @@ Read the module docstrings; they are thorough. This is the index.
 | `app/agents/research/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, tool `web_search`. |
 | `app/agents/math/agent.py` + `tools.py` | `tier="balanced"`, `peers=("currency",)`. Tools: `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. **Not a leaf** — it delegates conversions rather than applying a rate itself. |
 | `app/agents/planner/` | Leaf agent, `tier="balanced"`, no tools. Drafts a plan and returns it for review. |
-| `app/agents/currency/agent.py` + `tools.py` | Leaf agent, `tier="fast"`, reached only by `math`. Hardcoded USD-anchored rate table; every pair is derived from it, so no triangle of rates can disagree with itself. |
+| `app/agents/currency/agent.py` + `tools.py` | Leaf agent, `tier="fast"`, reached only by `math`. Hardcoded USD-anchored rate table; every pair is derived from it, so no triangle of rates can disagree with itself. **Refuses rather than guesses**: an ambiguous term ("dollars" is six currencies) returns `needs_input`, an amount over `LARGE_AMOUNT_USD` returns `needs_confirmation`, and both carry a question for the user. |
 | `app/agents/trades/agent.py` + `tools.py` + `dataset.py` | Leaf agent, `tier="capable"`. Writes SQL against the `cymbal_investments.trade_capture_report` BigQuery public dataset; `run_trade_query` is the **second gated action**. `dataset.py` holds both the schema the instruction is built from and the one-table allow-list the validator enforces. |
 | `app/cluster/peer_tool.py` | `PeerTool` — an `AgentTool` that gives a remote peer a **typed payload declaration**, so delegation sends an explicit request instead of the transcript. |
 | `app/cluster/cases.py` | The approval case store (`pending → approved → executed`), both backends (in-memory / `approval_cases`), and the helpers that read a proposal back out of a peer's text reply. |
@@ -475,6 +475,32 @@ These are real traps that have bitten this codebase.
   unanswerable one. Reconcile with `status = 'approved'` (indexed by `0005`) and
   re-drive by calling `POST /cases/{proposal_id}` again — unlike the mechanism
   this replaced, every such row is actionable.
+
+- **A specialist can ask the USER a question, and that is not an approval.**
+  `contracts.NEEDS_INPUT` (the request is ambiguous) and
+  `contracts.NEEDS_CONFIRMATION` (the amount is unusual) mean the specialist did
+  nothing and needs an answer. They are deliberately NOT approval cases: there
+  is no effect to gate, nothing to record for audit, and the answer is a
+  corrected *request* rather than a decision on a case. Every agent between the
+  specialist and the user must relay the question rather than answer it — the
+  instructions say so at all three levels, and `app/agents/reporting.py` is what
+  makes the JSON survive intact so the relay cannot quietly become a paraphrase.
+
+- **`reporting.py` has to scan INSIDE a peer's reply, not just its own tools.**
+  A peer reached through `PeerTool` answers as text, and ADK delivers it as
+  `{"result": "<the peer's text>"}` — `FunctionResponse.response` is typed
+  `dict | None`, so the peer's JSON is a value inside the wrapper, never the
+  payload. Without scanning that string, anything raised two hops down
+  (`orchestrator -> math -> currency`) reaches the user only if the middle
+  agent's model chooses to repeat it, which is the exact dependency that
+  callback exists to remove.
+
+- **`AUDITED_STATUSES` is derived from the contract vocabulary, not written
+  out.** It was a literal `{approval_required, published}` when the `trades`
+  agent landed, so a gated *read* reporting `executed` was silently not
+  restated. Add a status to `app/agents/contracts.py` and it is audited
+  everywhere; hardcode one and you get a flow that works until the model has an
+  off day.
 
 - **A gated action must report a status in `contracts.EFFECT_PERFORMED`.**
   `cases.find_execution` confirms an execution by scanning the reply for

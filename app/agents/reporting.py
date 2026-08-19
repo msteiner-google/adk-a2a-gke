@@ -49,11 +49,18 @@ from typing import TYPE_CHECKING, Any
 
 from google.genai import types
 
-from app.agents.contracts import APPROVAL_REQUIRED
+from app.agents.contracts import APPROVAL_REQUIRED, EFFECT_PERFORMED, NEEDS_USER
 
 #: Tool-result statuses that must reach the caller intact rather than as prose:
-#: an action awaiting sign-off, and the confirmation that an approved one ran.
-AUDITED_STATUSES = frozenset({APPROVAL_REQUIRED, "published"})
+#: an action awaiting sign-off, the confirmation that an approved one ran, and a
+#: question only the user can answer.
+#:
+#: Derived from the contract vocabulary rather than written out, which is not
+#: tidiness. This set said `{APPROVAL_REQUIRED, "published"}` when the trades
+#: agent landed, so a gated *read* reporting `executed` was silently not
+#: restated -- it survived only because the model chose to repeat it, which is
+#: exactly the thing this callback exists to stop relying on.
+AUDITED_STATUSES = frozenset({APPROVAL_REQUIRED}) | EFFECT_PERFORMED | NEEDS_USER
 
 if TYPE_CHECKING:
     from google.adk.agents.callback_context import CallbackContext
@@ -64,17 +71,53 @@ if TYPE_CHECKING:
 RESULT_HEADER = "Structured result(s):"
 
 
-def _payloads(event: Event) -> list[dict[str, Any]]:
-    """Return the tool-result dicts an event carries.
+def _embedded(text: str) -> list[dict[str, Any]]:
+    """Return JSON objects embedded anywhere in a string.
 
-    ADK sometimes wraps a tool's return value in ``{"result": ...}``, so both
-    shapes are unwrapped here rather than assuming one.
+    This is what makes the callback work more than one hop deep. A peer reached
+    through ``PeerTool`` answers as TEXT, so on the *caller* the reply is a
+    string tool result, not a dict -- and a proposal or a question raised two
+    levels down (``orchestrator -> math -> currency``) would be invisible to the
+    dict-only scan below, leaving it to the middle agent's model to relay
+    faithfully. That is precisely the dependency this module exists to remove.
+
+    Args:
+        text: A string tool result to scan.
+
+    Returns:
+        Every top-level JSON object found in it, in order.
+    """
+    decoder = json.JSONDecoder()
+    found: list[dict[str, Any]] = []
+    index = text.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except ValueError:
+            index = text.find("{", index + 1)
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+            index = text.find("{", end)
+        else:
+            index = text.find("{", index + 1)
+    return found
+
+
+def _payloads(event: Event) -> list[dict[str, Any]]:
+    """Return the tool-result payloads an event carries.
+
+    Two shapes, because ADK produces both: the tool's dict as-is, and the
+    ``{"result": ...}`` wrapper. The wrapper is where a remote peer's reply
+    lands, as a STRING -- ``FunctionResponse.response`` is typed ``dict | None``,
+    so the peer's own JSON is a value inside it rather than the payload itself,
+    and it has to be scanned out.
 
     Args:
         event: The event to inspect.
 
     Returns:
-        Every dict-shaped tool result on the event.
+        Every candidate payload dict on the event.
     """
     found: list[dict[str, Any]] = []
     for response in event.get_function_responses():
@@ -82,7 +125,12 @@ def _payloads(event: Event) -> list[dict[str, Any]]:
         if not isinstance(payload, dict):
             continue
         inner = payload.get("result")
-        found.append(inner if isinstance(inner, dict) else payload)
+        if isinstance(inner, dict):
+            found.append(inner)
+        elif isinstance(inner, str):
+            found.extend(_embedded(inner))
+        else:
+            found.append(payload)
     return found
 
 
