@@ -57,6 +57,7 @@ from a2a.server.tasks import TaskStore
 from a2a.types import AgentCapabilities, AgentExtension
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 from google.adk.a2a.executor.a2a_agent_executor import A2aAgentExecutor
+from google.adk.a2a.executor.config import A2aAgentExecutorConfig
 from google.adk.a2a.utils.agent_card_builder import AgentCardBuilder
 from google.adk.workflow import Workflow
 
@@ -93,6 +94,7 @@ async def attach_a2a_routes(
     runner: Runner,
     task_store: TaskStore,
     rpc_path: str,
+    executor_config: A2aAgentExecutorConfig | None = None,
     capabilities: AgentCapabilities | None = None,
     agent_version: str | None = None,
     app_url: str | None = None,
@@ -121,7 +123,7 @@ async def attach_a2a_routes(
     ).build()
 
     request_handler = DefaultRequestHandler(
-        agent_executor=A2aAgentExecutor(runner=runner),
+        agent_executor=A2aAgentExecutor(runner=runner, config=executor_config),
         task_store=task_store,
         agent_card=agent_card,
     )

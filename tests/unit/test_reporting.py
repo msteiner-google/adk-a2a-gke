@@ -36,18 +36,18 @@ from google.adk.events.event import Event
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
-from app.agents.contracts import (
-    APPROVAL_REQUIRED,
-    EXECUTED,
-    NEEDS_CONFIRMATION,
-    NEEDS_INPUT,
-    PUBLISHED,
-)
 from app.agents.reporting import (
     AUDITED_STATUSES,
     RESULT_HEADER,
     attach_structured_results,
     restate_structured_results,
+)
+from app.agents.statuses import (
+    AWAITING_APPROVAL,
+    EXECUTED,
+    NEEDS_CONFIRMATION,
+    NEEDS_INPUT,
+    PUBLISHED,
 )
 
 INVOCATION = "inv-1"
@@ -109,7 +109,7 @@ def _text_of(response: LlmResponse) -> str:
 
 
 _PROPOSAL = {
-    "status": APPROVAL_REQUIRED,
+    "status": AWAITING_APPROVAL,
     "action": "publish_result",
     "proposal": {"action": "publish_result", "value": "391.0", "label": "q3"},
     "summary": "Publish '391.0' under label 'q3'.",
@@ -208,7 +208,7 @@ def test_the_same_result_is_not_restated_twice():
 
 # --- Surviving more than one hop ----------------------------------------------
 #
-# A peer reached through PeerTool answers as TEXT, so on the caller its reply is
+# A peer's reply crosses A2A as TEXT, so on the caller its reply is
 # a *string* tool result. Without scanning inside those strings, a question or a
 # proposal raised two levels down (orchestrator -> math -> currency) is invisible
 # here, and reaches the user only if the middle agent's model chooses to repeat

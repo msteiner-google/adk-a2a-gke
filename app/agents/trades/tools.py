@@ -70,7 +70,18 @@ import os
 import re
 from typing import TYPE_CHECKING, Any
 
-from app.agents.contracts import APPROVAL_REQUIRED, EXECUTED
+# ToolContext must be imported at RUNTIME (see app/agents/gating.py) -- ADK
+# evaluates this annotation with typing.get_type_hints() to build the tool's
+# declaration, and a TYPE_CHECKING-only import breaks every tool in the module.
+from google.adk.tools.tool_context import ToolContext
+
+from app.agents.gating import (
+    AWAITING_APPROVAL,
+    REFUSED,
+    gated,
+    require_approval,
+)
+from app.agents.statuses import EXECUTED
 from app.agents.trades.dataset import TABLE
 
 if TYPE_CHECKING:
@@ -454,8 +465,11 @@ def _execute(statement: str, row_limit: int) -> dict[str, Any]:
     }
 
 
+@gated
 def run_trade_query(
-    sql: str, row_limit: int = DEFAULT_ROW_LIMIT, approved_by: str = "", note: str = ""
+    sql: str,
+    tool_context: ToolContext,
+    row_limit: int = DEFAULT_ROW_LIMIT,
 ) -> dict[str, Any]:
     """Run a read-only query against the trade data, once a human has approved.
 
@@ -466,16 +480,14 @@ def run_trade_query(
     shown a proposal that could not have run.
 
     Args:
-        sql: The SQL to run. On a first call, the query you composed; on an
-            approved re-send, the ``sql`` from the approved proposal, verbatim.
+        sql: The SQL to run.
+        tool_context: Injected by ADK. Carries the authorization decision.
         row_limit: How many rows to return, clamped to the configured cap.
-        approved_by: Who approved this exact query. Empty means "not approved
-            yet", and the call returns a proposal instead of querying.
-        note: Optional feedback the approver attached, recorded for audit.
 
     Returns:
-        Either ``status='approval_required'`` describing the query that would
-        run, ``status='executed'`` with the rows, or ``status='error'``.
+        ``status='awaiting_approval'`` while suspended, ``status='refused'`` if
+        a human declined, ``status='executed'`` with the rows once approved, or
+        ``status='error'`` if the SQL is refused by the validator.
     """
     statement = canonical_sql(sql)
     rows_wanted = _clamp_rows(row_limit)
@@ -488,18 +500,28 @@ def run_trade_query(
             "error": problem,
         }
 
-    proposal = {"action": QUERY_ACTION, "sql": statement, "row_limit": rows_wanted}
-
-    if not approved_by.strip():
-        return {
-            "status": APPROVAL_REQUIRED,
+    # Ask for authorization only AFTER validation: a statement that could never
+    # run is rejected above rather than put in front of a human. ADK re-executes
+    # this function with the same arguments once a decision arrives, so the
+    # BigQuery call below stays unreachable until then (app/agents/gating.py).
+    decision = require_approval(
+        tool_context,
+        summary=(
+            f"Run a read-only BigQuery query against {TABLE} and return up to "
+            f"{rows_wanted} rows: {statement}"
+        ),
+        # The canonicalised SQL and the clamped row count -- what will actually
+        # run, not what the model typed.
+        proposal={
             "action": QUERY_ACTION,
-            "proposal": proposal,
-            "summary": (
-                f"Run a read-only BigQuery query against {TABLE} and return up "
-                f"to {rows_wanted} rows."
-            ),
-        }
+            "sql": statement,
+            "row_limit": rows_wanted,
+        },
+    )
+    if decision.pending:
+        return {"status": AWAITING_APPROVAL, "action": QUERY_ACTION, "sql": statement}
+    if not decision.granted:
+        return {"status": REFUSED, "action": QUERY_ACTION, "note": decision.note}
 
     outcome = _execute(statement, rows_wanted)
     if outcome.get("status") == "error":
@@ -515,8 +537,8 @@ def run_trade_query(
         "action": QUERY_ACTION,
         "sql": statement,
         "row_limit": rows_wanted,
-        "approved_by": approved_by,
-        "note": note,
+        "approved_by": decision.approved_by,
+        "note": decision.note,
         **outcome,
     }
     EXECUTIONS.append(record)

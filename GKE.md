@@ -26,7 +26,8 @@ Kubernetes Service and reached over the **A2A** protocol.
                     │ (balanced)     │
                     └────────────────┘
 
-Every arrow above carries ONE typed payload, never the caller's transcript —
+An arrow to an agent that can suspend for human sign-off is a sub-agent hop;
+every other arrow is a tool call —
 including the second-level one. Depth changes nothing about what a specialist
 can see.
 ```
@@ -56,8 +57,8 @@ reference for every one mentioned below.
 | Multi-agent runtime architecture | One image, agent-selected at startup (`AGENT_NAME`) — `app/agent.py` |
 | Uniform agent model | Every agent is an `AgentSpec` built by one `build_agent` — `app/agents/base.py` |
 | Orchestration / planner layer | `app/agents/orchestrator/agent.py` (an agent whose spec declares peers; delegates through typed peer tools). Not limited to one level — `app/agents/math/agent.py` declares peers of its own |
-| Agent-to-agent communication | `app/cluster/resolver.py` builds typed `PeerTool`s from peer agent cards |
-| Context provisioning | Explicit payload per call, free text by default and typed where a contract is declared — `app/agents/contracts.py`; no transcript, no shared session state |
+| Agent-to-agent communication | `app/cluster/resolver.py` builds sub-agents or tools from peer agent cards, per peer |
+| Context provisioning | A gated peer receives the caller's recent conversation; every other peer receives one composed request. No shared session state either way |
 | Large inputs | Claim-check: object-store references in the payload, read by the specialist — `app/agents/documents.py` |
 | Session & memory persistence | Pluggable, env-selectable backends — `app/cluster/session.py` + `SessionModule` |
 | Artifact (blob) storage | Blob-store-agnostic via `cloudpathlib` — `app/cluster/artifacts.py` + `app/shared/artifacts.py` |
@@ -91,20 +92,28 @@ Every pod runs the same image; `AGENT_NAME` selects which agent from the registr
 The one asymmetry that remains — which agent is exposed to users — is a
 **deployment** concern (which Service gets external ingress), not a code one.
 
-**Peers are attached as tools, not sub-agents**, and that is the load-bearing
-detail of the whole design. A peer in `sub_agents` is reached with
-`transfer_to_agent`, which hands it the caller's session — measured at ten
-message parts, including the user's phone number and a different specialist's
-answer, where the task needed one. A peer in `tools` receives exactly the payload
-the caller composed. See [Context provisioning](#context-provisioning) below and
+**How a peer is attached follows from whether it can suspend**, and that is the
+load-bearing detail of the whole design. Neither wiring does both jobs:
+
+- A peer that owns a `@gated` tool is a **sub-agent**, reached with
+  `transfer_to_agent`. Only that propagates an A2A task suspended in
+  `TASK_STATE_AUTH_REQUIRED`. An `AgentTool` runs the peer to exhaustion and
+  never reads `long_running_tool_ids`, so a suspended peer returns the empty
+  string and the request for human sign-off is silently swallowed.
+- Every other peer is a **tool**. `transfer_to_agent` ends the caller's
+  invocation, so a caller that needs the peer's answer would never get one —
+  measured here as a currency conversion that succeeded while the sum it fed
+  was abandoned half-done.
+
+The split is derived from the registry by `suspending_agents()`, so marking a
+tool `@gated` is the single act that wires its agent correctly. See
 [`docs/design-decisions.md`](docs/design-decisions.md) (D1).
 
 Add an agent by:
 
 1. Creating `app/agents/<name>/agent.py` exposing a `SPEC = AgentSpec(...)` (put
-   agent-specific tools in `app/agents/<name>/tools.py`) and — optional in the
-   mechanism, conventional here — declaring its request contract in
-   `app/agents/contracts.py`.
+   agent-specific tools in `app/agents/<name>/tools.py`). If it gates an effect,
+   write that tool with `require_approval()` and mark it `@gated`.
 2. Registering it in `app/agents/__init__.py`.
 3. Adding it to the delegating agent's `AgentSpec.peers`.
 4. For the cluster: five files under `infra/` — `var.agents`,
@@ -171,34 +180,28 @@ the rest of the upgrade.
 history, no shared session state, no shared artifact handles. Everything it needs
 arrives in that payload; everything else stays with the caller.
 
-**How structured the payload is, is a per-peer choice.** The default contract
-between two agents here is one free-text `task` plus a `case_id`
-(`UnknownPeerRequest` in `app/cluster/resolver.py`) — enough to keep delegation
-explicit, and the honest level for a peer another squad owns whose real schema
-lives in its own agent card. Declaring a model in `app/agents/contracts.py` is
-the **opt-in** upgrade: named parameters the calling model sees, validation
-before the call leaves the pod, and a JSON Schema published in the card. Every
-agent in this repo takes the upgrade — one free-text field is where a caller
-starts pasting the conversation back in — but the mechanism supports both, and
-a peer with no declared model is still a first-class peer.
-
-This is a wiring decision, and it is easy to reverse by accident. A peer attached
-as an ADK **sub-agent** is reached with `transfer_to_agent`, and
-`RemoteA2aAgent` then rebuilds the outbound A2A message from the caller's
-*session events* — every turn since the peer last replied, with other agents'
-replies folded in and prefixed `For context:`. Measured on this repo's own
-agents, that was **ten message parts** where the task needed one, and it
-included the user's personal phone number and a different specialist's answer
-([`docs/design-decisions.md`](docs/design-decisions.md), D1).
-
-A peer attached as a **tool** (`app/cluster/peer_tool.py`) runs against a fresh
-session whose only content is the arguments the caller composed:
+**What a peer receives depends on its wiring.** A peer attached as a **tool**
+runs against a fresh session whose only content is the request the caller
+composed:
 
 ```json
-{"case_id": "case-123", "question": "Is BNP Paribas registered in IE?"}
+{"request": "Convert 500 USD to EUR"}
 ```
 
-Four things follow, and each is a problem under `sub_agents`:
+A peer attached as a **sub-agent** is reached with `transfer_to_agent`, and
+`RemoteA2aAgent` rebuilds the outbound A2A message from the caller's *session
+events* — every turn since that peer last replied, with other agents' replies
+folded in and prefixed `For context:`. Measured on this repo's own agents, that
+was **ten message parts** where the task needed one, and it included the user's
+personal phone number and a different specialist's answer
+([`docs/design-decisions.md`](docs/design-decisions.md), D1).
+
+That cost is accepted **only** for peers that can suspend for human sign-off,
+because no other wiring can carry the suspension. It was an explicit customer
+decision, not an oversight. Everything below therefore describes the tool half,
+and is what you lose on a gated hop:
+
+Four things follow from the tool wiring:
 
 - **Data segregation.** A specialist cannot receive personal or unrelated detail
   that merely happened to be earlier in the conversation.
@@ -404,65 +407,72 @@ never touches it, so the pods go green and the **first delegation** fails with
 
 ## Human-in-the-loop
 
-An action that must not happen without a person is **proposed, not performed**.
-The specialist returns a proposal and finishes its turn; the caller records a
-durable case and answers the user; the approved action is carried out later by
-an ordinary new call.
+An action that must not happen without a person **suspends** rather than
+running. The specialist leaves its A2A Task in `TASK_STATE_AUTH_REQUIRED` (A2A
+spec section 7.6, In-Task Authorization); the request bubbles up to the agent
+talking to the human, which records a durable case; the decision is delivered
+straight back to the suspended task and ADK re-executes the tool.
 
 ```
-   pending ──decide (single conditional UPDATE)──▶ approved ──execute──▶ executed
+   pending ──decide (single conditional UPDATE)──▶ approved ──deliver──▶ executed
         │                                                                    ▲
         └────────────────────────────────▶ rejected      re-drivable ────────┘
-                                                         if execution is not
-                                                         confirmed
+                                                         if delivery fails or
+                                                         is not confirmed
 ```
 
 Four properties make this a cluster feature rather than a request-scoped trick:
 
-**Waiting is free.** A pending approval is a row in `approval_cases`. No
-coroutine is suspended, no session is pinned in memory, nothing needs renewing.
-An approval that takes a fortnight costs exactly what one taking a second costs
-— which matters, because enterprise sign-off genuinely does take days.
+**A client is told in the protocol, not in prose.** `TASK_STATE_AUTH_REQUIRED`
+is an *interrupted* state, so a poller, an SSE subscriber or a webhook all learn
+that work is outstanding without parsing an agent's wording. That is the point
+of using the protocol's own mechanism rather than an application convention.
 
-**Nothing is pod-local.** Any replica can decide any case, because the only
-state they share is the row. There is no recovery machinery to run because
-nothing is in flight: the decision is written *before* the action is attempted,
-so a pod that dies mid-execution leaves a re-drivable `approved` case rather
-than an unanswerable one.
+**The decision survives everything the request does not.** A pending approval is
+a row in `approval_cases`, so any replica can decide any case and an approval
+taking a fortnight costs what one taking a second costs. The decision is written
+*before* delivery is attempted, so a pod that dies mid-delivery leaves a
+re-drivable `approved` case rather than an unanswerable one.
 
-**What was approved is what runs.** Two things enforce it. The specialist
-recomputes its result from the original request rather than from values a caller
-retypes, and the caller confirms execution by checking the returned values
-against the proposal it stored — a result that does not match is reported, not
-recorded. Confirming that the *call* happened, rather than what it produced,
-would catch neither.
+**What was approved is what runs.** The reviewer reads arguments ADK generated
+from the suspended call, and ADK re-executes *that* call with the decision
+attached — no model restates it and none re-sends it. The caller still confirms
+by matching the returned values against the stored proposal; a result that does
+not match is reported, not recorded.
 
-**Nothing here is ADK-specific.** Two ordinary skills and a JSON contract — a
-specialist written in LangGraph or plain FastAPI implements the same thing with
-no framework hooks, which is what makes the pattern usable across squads.
+**The gate is in the code, not the task state.** Spec 7.6.4 is explicit that
+`TASK_STATE_AUTH_REQUIRED` authorises nothing by itself. The effect sits behind
+a branch on the decision inside the tool, so anything able to resume a task
+still cannot perform the effect.
+
+One consequence to know before scaling out: a suspended task lives in its pod's
+A2A task registry, which is in-process. Every Deployment is `replicas: 1` today;
+with more, a grant routed to the wrong pod builds a second live task from the DB
+row. Sticky routing by task id, or a shared queue manager, is the fix.
 
 **Two gated actions, one mechanism.** `math`'s `publish_result` is a gated
 *write*; `trades`'s `run_trade_query` is a gated *read* — the model writes SQL,
-returns it as a proposal, and touches BigQuery not at all until the approved
-re-send. Gating a read is not a lesser case: the risk is not corruption but a
+suspends, and touches BigQuery not at all until a human decides. Gating a read
+is not a lesser case: the risk is not corruption but a
 query nobody reviewed, against a table nobody scoped, returning a confident
 number derived from the wrong rows. Both tools are the same shape — one
-function, two behaviours, chosen by whether `approved_by` is present, with no
-second code path that acts without the check.
+function that asks `require_approval()` and returns without acting until it has
+an answer, with no second code path that acts without the check.
 
 Each reports the effect it actually performed, so the status vocabulary lives in
-`app/agents/contracts.py`: `published` for the write, `executed` for the read,
+`app/agents/statuses.py`: `published` for the write, `executed` for the read,
 and `EFFECT_PERFORMED` as the set of both. `cases.find_execution` matches
 against that set rather than a literal, so a new gated action can name its own
 effect truthfully — and **must** add its status to the set, or its executions
 are reported as `approved_not_confirmed`.
 
-One difference is worth knowing before writing a third. The math specialist
-recomputes from `expression` because arithmetic is deterministic; SQL generation
-is not, so the approved query text travels back in `TradesRequest.sql` and the
-tool refuses to run without it rather than regenerating something similar.
-Reproducibility of the effect from the request is the property that decides
-which of the two shapes a gated action takes.
+Neither has to make its arguments travel back. ADK re-executes the suspended
+call itself, so the approved SQL is the SQL that runs — which removes the whole
+category of "the model re-sent something slightly different" that the previous
+design had to detect. What a tool *does* have to do is declare its canonical
+values in `require_approval(..., proposal=...)` when it normalises its inputs,
+or the case records the model's raw arguments and a correct execution is refused
+as unconfirmed.
 
 **There is no `HITL_BACKEND`.** The store follows `DB_BACKEND`: durable in
 `approval_cases` when a database is configured, per-pod memory otherwise. With
@@ -474,12 +484,14 @@ The reconciliation query is `status = 'approved'` (indexed by `0005`): an
 approved case whose action never completed. Every such row is actionable —
 re-drive it by calling `POST /cases/{proposal_id}` again.
 
-**Why not suspend the invocation instead?** ADK can pause a call and resume it,
-so the tempting design freezes the invocation across the A2A hop until the human
-answers. It needs a reclaimable lease, a heartbeat and a background sweeper, and
-it still cannot deliver the answer once the peer's A2A task has gone terminal.
-[`docs/design-decisions.md`](docs/design-decisions.md) (D5) has the measurements
-behind rejecting it.
+**Why the decision goes down and not around.** The natural reading of spec
+7.6.2 — resolve the top task and the chain unwinds — does not work on ADK: a
+peer's confirmation arrives in the caller's session as an ordinary function
+call, so the caller looks for the tool among its own, finds nothing, and drops
+the grant in silence. Measured twice, with the specialist receiving no traffic
+at all. `app/cluster/grants.py` therefore delivers straight to the owner.
+[`docs/design-decisions.md`](docs/design-decisions.md) (D5) has both that and
+the long-running-tool design that failed before it.
 
 > **[`docs/human-in-the-loop.md`](docs/human-in-the-loop.md)** is the full guide:
 > the HTTP API with real payloads, how to write a gated action, a local

@@ -19,12 +19,12 @@ from typing import cast
 
 import pytest
 from google.adk.agents import LlmAgent
+from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 
-from app.agents import AGENTS, DEFAULT_AGENT, PAYLOADS, build_agent
+from app.agents import AGENTS, DEFAULT_AGENT, build_agent, suspending_agents
 from app.agents.base import AgentSpec
 from app.agents.math.tools import calculate
 from app.cluster.config import ClusterConfig, PeerSpec
-from app.cluster.peer_tool import PeerTool
 from app.cluster.resolver import AgentResolver
 from app.shared.config import Models
 
@@ -63,7 +63,8 @@ _CONFIG_NO_PEERS = ClusterConfig(
 
 
 def _resolver(config: ClusterConfig) -> AgentResolver:
-    return AgentResolver(config, payload_schemas=PAYLOADS)
+    # The real derivation, so the tests exercise the wiring the cluster uses.
+    return AgentResolver(config, suspending=suspending_agents())
 
 
 def test_registry_lists_expected_agents():
@@ -92,11 +93,12 @@ def test_declared_peer_topology():
     assert AGENTS["currency"].peers == ()
 
 
-def test_every_delegatable_agent_declares_a_contract():
-    # An agent reachable as a peer but missing from PAYLOADS silently degrades
-    # to an untyped request, which is the failure mode D1 exists to prevent.
+def test_every_declared_peer_is_a_registered_agent():
+    # A peer naming an agent that does not exist resolves to a card URL nothing
+    # serves, and fails at first delegation as a connection error rather than
+    # at startup.
     delegatable = {name for spec in AGENTS.values() for name in spec.peers}
-    assert delegatable <= set(PAYLOADS), delegatable - set(PAYLOADS)
+    assert delegatable <= set(AGENTS), delegatable - set(AGENTS)
 
 
 def _tool_names(agent: LlmAgent) -> set[str]:
@@ -116,22 +118,58 @@ def test_build_agent_leaf_has_only_its_own_tools():
     assert _tool_names(agent) == {"web_search", "read_document"}
 
 
-def test_build_agent_attaches_resolved_peers_as_tools():
+def test_a_peer_that_can_suspend_is_a_sub_agent():
+    # An AgentTool runs the peer to exhaustion and drops long_running_tool_ids,
+    # so a peer suspended awaiting human authorization is indistinguishable
+    # from one that answered with an empty string -- the authorization request
+    # never reaches anyone. `math` owns a gated tool, so it must be here.
     orchestrator = build_agent(
         AGENTS["orchestrator"], _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS)
     )
     assert orchestrator.name == "orchestrator"
-    assert _tool_names(orchestrator) == {"research", "math"}
-    assert all(isinstance(t, PeerTool) for t in orchestrator.tools)
+    assert {a.name for a in orchestrator.sub_agents} == {"math"}
+    assert all(isinstance(a, RemoteA2aAgent) for a in orchestrator.sub_agents)
 
 
-def test_build_agent_never_attaches_peers_as_sub_agents():
-    # The invariant behind D1. A peer in sub_agents is reached with
-    # transfer_to_agent, which forwards the caller's transcript to it.
+def test_a_peer_that_cannot_suspend_is_a_tool():
+    # transfer_to_agent is a one-way handoff: the caller's invocation ends, so
+    # it can never use what the peer returned. Measured -- math transferred to
+    # currency and never resumed to finish the sum. A peer with nothing to
+    # suspend belongs in `tools`, where its answer comes back.
     orchestrator = build_agent(
         AGENTS["orchestrator"], _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS)
     )
-    assert orchestrator.sub_agents == []
+    assert _tool_names(orchestrator) == {"research"}
+
+
+def test_the_split_is_derived_from_the_gated_tools():
+    # Marking a tool @gated is the single act that wires its agent as a
+    # sub-agent everywhere. Anything else is two places to keep in sync.
+    assert suspending_agents() == {"math", "trades"}
+
+
+def test_every_tool_that_asks_for_approval_is_marked_gated():
+    # The dangerous omission: a new gated tool without @gated leaves its agent
+    # wired as an AgentTool, and every authorization request it raises is
+    # swallowed in silence. Cross-check the marker against the source rather
+    # than trusting it to be remembered.
+    import inspect
+    from typing import Any, cast
+
+    from app.agents.gating import is_gated
+
+    for name, spec in AGENTS.items():
+        for tool in spec.tools:
+            func = getattr(tool, "func", tool)
+            try:
+                source = inspect.getsource(cast(Any, func))
+            except OSError, TypeError:  # pragma: no cover - builtins
+                continue
+            if "require_approval(" in source and "def require_approval" not in source:
+                assert is_gated(tool), (
+                    f"{name}.{getattr(func, '__name__', tool)} calls "
+                    "require_approval but is not marked @gated"
+                )
 
 
 def test_build_agent_keeps_own_tools_alongside_peers():
@@ -145,19 +183,16 @@ def test_build_agent_keeps_own_tools_alongside_peers():
         peers=("research",),
     )
     agent = build_agent(spec, _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS))
-    assert _tool_names(agent) == {"calculate", "research", "math"}
+    assert _tool_names(agent) == {"calculate", "research"}
+    assert {a.name for a in agent.sub_agents} == {"math"}
 
 
 def test_build_agent_peers_come_from_config_not_spec():
     # Even a normally-leaf agent gets peers if the config resolved some (e.g. via
     # an A2A_PEERS override): peers are attached uniformly from the resolver.
     agent = build_agent(AGENTS["research"], _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS))
-    assert _tool_names(agent) == {
-        "web_search",
-        "read_document",
-        "research",
-        "math",
-    }
+    assert _tool_names(agent) == {"web_search", "read_document", "research"}
+    assert {a.name for a in agent.sub_agents} == {"math"}
 
 
 def test_build_agent_unknown_tier_raises():

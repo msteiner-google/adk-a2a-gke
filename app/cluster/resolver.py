@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Resolve cluster peers into callable tools.
+"""Resolve cluster peers into remote sub-agents.
 
 The ``AgentResolver`` is the injectable "service discovery" layer for the
 cluster: given the ``ClusterConfig`` (which peers exist and where), it produces
-the tools a coordinating agent uses to delegate over A2A.
+the ``RemoteA2aAgent`` instances a coordinating agent delegates to over A2A.
 
 Discovery is **agent-card based**: for each peer we point ``RemoteA2aAgent`` at
 the peer's well-known agent-card URL. The A2A serving layer mounts the JSON-RPC
@@ -28,18 +28,35 @@ resolver appends the RPC path and the well-known card path to it. ADK fetches an
 validates that card lazily on first use, so constructing the remote agents here
 does no network I/O.
 
-**Peers resolve to tools, not sub-agents** (D1). Each remote agent is wrapped in
-a :class:`~app.cluster.peer_tool.PeerTool` carrying that peer's declared payload
-contract, so the caller sends an explicit typed request rather than its
-conversation history. See ``app/cluster/peer_tool.py`` for why, and
-``docs/design-decisions.md`` for the measurement.
+**How a peer is wired depends on whether it can suspend.** Neither wiring does
+both jobs, so the resolver picks per peer:
 
-**A declared contract is optional.** A peer with no entry in the payload mapping
-— typically an agent another squad owns, configured by URL through ``A2A_PEERS``
-— resolves to :class:`UnknownPeerRequest`, a correlation id plus one free-text
-task. That is a supported way to run, not a broken state: the peer's real schema
-is published in its own agent card, and this repo simply has no local model for
-it. ``app/agents/contracts.py`` describes the trade-off between the two tiers.
+* A peer that owns a gated tool becomes a **sub-agent**. In-task authorization
+  (A2A spec 7.6) suspends the specialist's Task in
+  ``TASK_STATE_AUTH_REQUIRED``, and for that to reach a human every agent in
+  between has to suspend too — "a chain of Tasks in
+  ``TASK_STATE_AUTH_REQUIRED``" (spec 7.6.2). ``AgentTool`` cannot carry that
+  chain: it runs the peer to exhaustion against a throwaway session and keeps
+  only ``state_delta``, ``error_message`` and ``content``
+  (``google/adk/tools/agent_tool.py``), never ``long_running_tool_ids``. A
+  suspended peer is then indistinguishable from one that answered with an empty
+  string. As a sub-agent, ``RemoteA2aAgent`` propagates the suspension and
+  records the remote ``task_id``, which is what makes the request reach a human
+  at all.
+
+* Every other peer stays an **``AgentTool``**, because ``transfer_to_agent`` is
+  a one-way handoff: the caller's invocation *ends*. Measured here — ``math``
+  transferred to ``currency``, currency answered, and math never resumed to add
+  the converted figure or publish it. A peer whose result the caller needs must
+  therefore be a tool, and a peer that can suspend must not be.
+
+The split is derived from the peers' own tools rather than declared twice: see
+``app/agents/gating.py`` and ``ClusterModule`` in ``app/cluster/di.py``. The
+cost of the sub-agent half, accepted deliberately, is that
+``transfer_to_agent`` carries no arguments — a specialist is reached with the
+caller's recent conversation rather than a typed payload, so it sees context it
+has no need for. ``docs/design-decisions.md`` records the original measurement
+against that and why authorization overrode it.
 """
 
 from __future__ import annotations
@@ -50,62 +67,37 @@ from google.adk.agents.remote_a2a_agent import (
     AGENT_CARD_WELL_KNOWN_PATH,
     RemoteA2aAgent,
 )
-from pydantic import BaseModel, Field
-
-from app.cluster.peer_tool import PeerTool
+from google.adk.tools.agent_tool import AgentTool
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable
 
     from app.cluster.config import ClusterConfig, PeerSpec
 
 
-class UnknownPeerRequest(BaseModel):
-    """Default contract for a peer with no declared model — free text, typed.
-
-    This is what delegation looks like when nobody declares anything: one
-    self-contained task in prose. Deliberately minimal rather than free-form —
-    the caller must still supply a correlation key and state the task in full,
-    so even an undeclared peer is delegated to explicitly instead of being
-    handed a transcript. Declare a model in ``app/agents/contracts.py`` to
-    replace this with named, validated fields.
-    """
-
-    case_id: str = Field(
-        description="Identifier correlating all work for one case or request."
-    )
-    task: str = Field(
-        description=(
-            "The complete, self-contained task for this agent. It cannot see "
-            "the conversation this request came from."
-        )
-    )
-
-
 class AgentResolver:
-    """Resolves configured peers into callable ``PeerTool`` instances.
+    """Resolves configured peers into ``RemoteA2aAgent`` sub-agents.
 
-    Construct it with a ``ClusterConfig`` and the payload contracts (usually via
-    dependency injection — see ``app/cluster/di.py``), then call
-    :meth:`resolve_all` to get every peer as a tool.
+    Construct it with a ``ClusterConfig`` (usually via dependency injection —
+    see ``app/cluster/di.py``), then call :meth:`resolve_all` to get every peer
+    as a sub-agent.
     """
 
     def __init__(
-        self,
-        config: ClusterConfig,
-        payload_schemas: Mapping[str, type[BaseModel]] | None = None,
+        self, config: ClusterConfig, suspending: Iterable[str] | None = None
     ) -> None:
         """Initialize the resolver.
 
         Args:
             config: The resolved cluster configuration listing reachable peers.
-            payload_schemas: Contract per peer name (``app/agents/contracts.py``
-                supplies these). A peer absent from the mapping falls back to
-                :class:`UnknownPeerRequest`. Passed in rather than imported so
-                this module stays free of any dependency on ``app.agents``.
+            suspending: Names of the peers that own a gated tool and can
+                therefore suspend awaiting a human. Passed in rather than
+                imported so this module keeps knowing nothing about
+                ``app.agents`` — importing it would cycle through
+                ``agents.base``. A peer not named here is reached as a tool.
         """
         self._config = config
-        self._payload_schemas: Mapping[str, type[BaseModel]] = payload_schemas or {}
+        self._suspending = frozenset(suspending or ())
 
     @property
     def config(self) -> ClusterConfig:
@@ -128,30 +120,18 @@ class AgentResolver:
         """
         return f"{peer.base_url}{self._config.rpc_path}{AGENT_CARD_WELL_KNOWN_PATH}"
 
-    def payload_schema(self, name: str) -> type[BaseModel]:
-        """Return the contract a named peer accepts.
+    def resolve_peer(self, peer: PeerSpec) -> RemoteA2aAgent:
+        """Build a ``RemoteA2aAgent`` for a single peer spec.
 
         Args:
-            name: The peer's name.
+            peer: The peer to address.
 
         Returns:
-            The peer's declared payload model, or :class:`UnknownPeerRequest`
-            when this repo has no local contract for it.
+            A ``RemoteA2aAgent`` pointed at the peer's agent card. The card
+            (and the peer's real description/capabilities) is resolved lazily by
+            ADK on first invocation, so this call does no network I/O.
         """
-        return self._payload_schemas.get(name, UnknownPeerRequest)
-
-    def resolve_peer(self, peer: PeerSpec) -> PeerTool:
-        """Build a typed ``PeerTool`` for a single peer spec.
-
-        Args:
-            peer: The peer to wrap.
-
-        Returns:
-            A ``PeerTool`` addressing the peer's agent card. The card (and the
-            peer's real description/capabilities) is resolved lazily by ADK on
-            first invocation, so this call does no network I/O.
-        """
-        remote = RemoteA2aAgent(
+        return RemoteA2aAgent(
             name=peer.name,
             agent_card=self.card_url(peer),
             description=(
@@ -159,24 +139,15 @@ class AgentResolver:
                 f"{peer.base_url}."
             ),
         )
-        return PeerTool(
-            remote,
-            payload_schema=self.payload_schema(peer.name),
-            description=(
-                f"Delegate a self-contained task to the '{peer.name}' specialist "
-                f"agent over A2A. It receives ONLY the fields below — it cannot "
-                f"see this conversation — so state everything it needs."
-            ),
-        )
 
-    def resolve(self, name: str) -> PeerTool:
+    def resolve(self, name: str) -> RemoteA2aAgent:
         """Resolve a single peer by name.
 
         Args:
             name: The peer name to look up in the configuration.
 
         Returns:
-            The peer as a ``PeerTool``.
+            The peer as a ``RemoteA2aAgent``.
 
         Raises:
             KeyError: If no peer with that name is configured.
@@ -186,11 +157,41 @@ class AgentResolver:
                 return self.resolve_peer(peer)
         raise KeyError(f"No peer named {name!r} in cluster configuration")
 
-    def resolve_all(self) -> list[PeerTool]:
-        """Resolve every configured peer into a callable tool.
+    def suspends(self, name: str) -> bool:
+        """Return whether a peer can suspend awaiting human authorization.
+
+        Args:
+            name: The peer's name.
 
         Returns:
-            A list of ``PeerTool`` instances, one per configured peer (empty
-            when no peers are configured).
+            True when that peer owns a gated tool.
         """
-        return [self.resolve_peer(peer) for peer in self._config.peers]
+        return name in self._suspending
+
+    def resolve_sub_agents(self) -> list[RemoteA2aAgent]:
+        """Resolve the peers that must be sub-agents.
+
+        Returns:
+            A ``RemoteA2aAgent`` per peer that can suspend, so an authorization
+            request it raises propagates to this agent instead of being
+            swallowed.
+        """
+        return [
+            self.resolve_peer(peer)
+            for peer in self._config.peers
+            if self.suspends(peer.name)
+        ]
+
+    def resolve_tools(self) -> list[AgentTool]:
+        """Resolve the peers that must be tools.
+
+        Returns:
+            An ``AgentTool`` per peer that cannot suspend, so the caller gets
+            its answer back and can carry on — which ``transfer_to_agent``
+            would not allow.
+        """
+        return [
+            AgentTool(self.resolve_peer(peer))
+            for peer in self._config.peers
+            if not self.suspends(peer.name)
+        ]

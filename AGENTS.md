@@ -17,17 +17,18 @@ GKE Autopilot with Terraform + Kustomize.
    user ───────────▶   │   orchestrator    │  tier=balanced
                        │  Deployment/Svc   │  holds the conversation
                        └─────────┬─────────┘
-        A2A — one typed payload per call, never the transcript
+        A2A — sub-agent if it can suspend, tool otherwise
       ┌──────────────┬───────────┼───────────────┐
       ▼              ▼           ▼               ▼
 ┌──────────┐   ┌──────────┐ ┌─────────┐    ┌──────────┐
 │ research │   │  math    │ │ planner │    │  trades  │  specialists
+│  tool    │   │sub-agent │ │  tool   │    │sub-agent │
 │ balanced │   │ balanced │ │balanced │    │ capable  │
 └──────────┘   └────┬─────┘ └─────────┘    └──────────┘
-                    │ A2A                   gated: a query
+                    │ A2A (tool)            gated: a query
                     ▼                       runs only after
               ┌──────────┐                  a human approves
-              │ currency │  tier=fast
+              │ currency │  tier=balanced
               └──────────┘  reached ONLY by math
 ```
 
@@ -35,18 +36,23 @@ GKE Autopilot with Terraform + Kustomize.
 so `orchestrator -> math -> currency` is an ordinary chain of A2A calls that
 needed no new machinery: an agent that coordinates is simply one whose
 `AgentSpec.peers` is non-empty, at any depth. The rules do not loosen further
-down — `currency` sees a `CurrencyRequest` and nothing about the sum `math` is
-computing, let alone the conversation the orchestrator is holding.
+down — `math` reaches `currency` exactly as the orchestrator reaches `math`.
 
-**The agents share no runtime state.** A specialist is reached with an explicit
-request and sees nothing else — no conversation history, no shared session
-state, no shared artifact handles. The *default* request is a single free-text
-task; every agent here opts into a typed contract from
-`app/agents/contracts.py` instead, which is a choice you can make per peer. Large
-inputs travel as object-store references it reads itself, and an action needing
-human sign-off is a proposal plus a durable case record rather than a suspended
-invocation. See [`docs/design-decisions.md`](docs/design-decisions.md) for the
-reasoning and the measurements behind it.
+**How a peer is reached depends on whether it can suspend.** A peer owning a
+`@gated` tool is a **sub-agent** (`transfer_to_agent`), because only that
+propagates an A2A task suspended awaiting human authorization. Every other peer
+is an **`AgentTool`**, because `transfer_to_agent` ends the caller's invocation
+and a caller that needs an answer would never get one. The split is derived
+from the registry by `suspending_agents()`, not declared twice.
+
+**The agents share no runtime state.** No shared session state, no shared
+artifact handles, no side channels. A gated peer does see the caller's recent
+conversation — the accepted cost of the sub-agent half above — and large inputs
+travel as object-store references it reads itself. An action needing human
+sign-off suspends its A2A task in `TASK_STATE_AUTH_REQUIRED` (A2A spec 7.6) and
+is resumed by a decision delivered straight to it. See
+[`docs/design-decisions.md`](docs/design-decisions.md) for the reasoning and the
+measurements behind all of it.
 
 **Shared *code* is fine and encouraged** — `app/shared/**` is a library every
 agent imports, and one another squad could vendor. The rule is about shared
@@ -114,16 +120,18 @@ Read the module docstrings; they are thorough. This is the index.
 | `app/agent.py` | Entry point. Calls `configure_observability()`, builds the `Injector`, selects this process's agent by `AGENT_NAME`, exports `root_agent` and `app = App(name="app")`. |
 | `app/agents/__init__.py` | **The registry.** `AGENTS: dict[str, AgentSpec]` + `DEFAULT_AGENT`. Single source of truth for which agents exist. |
 | `app/agents/base.py` | `AgentSpec` (frozen dataclass: name, description, instruction, tier, tools, peers) and the single `build_agent()`. `TIERS = ("fast","balanced","capable")`. |
-| `app/agents/contracts.py` | **The wire contracts.** One pydantic model per delegatable agent + `PAYLOADS`. The interface both a caller and a specialist agree on. Opt-in per agent: a peer with no model here is delegated to with a single free-text `task` instead (see its module docstring for the tiers). |
+| `app/agents/statuses.py` | **The status vocabulary.** `AWAITING_APPROVAL`, `REFUSED`, `NEEDS_INPUT`, `NEEDS_CONFIRMATION`, `PUBLISHED`, `EXECUTED` + the derived sets. Plain strings a non-ADK agent produces without importing anything. What remains of the deleted per-peer payload contracts. |
+| `app/agents/gating.py` | **The human-authorization gate.** `require_approval()` suspends the task and returns the decision when ADK re-executes the tool; `@gated` marks a tool, which is what makes its agent a sub-agent of its callers. |
 | `app/agents/documents.py` | `read_document` — reads a claim-check reference (`gs://…`) the caller passed in `document_refs`. |
 | `app/agents/reporting.py` | Makes a proposal survive the A2A text boundary instead of being paraphrased. **Two** callbacks: `attach_structured_results` (after-model) folds the JSON into the model's own reply so a turn stays *one* message; `restate_structured_results` (after-agent) is the fallback, and emits only what that reply does not already carry. |
 | `app/agents/orchestrator/agent.py` | `SPEC` with `peers=("research","math","planner","trades")`, `tier="balanced"`. |
 | `app/agents/research/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, tool `web_search`. |
-| `app/agents/math/agent.py` + `tools.py` | `tier="balanced"`, `peers=("currency",)`. Tools: `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. **Not a leaf** — it delegates conversions rather than applying a rate itself. |
+| `app/agents/math/agent.py` + `tools.py` | `tier="balanced"`, `peers=("currency",)`. Gated, so its callers reach it as a **sub-agent**. Tools: `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. **Not a leaf** — it delegates conversions rather than applying a rate itself. |
 | `app/agents/planner/` | Leaf agent, `tier="balanced"`, no tools. Drafts a plan and returns it for review. |
 | `app/agents/currency/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, reached only by `math`. Hardcoded USD-anchored rate table; every pair is derived from it, so no triangle of rates can disagree with itself. **Refuses rather than guesses**: an ambiguous term ("dollars" is six currencies) returns `needs_input`, an amount over `LARGE_AMOUNT_USD` returns `needs_confirmation`, and both carry a question for the user. |
 | `app/agents/trades/agent.py` + `tools.py` + `dataset.py` | Leaf agent, `tier="capable"`. Writes SQL against the `cymbal_investments.trade_capture_report` BigQuery public dataset; `run_trade_query` is the **second gated action**. `dataset.py` holds both the schema the instruction is built from and the one-table allow-list the validator enforces. |
-| `app/cluster/peer_tool.py` | `PeerTool` — an `AgentTool` that gives a remote peer a **typed payload declaration**, so delegation sends an explicit request instead of the transcript. |
+| `app/cluster/authorization.py` | Reports a suspended gated tool as `TASK_STATE_AUTH_REQUIRED` instead of the `input_required` ADK derives for any long-running call, via an `ExecuteInterceptor`. Also records the approval case. |
+| `app/cluster/grants.py` | Delivers a decision **straight to the agent that owns the suspended tool**. ADK cannot resolve a peer's confirmation locally, so a grant sent to the caller is silently dropped — see the module docstring. |
 | `app/cluster/cases.py` | The approval case store (`pending → approved → executed`), both backends (in-memory / `approval_cases`), and the helpers that read a proposal back out of a peer's text reply. |
 | `app/cluster/config.py` | **Pure stdlib** (no ADK/genai imports). `PeerSpec`, `ClusterConfig.from_env()`, `service_dns_url()`. Parses `AGENT_NAME` / `A2A_*`. |
 | `app/cluster/resolver.py` | `AgentResolver` — turns peers into `RemoteA2aAgent`s pointed at their well-known agent cards. No network I/O at construction (ADK resolves cards lazily). |
@@ -177,11 +185,12 @@ Read the module docstrings; they are thorough. This is the index.
 - `tests/unit/test_trades.py` — the same properties for the gated *read*, plus
   the SQL validator (a keyword inside a string literal is not a keyword; a
   comment cannot hide a second statement) and the full propose → approve →
-  re-send → `find_execution` round trip, including the negative case. The one
+  re-execute → `find_execution` round trip, including the negative case. The one
   function that would touch BigQuery is stubbed, which is why it exists.
 - `tests/unit/test_currency.py` — the conversions, the no-arbitrage property the
   USD-anchored table exists to give, and the wiring that lets `math` reach
-  `currency` as a `PeerTool` rather than a sub-agent.
+  `currency` as a tool rather than a sub-agent (it owns no gated tool, and
+  `math` needs its answer back).
 - `tests/unit/test_documents.py` — claim-check reads against `tmp_path`.
 - `tests/integration/` — `test_agent.py`, `test_server_e2e.py`. Needs a server.
 - `tests/eval/` — `eval_config.yaml`, `response_quality.py`, `datasets/`. Needs GCP creds.
@@ -252,31 +261,40 @@ Violating these is how this codebase breaks. They are deliberate.
    per-role builder or an orchestrator subclass.** This is also what makes depth
    free: `math` declares `currency` and becomes a caller as well as a callee,
    with no new type, no new code path and no change to `build_agent`.
-2. **Peers are TOOLS, never `sub_agents`.** `build_agent` puts resolved peers in
-   `tools` and leaves `sub_agents` empty. A peer in `sub_agents` is reached with
-   `transfer_to_agent`, and `RemoteA2aAgent` then rebuilds the outbound message
-   from the caller's **session events** — measured at ten message parts,
-   including the user's phone number and a different specialist's answer, where
-   the task needed one (`docs/design-decisions.md`, D1). A peer
-   in `tools` gets only the payload the caller composed. This looks like a
-   harmless wiring detail and is the most damaging thing in the repo to undo;
-   `tests/unit/test_peer_tool.py` guards it.
-3. **Every delegatable agent declares a contract in `app/agents/contracts.py` —
-   a policy of this repo, not a requirement of the mechanism.** Contracts are
-   **optional**. A peer with no entry in `PAYLOADS` is still reachable and still
-   answers; its tool falls back to `UnknownPeerRequest` (a `case_id` plus one
-   free-text `task`), which is the honest tier for a peer another squad owns
-   whose schema lives in its own agent card. Declare the contract for an agent
-   this repo owns: one free-text field is where a caller starts pasting the
-   conversation back in, which erodes invariant 2. The three tiers — session
-   transcript, free text, declared contract — are laid out in the
-   `app/agents/contracts.py` module docstring.
-   `test_agents.py::test_every_delegatable_agent_declares_a_contract` enforces
-   the policy; it is a repo convention you could drop, unlike invariant 2.
-4. **No implicit cross-agent context.** No shared session state, no shared
-   artifact handles, no transcript forwarding. Anything a specialist needs is a
-   field in its contract; large inputs travel as `document_refs` pointers, never
-   as content. A tool that stashes state for another agent to pick up is the
+2. **A peer's slot follows from whether it can suspend — never pick one by
+   taste.** `build_agent` puts a peer in `sub_agents` if that peer owns a
+   `@gated` tool, and in `tools` otherwise. `suspending_agents()` derives the
+   split from the registry; marking a tool `@gated` is the single act that
+   wires its agent correctly. Both uniform rules were tried and each breaks
+   something:
+   - *All tools*: `AgentTool` runs the peer to exhaustion and never reads
+     `long_running_tool_ids`, so a peer suspended awaiting human authorization
+     returns the empty string and the caller carries on. Every authorization
+     request is silently swallowed.
+   - *All sub-agents*: `transfer_to_agent` is a one-way handoff — the caller's
+     invocation **ends**. Measured: `math` transferred to `currency`, the
+     conversion succeeded, and the sum was abandoned with no addition, no
+     publish and no case.
+
+   `tests/unit/test_agents.py` and `test_cluster_resolver.py` guard the split;
+   `test_every_tool_that_asks_for_approval_is_marked_gated` reads the source of
+   every registered tool and fails if a gated one is missing its marker. That
+   omission is the dangerous one: it wires the agent as a tool and swallows
+   every request for approval.
+3. **A gated effect is unreachable without a decision — the task state is not
+   the gate.** A2A spec 7.6.4 says `TASK_STATE_AUTH_REQUIRED` "by itself"
+   authorises nothing, and that an implementation must define how the
+   authorized operation is checked before it is performed. Here that is the
+   branch on `Approval.granted` inside the tool (`app/agents/gating.py`).
+   Suspending is how the human is *asked*. Adding a second path that acts
+   without that branch removes the guarantee entirely, however well the prompt
+   is worded — and so does trusting the task state in its place, since anything
+   able to resume a task could then perform the effect.
+4. **No implicit cross-agent context.** No shared session state and no shared
+   artifact handles. A gated peer does receive the caller's recent conversation
+   — that is the accepted cost of the sub-agent half of invariant 2 — but
+   nothing is passed by side channel, and large inputs travel as `gs://`
+   pointers, never as content. A tool that stashes state for another agent to pick up is the
    thing to reject in review — D3 measured that the transport does not carry it,
    so it cannot work as advertised.
 5. **`agents/` = who the agents are. `cluster/` = the plumbing.** Keep config,
@@ -529,7 +547,7 @@ These are real traps that have bitten this codebase.
   makes the JSON survive intact so the relay cannot quietly become a paraphrase.
 
 - **`reporting.py` has to scan INSIDE a peer's reply, not just its own tools.**
-  A peer reached through `PeerTool` answers as text, and ADK delivers it as
+  A peer's reply crosses A2A as text, and ADK delivers a tool result as
   `{"result": "<the peer's text>"}` — `FunctionResponse.response` is typed
   `dict | None`, so the peer's JSON is a value inside the wrapper, never the
   payload. Without scanning that string, anything raised two hops down
@@ -550,9 +568,9 @@ These are real traps that have bitten this codebase.
   reply straight back.
 
 - **`AUDITED_STATUSES` is derived from the contract vocabulary, not written
-  out.** It was a literal `{approval_required, published}` when the `trades`
+  out.** It was a literal `{"approval_required", "published"}` when the `trades`
   agent landed, so a gated *read* reporting `executed` was silently not
-  restated. Add a status to `app/agents/contracts.py` and it is audited
+  restated. Add a status to `app/agents/statuses.py` and it is audited
   everywhere; hardcode one and you get a flow that works until the model has an
   off day.
 
@@ -562,22 +580,25 @@ These are real traps that have bitten this codebase.
   approved proposal. A new gated action that invents its own success string runs
   perfectly and is reported as `approved_not_confirmed` — a vocabulary bug
   wearing a model bug's clothes. Add the status to the frozenset in
-  `app/agents/contracts.py`.
+  `app/agents/statuses.py`.
 
-- **A gated action whose input is not reproducible must carry it back.**
-  `publish_result` recomputes from `expression`; `run_trade_query` cannot,
-  because a model asked the same question twice writes different SQL. So the
-  approved `sql` travels in the re-sent request and the tool refuses to run
-  without it, and the tool canonicalises it so a reflowed re-send still matches
-  what was approved. Do not "fix" a mismatch by loosening the comparison —
-  canonicalise at the source instead, or the check stops catching a genuinely
-  different action.
+- **A gated tool that normalises its input must declare the normalised values.**
+  Pass them as `require_approval(..., proposal=...)`. Without it the case
+  records the model's raw arguments while the tool acts on the canonical ones,
+  and the caller correctly refuses to confirm a perfectly good execution.
+  Measured twice: `391000000.0` against `391000000`, then `88000.0` against
+  `88000`. Do not "fix" a mismatch by loosening the comparison — canonicalise
+  at the source, or the check stops catching a genuinely different action.
+  (Nothing has to travel back any more: ADK re-executes the suspended call
+  itself, so the approved arguments *are* the arguments that run.)
 
-- **The gate is that the effect is unreachable without an approver**, not an
-  instruction the model is asked to follow. `publish_result` returns a proposal
-  when `approved_by` is empty and only performs the write when it is set. Adding
-  a second code path that publishes without that check removes the guarantee
-  entirely, however well the prompt is worded.
+- **The gate is the branch on the decision, not the task state.** A2A spec
+  7.6.4 says `TASK_STATE_AUTH_REQUIRED` authorises nothing by itself.
+  `publish_result` returns without acting while `Approval.pending` is set and
+  performs the write only once `granted` is true. Adding a second code path
+  that acts without that check removes the guarantee entirely, however well the
+  prompt is worded — and so does trusting the task state in its place, since
+  anything able to resume a task could then perform the effect.
 
 - **Execution is confirmed by comparing content, not by trusting prose.**
   `cases.find_execution` accepts a result only if the values it reports match
@@ -717,16 +738,17 @@ Full walkthrough, checklist, and troubleshooting table:
 1. `app/agents/<name>/` with `__init__.py` (**needs a docstring** — `D104`),
    `tools.py`, and `agent.py` exposing `SPEC = AgentSpec(...)`.
 2. Register it in `app/agents/__init__.py` (`AGENTS`).
-3. **Declare its contract** in `app/agents/contracts.py`: a `PeerRequest`
-   subclass with a `Field(description=...)` on every field, added to `PAYLOADS`.
-   Those descriptions are the only instructions a caller's model gets about how
-   to call it. Optional in the mechanism — skip it and the agent is delegated to
-   with a single free-text `task` — but required by this repo's policy and its
-   test (invariant 3).
+3. **If it gates an effect**, write the tool with `require_approval()` and mark
+   it `@gated` (`app/agents/gating.py`). That marker is what makes the agent a
+   sub-agent of its callers; without it every authorization request it raises is
+   swallowed. Report a success status that is in
+   `statuses.EFFECT_PERFORMED`, or a correct execution is reported as
+   `approved_not_confirmed`.
 4. If an existing agent should delegate to it, add the name to that agent's
    `AgentSpec.peers`.
-5. Update **two** tests in `tests/unit/test_agents.py`:
-   `test_registry_lists_expected_agents` and `test_declared_peer_topology`.
+5. Update the tests in `tests/unit/test_agents.py`:
+   `test_registry_lists_expected_agents`, `test_declared_peer_topology`, and —
+   if it is gated — `test_the_split_is_derived_from_the_gated_tools`.
 6. Cluster only — five files:
    - `infra/terraform/variables.tf` → add to `var.agents`, then `terraform apply`
      (creates the GSA, IAM roles, WI binding, and AlloyDB user via `for_each`).

@@ -20,11 +20,14 @@ strategy C of the coroutine-based HITL design, and it went when that design did:
 see ``docs/design-decisions.md`` for why, and ``docs/design-decisions.md``
 for the evidence that motivated the change.
 
-What replaces it is simpler and framework-neutral: the planner **drafts and
-returns**. It holds nothing open, so a review that takes a week costs nothing.
-The human step happens where it belongs — in the caller's business workflow,
-against a case record — and a revision is an ordinary second call carrying the
-reviewer's feedback in the payload.
+What replaces it is simpler: the planner **drafts and returns**. It holds
+nothing open, so a review that takes a week costs nothing, and a revision is an
+ordinary second hand-off carrying the reviewer's feedback.
+
+Note this agent is deliberately NOT gated. A plan is a document, not an effect;
+there is nothing to make unreachable, so ``app/agents/gating.py`` has no part to
+play here. Gating is for an action that changes something — see ``math`` and
+``trades``.
 """
 
 from __future__ import annotations
@@ -38,18 +41,17 @@ SPEC = AgentSpec(
         "wants a plan they can approve or amend before it is acted on."
     ),
     instruction=(
-        "You are a planning specialist. You receive a JSON request with an "
-        "`objective`, an optional `constraints` field, and a `case_id`.\n\n"
+        "You are a planning specialist. You are handed an objective from the "
+        "conversation you can see.\n\n"
         "- Produce a concise, numbered plan that achieves the objective and "
-        "respects every constraint.\n"
+        "respects every stated constraint.\n"
         "- Each step must be concrete enough for someone else to execute "
         "without asking you what you meant.\n"
-        "- Where a step is risky or irreversible, say so on the step itself, so "
-        "a reviewer can see what they are approving.\n"
-        "- If the request carries reviewer feedback on an earlier draft, "
+        "- Where a step is risky or irreversible, say so on the step itself, "
+        "so a reviewer can see what they are approving.\n"
+        "- If the conversation carries reviewer feedback on an earlier draft, "
         "produce the revised plan and note briefly what changed.\n"
-        "- The request is all the context you have: you cannot see the "
-        "conversation it came from. Return the plan as plain text."
+        "- Return the plan as plain text."
     ),
     tier="balanced",
 )

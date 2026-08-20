@@ -26,13 +26,7 @@ from typing import cast
 
 import pytest
 
-from app.agents import AGENTS, PAYLOADS, build_agent
-from app.agents.contracts import (
-    NEEDS_CONFIRMATION,
-    NEEDS_INPUT,
-    CurrencyRequest,
-    MathRequest,
-)
+from app.agents import AGENTS, build_agent, suspending_agents
 from app.agents.currency.tools import (
     RATES_AS_OF,
     convert_currency,
@@ -41,8 +35,8 @@ from app.agents.currency.tools import (
     supported_currencies,
 )
 from app.agents.reporting import AUDITED_STATUSES
+from app.agents.statuses import NEEDS_CONFIRMATION, NEEDS_INPUT
 from app.cluster.config import ClusterConfig, PeerSpec
-from app.cluster.peer_tool import PeerTool
 from app.cluster.resolver import AgentResolver
 from app.shared.config import Models
 
@@ -158,7 +152,6 @@ def test_the_currency_agent_is_a_leaf_with_its_own_tools():
                 peer_port=80,
                 peers=(),
             ),
-            payload_schemas=PAYLOADS,
         ),
     )
     assert agent.sub_agents == []
@@ -168,35 +161,27 @@ def test_the_currency_agent_is_a_leaf_with_its_own_tools():
     assert names == {"convert_currency", "list_supported_currencies"}
 
 
-def test_math_reaches_currency_as_a_typed_tool_not_a_sub_agent():
-    # The D1 invariant has to hold at every depth, not just below the
-    # orchestrator. A peer in `sub_agents` is reached with transfer_to_agent,
-    # which rebuilds the outbound message from the CALLER's session events --
-    # here that would hand the currency agent the math agent's transcript.
+def test_math_reaches_currency_as_a_tool_not_a_sub_agent():
+    # currency owns no gated tool, so it never suspends -- and math NEEDS its
+    # answer back to finish the sum. As a sub-agent it could not give one:
+    # transfer_to_agent ends the caller's invocation. Measured -- math handed
+    # off, currency converted, and the total was never computed or published.
     agent = build_agent(
         AGENTS["math"],
         _FAKE_MODELS,
-        AgentResolver(_MATH_CONFIG, payload_schemas=PAYLOADS),
+        AgentResolver(_MATH_CONFIG, suspending=suspending_agents()),
     )
     assert agent.sub_agents == []
-    peers = [t for t in agent.tools if isinstance(t, PeerTool)]
-    assert [t.name for t in peers] == ["currency"]
-    assert peers[0].payload_schema is CurrencyRequest
-
-
-def test_the_currency_contract_names_the_conversion_and_nothing_else():
-    # No free-text field: the moment one exists, a caller starts pasting the
-    # conversation into it (see app/agents/contracts.py). `confirmed` is the
-    # user's answer to a question this agent asked, not a place for context.
-    fields = set(CurrencyRequest.model_fields)
-    assert fields == {
-        "case_id",
-        "document_refs",
-        "amount",
-        "from_currency",
-        "to_currency",
-        "confirmed",
+    tool_names = {
+        getattr(t, "name", None) or getattr(t, "__name__", "?") for t in agent.tools
     }
+    assert "currency" in tool_names
+
+
+def test_currency_is_not_wired_as_a_suspending_peer():
+    # The rule that decides the slot above. If currency ever gains a gated
+    # tool this flips, and math must become unable to use its answer directly.
+    assert "currency" not in suspending_agents()
 
 
 # --- Refusing rather than guessing --------------------------------------------
@@ -299,42 +284,22 @@ def test_both_questions_survive_the_a2a_boundary():
     assert NEEDS_CONFIRMATION in AUDITED_STATUSES
 
 
-def test_the_contract_carries_the_users_answer_back_down():
-    # Ambiguity is answered by naming the currency; a large amount by a flag.
-    # Both travel through math, which is why MathRequest mirrors the flag.
-    assert (
-        CurrencyRequest(
-            case_id="c1", amount=1.0, from_currency="dollars", to_currency="EUR"
-        ).confirmed
-        is False
-    )
-    assert MathRequest(case_id="c1", expression="1+1").currency_confirmed is False
-    assert (
-        MathRequest(
-            case_id="c1", expression="1+1", currency_confirmed=True
-        ).currency_confirmed
-        is True
-    )
-
-
-def test_no_contract_on_the_path_to_currency_demands_a_code():
-    # Regression, found in the cluster and not by any test here. Both contracts
-    # are instructions to a model, and they contradicted each other: the
-    # currency contract said "pass the user's own word", while
-    # MathRequest.expression said "tag each amount with its own ISO-4217 code".
-    # The orchestrator never calls currency directly -- it calls math -- so the
-    # math wording won, "dollars" was silently resolved to USD one hop above the
-    # only agent holding the list, and the question was never asked.
+def test_no_instruction_on_the_path_to_currency_resolves_the_word_itself():
+    # Regression, found in the cluster and not by any test here. "dollars" is
+    # six currencies, and only this agent holds the list -- so any agent above
+    # it that maps the word to a code silently answers a question that should
+    # have been asked. It happened once already, one hop up in math.
     #
-    # Asserting on a description string is unusual and correct here: for a peer
-    # tool these strings ARE the interface, and this one is load-bearing.
-    expression = MathRequest.model_fields["expression"].description or ""
-    assert "own wording" in expression.lower()
-    assert "do not resolve" in expression.lower()
+    # This used to assert on the peer contracts' field descriptions. Those are
+    # gone (peers are sub-agents now, and transfer_to_agent carries no typed
+    # arguments), so the same rule now lives where a model will actually read
+    # it: the instruction text. Asserting on prose is unusual and correct here
+    # -- with no schema in between, the instruction IS the interface.
+    math_instruction = AGENTS["math"].instruction.lower()
+    assert "user's own word" in math_instruction
 
-    for field in ("from_currency", "to_currency"):
-        described = CurrencyRequest.model_fields[field].description or ""
-        assert "own word" in described.lower()
+    currency_instruction = AGENTS["currency"].instruction.lower()
+    assert "resolving it yourself" in currency_instruction
 
 
 def test_money_reaches_the_currency_specialist_even_with_no_conversion():
@@ -344,9 +309,11 @@ def test_money_reaches_the_currency_specialist_even_with_no_conversion():
     # all in the same currency", which meant "500M dollars" -- one currency, no
     # conversion needed -- was added up as plain arithmetic: the ambiguous word
     # was never questioned and the size threshold was never applied.
-    described = MathRequest.model_fields["target_currency"].description or ""
-    assert "money at all" in described.lower()
-    assert "same currency" in described.lower()
+    # Re-pointed from the deleted MathRequest.target_currency description to
+    # the instruction, which is now the only place the rule is stated.
+    described = AGENTS["math"].instruction.lower()
+    assert "including an amount already in the target currency" in described
+    assert "not a no-op" in described
 
 
 def test_a_same_currency_call_still_checks_the_amount():

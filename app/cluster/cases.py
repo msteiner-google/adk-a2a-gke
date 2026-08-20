@@ -64,7 +64,7 @@ from typing import TYPE_CHECKING, Any
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-from app.agents.contracts import APPROVAL_REQUIRED, EFFECT_PERFORMED
+from app.agents.statuses import AWAITING_APPROVAL, EFFECT_PERFORMED
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -134,6 +134,21 @@ class ApprovalCase:
     result: dict[str, Any] | None = None
     """What the specialist returned when the approved action was executed."""
 
+    owner_task_id: str = ""
+    """The A2A task, on the owning agent, that is suspended awaiting this
+    decision. A grant is delivered here rather than to the caller that relayed
+    the request -- see ``app/cluster/grants.py`` for why the two directions are
+    asymmetric."""
+
+    owner_context_id: str = ""
+    """The context of :attr:`owner_task_id`. Sent alongside it because A2A
+    requires the pair to agree when both are supplied."""
+
+    confirmation_id: str = ""
+    """The id of the suspended ``adk_request_confirmation`` call. The decision
+    is addressed to this id; without it the owner cannot match the answer to
+    the pending tool call."""
+
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     decided_at: datetime | None = None
     executed_at: datetime | None = None
@@ -160,6 +175,8 @@ class ApprovalCase:
             "decided_by": self.decided_by,
             "note": self.note,
             "result": self.result,
+            "owner_task_id": self.owner_task_id,
+            "confirmation_id": self.confirmation_id,
             "created_at": stamp(self.created_at),
             "decided_at": stamp(self.decided_at),
             "executed_at": stamp(self.executed_at),
@@ -325,6 +342,12 @@ CASES = sa.Table(
     sa.Column("decided_by", sa.String(256), nullable=False),
     sa.Column("note", sa.Text(), nullable=False),
     sa.Column("result", _json_type(), nullable=True),
+    # Where a grant is delivered. Non-null with a "" default rather than
+    # nullable, so the dataclass and the table agree field-for-field and
+    # test_cases.py::test_table_columns_match_the_dataclass keeps holding.
+    sa.Column("owner_task_id", sa.String(128), nullable=False, server_default=""),
+    sa.Column("owner_context_id", sa.String(128), nullable=False, server_default=""),
+    sa.Column("confirmation_id", sa.String(128), nullable=False, server_default=""),
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("decided_at", sa.DateTime(timezone=True), nullable=True),
     sa.Column("executed_at", sa.DateTime(timezone=True), nullable=True),
@@ -370,6 +393,9 @@ def _row_to_case(row: sa.Row[Any]) -> ApprovalCase:
         decided_by=mapping["decided_by"],
         note=mapping["note"],
         result=mapping["result"],
+        owner_task_id=mapping["owner_task_id"],
+        owner_context_id=mapping["owner_context_id"],
+        confirmation_id=mapping["confirmation_id"],
         created_at=_as_utc(mapping["created_at"]),
         decided_at=_as_utc(mapping["decided_at"]),
         executed_at=_as_utc(mapping["executed_at"]),
@@ -410,6 +436,9 @@ class DatabaseCaseStore(CaseStore):
                     session_id=case.session_id,
                     decided_by=case.decided_by,
                     note=case.note,
+                    owner_task_id=case.owner_task_id,
+                    owner_context_id=case.owner_context_id,
+                    confirmation_id=case.confirmation_id,
                     created_at=case.created_at,
                 )
             )
@@ -568,7 +597,7 @@ def find_proposals(texts: Sequence[str]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     for text in texts:
         for obj in _json_objects_in(text):
-            if obj.get("status") != APPROVAL_REQUIRED:
+            if obj.get("status") != AWAITING_APPROVAL:
                 continue
             proposal = obj.get("proposal")
             if not isinstance(proposal, dict):
@@ -593,7 +622,7 @@ def find_execution(
     against the record the caller already holds, with nothing extra on the wire.
 
     Which statuses count as "it happened" comes from
-    :data:`~app.agents.contracts.EFFECT_PERFORMED`, not from a literal here: a
+    :data:`~app.agents.statuses.EFFECT_PERFORMED`, not from a literal here: a
     gated *write* reports ``published`` and a gated *read* reports ``executed``,
     and this function stays indifferent to which specialist it is confirming.
 
@@ -643,6 +672,105 @@ def case_from_proposal(
         proposal=proposal,
         session_id=session_id,
     )
+
+
+def case_from_confirmation(
+    call: dict[str, Any],
+    *,
+    session_id: str,
+    case_id: str,
+    agent: str,
+    owner_task_id: str,
+    owner_context_id: str,
+) -> ApprovalCase:
+    """Build a case from a suspended ``adk_request_confirmation`` call.
+
+    The proposal is taken from the pending call's own arguments, which is the
+    point: it is generated by ADK from the invocation that is actually
+    suspended, so it cannot describe something other than what will run if the
+    case is approved. The previous design asked a model to restate its proposal
+    as JSON and parsed it back out of prose, which is how a proposal and its
+    execution could quietly disagree.
+
+    Args:
+        call: The ``adk_request_confirmation`` payload, carrying
+            ``originalFunctionCall`` and ``toolConfirmation``.
+        session_id: The conversation it arose in.
+        case_id: The wider unit of work it belongs to.
+        agent: The agent that owns the suspended tool.
+        owner_task_id: That agent's suspended A2A task.
+        owner_context_id: The context of ``owner_task_id``.
+
+    Returns:
+        A pending :class:`ApprovalCase`.
+    """
+    args = dict(call.get("args") or {})
+    original = dict(args.get("originalFunctionCall") or {})
+    confirmation = dict(args.get("toolConfirmation") or {})
+    action = str(original.get("name", ""))
+    # Prefer the payload the tool supplied: it holds the values the tool will
+    # actually act on, already canonicalised. `originalFunctionCall.args` is the
+    # model's raw spelling, which a tool that normalises its inputs will not
+    # reproduce -- and find_execution would then refuse a correct execution.
+    declared = confirmation.get("payload")
+    proposal = (
+        dict(declared)
+        if isinstance(declared, dict) and declared
+        else dict(original.get("args") or {})
+    )
+    # `action` is the tool that will run; keep it inside the proposal too so
+    # find_execution can match it against the result the tool reports.
+    proposal.setdefault("action", action)
+    return ApprovalCase(
+        case_id=case_id,
+        proposal_id=new_proposal_id(),
+        agent=agent,
+        action=action,
+        summary=str(confirmation.get("hint", "")),
+        proposal=proposal,
+        session_id=session_id,
+        owner_task_id=owner_task_id,
+        owner_context_id=owner_context_id,
+        confirmation_id=str(call.get("id", "")),
+    )
+
+
+def task_texts(task: dict[str, Any]) -> list[str]:
+    """Flatten an A2A task into the strings :func:`find_execution` scans.
+
+    A tool's result crosses A2A as a data part inside the task's history, not
+    as prose, so the JSON has to be recovered from both the status message and
+    every historical message before it can be matched against the approved
+    proposal.
+
+    Args:
+        task: A task as returned by ``SendMessage`` / ``GetTask``.
+
+    Returns:
+        Every text and every serialized data payload found in the task, with a
+        function response's ``response`` object emitted separately as well.
+    """
+    found: list[str] = []
+    messages = [*(task.get("history") or [])]
+    status_message = (task.get("status") or {}).get("message")
+    if status_message:
+        messages.append(status_message)
+    for message in messages:
+        for part in message.get("parts") or []:
+            if text := part.get("text"):
+                found.append(str(text))
+            data = part.get("data")
+            if data is None:
+                continue
+            found.append(json.dumps(data))
+            # A tool's result arrives wrapped as
+            # {"name": ..., "id": ..., "response": {...}}. `_json_objects_in`
+            # decodes the outer object and moves past it, so the result would
+            # never be seen on its own -- and a genuine execution would be
+            # reported as unconfirmed. Emit the inner object too.
+            if isinstance(data, dict) and isinstance(data.get("response"), dict):
+                found.append(json.dumps(data["response"]))
+    return found
 
 
 def execution_instruction(case: ApprovalCase) -> str:

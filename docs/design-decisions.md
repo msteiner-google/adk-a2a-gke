@@ -4,7 +4,7 @@ Why this cluster is built the way it is, and the measurements behind each
 choice. [GKE.md](../GKE.md) describes *what* the architecture is; this file
 records *why*, including the alternatives that were tried and rejected.
 
-Read it before changing anything in `app/cluster/` or `app/agents/contracts.py`.
+Read it before changing anything in `app/cluster/` or `app/agents/gating.py`.
 Several decisions here look like incidental wiring and are not — reversing them
 reintroduces failures that took real effort to find. The numbered decisions
 **D1**–**D6** are cited from the code and from AGENTS.md's invariants.
@@ -34,71 +34,94 @@ That is not an argument against shared *code*:
 | Layer | Shared? | Why |
 | --- | --- | --- |
 | `app/shared/**` | **Yes, deliberately** | A library, at the bottom of the dependency graph, kept portable to Python 3.11 so another squad can vendor it. Its `traceparent` wiring is the framework-agnostic piece of the blueprint. |
-| `app/agents/contracts.py` | **Yes, deliberately — and optional** | The interface definition — the same kind of artefact as a `.proto`. Opt-in per peer: without a model here, delegation falls back to a free-text task (see D1). A non-ADK squad reads the equivalent JSON Schema from the agent card instead. |
+| `app/agents/statuses.py` | **Yes, deliberately** | The status vocabulary a specialist reports and a caller keys on. Plain strings, so an agent on another framework produces them without importing anything. What remains of the deleted per-peer payload contracts (D1). |
 | AlloyDB instance | Yes, for cost | Isolation is already at the schema + IAM level (`app/cluster/db.py`, `infra/terraform/alloydb.tf`). One instance is a prototype decision; a squad wanting its own runs its own. |
 | Session state, conversation, artifacts | **No** | D1–D4 below. |
 | Execution state across a hop | **No** | D5. |
 
 ---
 
-## D1 — Peers are tools, never sub-agents
+## D1 — A peer's wiring follows from whether it can suspend
 
-`build_agent` puts resolved peers in `tools` and leaves `sub_agents` empty.
+`build_agent` puts a peer in `sub_agents` if that peer owns a `@gated` tool, and
+in `tools` otherwise. The split is derived by `suspending_agents()` from the
+registry, not declared twice.
 
-**Why it matters.** A peer in `sub_agents` is reached with `transfer_to_agent`,
-and `RemoteA2aAgent` then rebuilds the outbound message from the caller's
-*session events*. Measured on this repo's own agents, with an identical two-turn
-conversation and only the wiring differing:
+This reverses an earlier invariant ("peers are tools, never sub-agents"). The
+measurement that motivated it still stands and is kept below; what changed is
+that a second requirement arrived which the old rule made impossible.
 
-| | `sub_agents` | `PeerTool` |
+### Why a gated peer must be a sub-agent
+
+In-task authorization (A2A spec 7.6) suspends the *specialist's* Task in
+`TASK_STATE_AUTH_REQUIRED`, and spec 7.6.2 expects that suspension to propagate
+to whoever can reach a human.
+
+`AgentTool` cannot propagate it. It runs the peer to exhaustion against a
+throwaway in-memory session and keeps exactly three things off the resulting
+events — `state_delta`, `error_message`, `content`
+(`google/adk/tools/agent_tool.py`). It never reads `long_running_tool_ids`. A
+suspended peer therefore returns the empty string, and the caller carries on as
+though the peer simply had nothing to say. There is no hook to change that from
+outside ADK.
+
+### Why every other peer must be a tool
+
+`transfer_to_agent` is a one-way handoff: the caller's invocation **ends**.
+Measured here, with `currency` wired as a sub-agent of `math`:
+
+```
+[3] transfer_to_agent {"agent_name": "currency"}
+[5] convert_currency  {"amount": 500.0, "from_currency": "USD", ...}
+[6] convert_currency  -> 458.72 EUR
+[7] "500 USD converts to 458.72 EUR …"      <- and that is the whole answer
+```
+
+Math never resumed. The conversion succeeded and the sum was abandoned
+half-done — no addition, no `publish_result`, no case. A caller that needs a
+peer's answer cannot hand control away to get it.
+
+So neither wiring does both jobs, and a uniform rule breaks one of them.
+
+### What the sub-agent half costs
+
+The original measurement, unchanged. Identical two-turn conversation, only the
+wiring differing:
+
+| | `sub_agents` | typed tool |
 | --- | --- | --- |
 | message parts sent to the peer | **8–10** | **1** |
 | user's phone number included | **yes** | no |
 | a different specialist's answer included | **yes** | no |
-| caller can see the peer's result | **no** | `function_response -> dict` |
 
 ```
-sub_agents outbound:                    PeerTool outbound:
-  "Hi, I'm Marc. My mobile is             {"case_id": "…",
-   +353 87 555 0101 …"                     "expression": "17 * 23",
-  "For context:"                           "publish_as": "q3-revenue"}
-  "[orchestrator] said: … Thanks for
-    sharing your number!"
-  "Thanks. Now work out 17 * 23…"
+sub_agents outbound:
+  "Hi, I'm Marc. My mobile is +353 87 555 0101 …"
   "For context:"
-  "[orchestrator] called tool
-    `transfer_to_agent` …"
+  "[orchestrator] said: … Thanks for sharing your number!"
+  "Thanks. Now work out 17 * 23…"
   …
 ```
 
-Three distinct problems in one output: personal data reaching an agent with no
-need for it, nine of ten parts diluting attention (ADK even prefixes them
-`For context:`), and the whole transcript re-sent to every specialist on every
-turn.
+Personal data reaching an agent with no need for it, nine of ten parts diluting
+attention, and the transcript re-sent on every turn. That cost is now **accepted
+deliberately** for gated peers only, on the customer's explicit decision, and it
+is the price of being able to ask a human at all. It does not apply to the tool
+half, which still sends one composed request.
 
-**Also worse where it looks better.** Under `sub_agents` control *transfers* —
-the specialist's reply goes to the user, and the caller's inbound structure is
-only `function_response(transfer_to_agent) -> {'result': None}`. The caller
-never sees the specialist's result, which makes recording an approval (D5)
-impossible.
+The typed payload contracts that used to make that request precise
+(`app/agents/contracts.py`, `PeerTool`) are **deleted**: `transfer_to_agent`
+carries no arguments, so there was nothing left for a per-peer request model to
+describe. What survives is the status vocabulary, in `app/agents/statuses.py`.
 
-This was re-tested after the HITL redesign removed the other objection to
-`sub_agents`, in case that changed the calculus. It does not: the leak is a
-property of `transfer_to_agent`, unrelated to HITL.
+One consequence worth stating: a rule that used to be enforced by a field
+description is now enforced by instruction text. `MathRequest.expression` said
+"pass the user's own wording, do not resolve it"; that now lives in the `math`
+instruction, and `test_currency.py` asserts on the prose. Verified live — an
+ambiguous `"dollars"` still reaches `currency` verbatim and still comes back as
+a question.
 
-**The typed contract is a separate and optional decision.** Peers-as-tools is
-the invariant; declaring a payload model is not. A peer with no entry in
-`PAYLOADS` falls back to `resolver.UnknownPeerRequest` — a `case_id` plus one
-free-text `task` — and that already delivers the table above, because the win
-comes from the caller *composing a payload* rather than from the payload being
-typed. Declaring a model in `app/agents/contracts.py` buys three further things:
-the calling model sees documented parameters instead of guessing what to write,
-a malformed request is rejected in-process rather than several hops away, and
-the schema is published in the agent card for a non-ADK caller to read. This
-repo declares one for every agent it owns; a peer another squad owns is
-perfectly well delegated to in free text.
-
-Guarded by `tests/unit/test_peer_tool.py`.
+Guarded by `tests/unit/test_agents.py` and `tests/unit/test_cluster_resolver.py`.
 
 ## D2 — Continuity is declared, not implicit
 
@@ -152,61 +175,104 @@ blobs by app name + user + session — sharing one means sharing a session.
 `ARTIFACT_STORAGE_URI` remains for an agent's own storage and no longer needs to
 match across agents.
 
-## D5 — Human approval is business state, not a suspended invocation
+## D5 — Human approval is in-task authorization, gated in code
 
-A specialist that must not act alone returns a proposal and **finishes**. The
-caller records an `approval_cases` row, answers the user, and stops. The
-approved action is an ordinary later call.
+A specialist that must not act alone **suspends its A2A Task** in
+`TASK_STATE_AUTH_REQUIRED` (A2A spec 7.6). The request bubbles up to the agent
+talking to the human, which records an `approval_cases` row. The decision is
+delivered straight back to the suspended task, and ADK re-executes the tool.
 
 ```
-pending ──decide (one conditional UPDATE)──▶ approved ──execute──▶ executed
-     │                                                                ▲
-     └──────────────────────────▶ rejected     re-drivable ───────────┘
+math suspends ──▶ orchestrator AUTH_REQUIRED ──▶ case row ──▶ human
+                                                               │
+math re-executes ◀── grant delivered to math's task ◀──────────┘
 ```
 
-### Why not suspend the invocation instead
+This replaces an earlier design in which a specialist returned a proposal,
+finished, and the approved action was an ordinary later call. That version
+worked; it was replaced because a proposal-and-re-send handshake is invisible to
+a client. A caller could not tell "waiting on a human" from "answered", and
+nothing in the protocol said so. `TASK_STATE_AUTH_REQUIRED` is the standard way
+to say it, and it is what a non-ADK client can act on.
 
-The obvious alternative — ADK supports it — is to freeze the invocation across
-the A2A hop and replay it once the human answers. It was built end to end here
-and measured before this state machine replaced it, so the objection is not
-theoretical. It works, and it costs a reclaimable lease, a heartbeat, a
-background sweeper and a workaround pinned to one ADK version. The decisive
-failure: **a decision could take effect while its answer never reached the
-user**, because the peer's A2A task had gone terminal and the reply could not be
-replayed. That is not a bug with a fix — it is structural to replaying a
-distributed execution stack. It is also unimplementable by a squad not using
-ADK.
+### The two directions are asymmetric, and that is forced
 
-Waiting as a row has none of it. An approval taking a fortnight costs what one
-taking a second costs, any replica can decide any case, and there is no recovery
-machinery because nothing is in flight.
+The request goes **up** the chain of callers. The decision goes **straight down**
+to the agent that owns the tool. The natural reading of spec 7.6.2 — resolve the
+top task and the chain unwinds — does not work on ADK, and this was measured
+twice:
+
+A peer's confirmation arrives in the caller's session as an ordinary function
+call, so the caller believes it is its own to resolve. On a grant it looks for
+the tool among its own and finds nothing, because the tool is one hop away:
+
+```python
+# google/adk/flows/llm_flows/request_confirmation.py
+if not tools_to_resume_with_confirmation:
+    return
+```
+
+The grant is dropped in silence. Observed: after granting at the orchestrator
+the specialist received **no traffic at all**, and the orchestrator's task sat in
+`working` indefinitely. Suppressing the caller's duplicate confirmation was
+tried and did not help — the duplicate is a function-call part, not the
+`requested_tool_confirmations` action. So `app/cluster/grants.py` sends the
+decision to the owner, whose task id and confirmation id are recorded on the
+case when the request bubbles up.
+
+### Why not a long-running tool that returns None
+
+The first attempt used ADK's long-running-tool pause, with the human's answer
+arriving as the function response. It does not work, and it fails *silently*:
+ADK hands that response to the **model** as the tool's result and never calls
+the tool again. Measured:
+
+```
+[3] function_call     publish_result {"approved_by": "", "value": "391000000.0"}
+[5] function_response publish_result {"approved_by": "alice@bnpp.com"}
+[6] text  "The result 391000000.0 has been published under the label q3-revenue,
+           approved by alice@bnpp.com"
+```
+
+Nothing was published. ADK's *tool confirmation* flow does not have the gap —
+`request_confirmation.py` explicitly re-executes the tool with the decision
+attached — so the effect is performed by code, with the arguments a human
+actually saw, rather than by a model choosing to call the tool again.
 
 ### The gate
 
-`publish_result` returns a proposal when `approved_by` is empty and performs the
-write only when it is set. The effect is **unreachable** without an approver —
-a property of the code, not an instruction the model is asked to respect. A
-second code path that publishes without that check removes the guarantee
-entirely, however well the prompt is worded.
+Spec 7.6.4 is explicit that `TASK_STATE_AUTH_REQUIRED` "by itself" authorises
+nothing, and that an implementation must define "how the authorized operation is
+identified and how that authorization is checked before the operation is
+performed".
 
-### Why execution re-sends the request, and why the result is canonicalised
+Here that is the branch on `Approval.granted` in the tool
+(`app/agents/gating.py`). Suspending is how the human is *asked*; the branch is
+what keeps the effect unreachable until one answers. Removing it and trusting
+the task state would mean anything able to resume the task could also perform
+the effect.
 
-Approval does not compose a second payload describing what to do. It re-sends
-**the same request** with `approved_by` filled in, and the specialist recomputes
-from `expression`. Drift is removed rather than detected: a caller's LLM asked to
-restate a proposal for execution will render it as markdown prose and stall the
-flow, and no digest or signature on the wire prevents that — it only catches it
-afterwards. The check that remains is a content comparison on the caller
-(`cases.find_execution`), which refuses a result that does not match what was
-approved.
+### Why the proposal is generated, not restated
 
-"The specialist recomputes, so nothing can drift" is true of the number and
-false of its *spelling*: a live run proposed `391000000` and published
-`391000000.0`, and the comparison correctly refused to confirm a correct
-execution. The fix is to canonicalise the value where it is produced
-(`math.tools.canonical_value`) rather than to loosen the comparison. The general
-lesson: when two independently produced values must be compared later,
-canonicalise at the source, not at the comparison.
+What a reviewer reads is ADK's `adk_request_confirmation` payload, built from
+the call that is actually suspended. It cannot describe something other than
+what will run. The previous design asked a model to restate its proposal as JSON
+and parsed it back out of prose, which is how a proposal and its execution could
+quietly disagree.
+
+A tool that normalises its inputs must declare the normalised values, via
+`require_approval(..., proposal=...)`. Measured twice: a proposal recorded from
+the model's raw arguments said `391000000.0` while the tool published
+`391000000`, and again `88000.0` against `88000`. Both were correctly reported
+as `approved_not_confirmed`. Canonicalise at the source — do not loosen the
+comparison, which is what catches a specialist doing something *else*.
+
+### What is kept from the previous design
+
+The decision is still written to the row **before** delivery is attempted, so a
+pod that dies mid-delivery leaves a re-drivable `approved` case. Execution is
+still confirmed by matching the result's values against the approved proposal,
+not by trusting prose. Both survived the redesign unchanged.
 
 ## D6 — What stays coupled, deliberately
 
@@ -247,9 +313,14 @@ The protocol offers no help either — `AgentSkill` carries only
 `AgentTool` drops non-text parts, and the A2A spec's own structured-data example
 (§6.8) returns JSON as a string inside a `TextPart`.
 
-### `sub_agents`, re-tested
+### Uniform wiring, either way
 
-See D1. Worse on both axes, and the HITL relaxation did not change it.
+Both uniform rules were tried and each breaks something. All peers as tools:
+a suspended specialist is swallowed and no authorization request ever reaches a
+human. All peers as sub-agents: a caller that needs a peer's answer never gets
+it, and `math -> currency -> back to math` abandons the calculation half-done.
+See D1 for both measurements. The derived split is not a compromise between
+them — it is the only wiring under which both work.
 
 ---
 
@@ -315,21 +386,31 @@ spurious when not.
 
 ## Known gaps
 
-- **The web UI does not record approval cases.** Proposal detection lives in the
-  `POST /cases/run` route, so a gated action driven from the ADK dev UI
-  correctly refuses to publish but records nothing. Moving detection into a
-  plugin would capture from any surface, and is a small change.
-- **The proposal handshake depends on a model following an instruction.** The
-  callback above makes it deterministic *given* the specialist called its tool,
-  but nothing forces the call. Mitigated by tier choice and by never assuming an
-  effect happened.
+- **A suspended task is pinned to one pod.** `a2a-sdk`'s `ActiveTaskRegistry` is
+  a plain in-process dict; there is no distributed queue manager in the SDK.
+  Every Deployment runs `replicas: 1` today, so this is latent — but with two
+  replicas a grant routed to the wrong pod builds a *second* `ActiveTask` from
+  the DB row, which is double execution rather than a clean error. Fix before
+  scaling out: sticky routing by task id, or a shared queue manager.
+- **The caller's task is left suspended after a grant.** The decision is
+  delivered to the owner and the case is closed from its reply, but the
+  orchestrator's own task stays in `auth-required` — nothing resolves it, since
+  ADK cannot resolve a peer's confirmation locally (D5). Harmless with a
+  durable task store and a retention sweep; untidy.
+- **`decided_by` is not authenticated.** `POST /cases/{id}` takes the approver's
+  name on trust. Put a real identity in front of that route before it means
+  anything.
 - **"Approved" means this case, not these exact bytes.** The caller compares
-  content, which catches a specialist returning something different, but there is
-  no signed token binding a decision to a payload. A compliance context needing
+  content, which catches a specialist doing something different, but there is no
+  signed token binding a decision to a payload. A compliance context needing
   after-the-fact proof should add one field and one check.
-- **Eval impact of D1 is unmeasured.** A typed payload carries less context than
-  a transcript; whether the orchestrator extracts the right constraints is a
-  quality question unit tests cannot answer.
-- **Not exercised:** multi-hop delegation (A → B → C), concurrent decisions on
-  one case from two replicas, and the approval flow against live AlloyDB rather
-  than the in-memory store.
+- **The instruction-only guards are weaker than the contracts they replaced.**
+  "Pass the user's own wording, do not resolve it" was a field description a
+  model saw as a parameter; it is now prose. `test_currency.py` asserts the
+  prose exists and a live run confirmed the behaviour, but neither is as strong
+  as a schema.
+- **Eval impact of the sub-agent half is unmeasured.** A gated peer now receives
+  the caller's recent conversation rather than a composed request. Whether that
+  helps or hurts answer quality is a question unit tests cannot answer.
+- **Not exercised:** concurrent decisions on one case from two replicas, and the
+  flow against live AlloyDB rather than the in-memory store.

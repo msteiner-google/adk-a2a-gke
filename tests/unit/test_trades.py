@@ -22,10 +22,13 @@ a separate function at all.
 """
 
 import json
+from typing import Any, cast
 
 import pytest
+from google.adk.tools.tool_confirmation import ToolConfirmation
+from google.adk.tools.tool_context import ToolContext
 
-from app.agents.contracts import APPROVAL_REQUIRED, EFFECT_PERFORMED, TradesRequest
+from app.agents.statuses import AWAITING_APPROVAL, EFFECT_PERFORMED, REFUSED
 from app.agents.trades import tools
 from app.agents.trades.dataset import TABLE
 from app.agents.trades.tools import (
@@ -35,6 +38,7 @@ from app.agents.trades.tools import (
     validate_sql,
 )
 from app.cluster import cases
+from tests.unit.conftest import FakeToolContext
 
 GOOD_SQL = f"""
 SELECT p.PartyID AS bot, COUNT(*) AS trades
@@ -73,34 +77,64 @@ def _fake_bigquery(monkeypatch: pytest.MonkeyPatch):
     return calls
 
 
+def _pending() -> FakeToolContext:
+    """A context for a query nobody has decided on yet."""
+    return FakeToolContext()
+
+
+def _decided(
+    *, confirmed: bool, approved_by: str = "desk-head@cymbal", note: str = ""
+) -> FakeToolContext:
+    """A context carrying a human's decision, as ADK re-supplies it."""
+    return FakeToolContext(
+        ToolConfirmation(
+            confirmed=confirmed,
+            payload={"approved_by": approved_by, "note": note},
+        )
+    )
+
+
+def _query(ctx: FakeToolContext, sql: str = GOOD_SQL, **kwargs):
+    return run_trade_query(sql, cast(ToolContext, ctx), **kwargs)
+
+
+def _requested(ctx: FakeToolContext) -> dict[str, Any]:
+    """The proposal the tool put in front of a reviewer."""
+    assert ctx.requested is not None
+    return cast(dict[str, Any], ctx.requested.payload)
+
+
 # --- The gate -----------------------------------------------------------------
 
 
-def test_proposing_queries_nothing(_fake_bigquery):
-    out = run_trade_query(GOOD_SQL)
-    assert out["status"] == APPROVAL_REQUIRED
+def test_asking_queries_nothing(_fake_bigquery):
+    out = _query(_pending())
+    assert out["status"] == AWAITING_APPROVAL
     assert _fake_bigquery == []
     assert EXECUTIONS == []
 
 
-def test_whitespace_is_not_an_approval(_fake_bigquery):
-    out = run_trade_query(GOOD_SQL, approved_by="   ")
-    assert out["status"] == APPROVAL_REQUIRED
+def test_a_refusal_is_not_an_approval(_fake_bigquery):
+    out = _query(_decided(confirmed=False, note="not authorised"))
+    assert out["status"] == REFUSED
     assert _fake_bigquery == []
+    assert EXECUTIONS == []
 
 
-def test_a_proposal_shows_the_reviewer_the_exact_query(_fake_bigquery):
-    out = run_trade_query(GOOD_SQL, row_limit=5)
-    assert out["proposal"] == {
+def test_the_request_shows_the_reviewer_the_exact_query(_fake_bigquery):
+    ctx = _pending()
+    _query(ctx, row_limit=5)
+    assert _requested(ctx) == {
         "action": "run_trade_query",
         "sql": canonical_sql(GOOD_SQL),
         "row_limit": 5,
     }
-    assert TABLE in out["summary"]
+    assert ctx.requested is not None
+    assert TABLE in ctx.requested.hint
 
 
 def test_an_approved_query_runs_once(_fake_bigquery):
-    result = run_trade_query(GOOD_SQL, row_limit=5, approved_by="desk-head@cymbal")
+    result = _query(_decided(confirmed=True), row_limit=5)
     assert result["status"] in EFFECT_PERFORMED
     assert result["rows"] == [{"bot": "PREDICTES", "trades": 193809}]
     assert len(_fake_bigquery) == 1
@@ -114,21 +148,22 @@ def test_a_failed_query_is_not_recorded_as_a_performed_effect(monkeypatch):
         "_execute",
         lambda statement, row_limit: {"status": "error", "error": "boom"},
     )
-    result = run_trade_query(GOOD_SQL, approved_by="desk-head@cymbal")
+    result = _query(_decided(confirmed=True))
     assert result["status"] == "error"
     assert result["status"] not in EFFECT_PERFORMED
     assert EXECUTIONS == []
 
 
 def test_row_limit_is_clamped_rather_than_trusted(_fake_bigquery):
-    out = run_trade_query(GOOD_SQL, row_limit=10_000)
-    assert out["proposal"]["row_limit"] == tools.DEFAULT_MAX_ROWS
+    ctx = _pending()
+    _query(ctx, row_limit=10_000)
+    assert _requested(ctx)["row_limit"] == tools.DEFAULT_MAX_ROWS
 
 
 def test_a_missing_row_limit_falls_back_to_the_default(_fake_bigquery):
-    assert run_trade_query(GOOD_SQL, row_limit=0)["proposal"]["row_limit"] == (
-        tools.DEFAULT_ROW_LIMIT
-    )
+    ctx = _pending()
+    _query(ctx, row_limit=0)
+    assert _requested(ctx)["row_limit"] == tools.DEFAULT_ROW_LIMIT
 
 
 # --- The validator ------------------------------------------------------------
@@ -163,11 +198,21 @@ def test_anything_that_is_not_a_read_of_the_one_table_is_refused(sql: str):
 
 
 def test_a_rejected_query_is_refused_even_with_an_approval(_fake_bigquery):
-    # The approval is for a query, not for the agent. A tampered statement on
-    # the execution turn must not ride in on someone else's sign-off.
-    out = run_trade_query(f"DROP TABLE `{TABLE}`", approved_by="desk-head@cymbal")
+    # The approval is for a query, not for the agent. A tampered statement must
+    # not ride in on someone else's sign-off. Validation runs BEFORE the gate,
+    # so this never even reaches a human.
+    out = _query(_decided(confirmed=True), sql=f"DROP TABLE `{TABLE}`")
     assert out["status"] == "error"
     assert _fake_bigquery == []
+
+
+def test_an_invalid_query_is_never_put_in_front_of_a_human(_fake_bigquery):
+    ctx = _pending()
+    out = _query(ctx, sql=f"DROP TABLE `{TABLE}`")
+    assert out["status"] == "error"
+    # No confirmation requested: a reviewer is never shown something that
+    # could not have run in the first place.
+    assert ctx.requested is None
 
 
 def test_a_keyword_inside_a_string_literal_is_not_a_keyword():
@@ -194,27 +239,27 @@ def test_canonicalisation_absorbs_reformatting_but_not_a_different_query():
 
 
 def test_the_caller_can_confirm_the_approved_query_actually_ran(_fake_bigquery):
-    # The full round trip the /cases endpoint performs: propose, serialise the
-    # way an A2A reply would, approve, re-send, and match the result against
-    # the record. This is what turns "the model said it ran" into evidence.
-    proposed = json.loads(json.dumps(run_trade_query(GOOD_SQL, row_limit=5)))
-    proposal = proposed["proposal"]
-    assert cases.find_proposals([json.dumps(proposed)])
+    # The full round trip the /cases endpoint performs: ask, serialise the way
+    # the confirmation crosses A2A, approve, re-execute, and match the result
+    # against the record. This is what turns "the model said it ran" into
+    # evidence.
+    ctx = _pending()
+    _query(ctx, row_limit=5)
+    proposal = json.loads(json.dumps(_requested(ctx)))
 
-    performed = run_trade_query(
-        proposal["sql"],
-        row_limit=proposal["row_limit"],
-        approved_by="desk-head@cymbal",
+    performed = _query(
+        _decided(confirmed=True), sql=proposal["sql"], row_limit=proposal["row_limit"]
     )
     assert cases.find_execution([json.dumps(performed)], proposal) is not None
 
 
 def test_a_different_query_is_not_accepted_as_the_approved_one(_fake_bigquery):
-    proposal = run_trade_query(GOOD_SQL, row_limit=5)["proposal"]
-    performed = run_trade_query(
-        f"SELECT COUNT(*) FROM `{TABLE}`",
-        row_limit=5,
-        approved_by="desk-head@cymbal",
+    ctx = _pending()
+    _query(ctx, row_limit=5)
+    proposal = _requested(ctx)
+
+    performed = _query(
+        _decided(confirmed=True), sql=f"SELECT COUNT(*) FROM `{TABLE}`", row_limit=5
     )
     # It ran -- the approver said yes to *a* query -- but it is not the one on
     # the record, so the case is reported unconfirmed rather than closed.
@@ -222,23 +267,7 @@ def test_a_different_query_is_not_accepted_as_the_approved_one(_fake_bigquery):
     assert cases.find_execution([json.dumps(performed)], proposal) is None
 
 
-# --- The contract -------------------------------------------------------------
-
-
-def test_the_contract_carries_the_approved_sql_back():
-    # Unlike MathRequest, which is reproducible from `expression`, SQL has to
-    # travel: a model asked the same question twice does not emit the same text.
-    first = TradesRequest(case_id="c1", question="Which bot traded most?")
-    assert first.sql == ""
-    assert first.approved_by == ""
-
-    approved = TradesRequest(
-        case_id="c1",
-        question="Which bot traded most?",
-        sql=canonical_sql(GOOD_SQL),
-        approved_by="desk-head@cymbal",
-    )
-    assert approved.sql == canonical_sql(GOOD_SQL)
+# --- The vocabulary -----------------------------------------------------------
 
 
 def test_every_gated_tool_reports_a_status_the_caller_recognises():

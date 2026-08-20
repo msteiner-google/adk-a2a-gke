@@ -270,7 +270,11 @@ def test_approval_cases_matches_the_store_model(migration_sql: str) -> None:
     """
     from app.cluster.cases import CASES
 
-    ours = _column_definitions(_created_tables(migration_sql)["approval_cases"])
+    # _effective_columns, not _created_tables: this table now gains columns in
+    # a later revision (0007 adds the grant-routing ids), and reading only the
+    # CREATE TABLE would report every one of them as missing drift forever --
+    # the exact trap _effective_columns was written for.
+    ours = _effective_columns(migration_sql, "approval_cases")
     theirs = _library_columns(CASES)
 
     # Column NAMES must match exactly. Types are compared loosely: the migration

@@ -28,14 +28,14 @@ working agent you can exercise locally.
 stop there. Steps 6–8 are cluster-only: five infrastructure files, a Terraform
 apply and a deploy. The [checklist](#checklist) at the end is split the same way.
 
-**The one rule that is not obvious.** Your agent will be called with an
-explicit payload and **nothing else** — no conversation history, no shared
-state. The default payload is a single free-text task; declaring a contract in
-`app/agents/contracts.py` (step 2b) upgrades that to named, validated fields,
-and is optional in the mechanism but expected of every agent this repo owns.
-Either way, everything your agent needs has to arrive in that payload. If your agent needs to gate an action behind
-a human, see [human-in-the-loop.md](human-in-the-loop.md#writing-a-gated-action);
-it is two ordinary functions, not a framework feature.
+**The one rule that is not obvious.** How your agent is reached depends on
+whether it can suspend for human sign-off. Own a `@gated` tool and callers
+attach you as a **sub-agent**, reached with `transfer_to_agent`, seeing their
+recent conversation. Own none and they attach you as a **tool**, reached with
+one composed request and nothing else. You do not choose this — it is derived
+from your tools by `suspending_agents()` — but it decides what your instruction
+can assume, so write step 2b before step 4. Either way there is no shared
+session state and no way to ask your caller for more.
 
 For standing the whole system up in a fresh Google Cloud project, read
 [`deploy-to-another-project.md`](deploy-to-another-project.md) instead.
@@ -191,61 +191,69 @@ runs all of them.
 
 ---
 
-## 2b. Declare its request contract (optional, but do it)
+## 2b. If it gates an effect, write the gate
 
-**Optional in the mechanism, required by this repo's policy.** The default
-contract between two agents here is *one free-text task plus a `case_id`*: an
-agent with no entry in `PAYLOADS` is still reachable and still answers, its tool
-falling back to `UnknownPeerRequest`. Declaring a model is how you opt into
-something stricter — named parameters, validation before the call leaves the
-pod, and a JSON Schema published in the agent's card.
+Skip this step for an agent that only computes or reports. Do it for one that
+*does* something a human must authorise first — publishes a figure, runs a
+billed query, moves money.
 
-Do it for an agent you own. A single free-text field is where a caller quietly
-starts pasting conversation context back in — the transcript returning a
-paragraph at a time, which is the thing explicit delegation exists to prevent.
-Leave it undeclared only for a peer another squad owns, whose real schema lives
-in its own agent card. `app/agents/contracts.py`'s module docstring lays out all
-three tiers.
-
-**It also fails quietly**, which is why it is the step people forget: nothing
-errors, the caller just sends prose.
-
-`app/agents/contracts.py`:
+A gated action is one plain function that asks for a decision and returns
+without acting until it has one:
 
 ```python
-class WeatherRequest(PeerRequest):
-    """Ask the weather specialist about conditions at a location."""
+from google.adk.tools.tool_context import ToolContext   # RUNTIME import
 
-    location: str = Field(
-        description=(
-            "The place to report on, e.g. 'Dublin, IE'. Be specific: the "
-            "specialist cannot ask which Dublin you meant."
-        )
+from app.agents.gating import AWAITING_APPROVAL, REFUSED, gated, require_approval
+from app.agents.statuses import PUBLISHED
+
+
+@gated
+def send_alert(message: str, channel: str, tool_context: ToolContext):
+    """Send an operational alert, once a human has authorised it."""
+    decision = require_approval(
+        tool_context,
+        summary=f"Send {message!r} to {channel!r}.",
+        proposal={"action": "send_alert", "message": message, "channel": channel},
     )
-    when: str = Field(
-        default="",
-        description="Optional day or range, e.g. 'tomorrow' or '2026-08-20'.",
-    )
+    if decision.pending:
+        return {"status": AWAITING_APPROVAL, "action": "send_alert"}
+    if not decision.granted:
+        return {"status": REFUSED, "action": "send_alert", "note": decision.note}
 
-
-PAYLOADS: dict[str, type[PeerRequest]] = {
-    ...,
-    "weather": WeatherRequest,
-}
+    _really_send(message, channel)          # the effect, and only here
+    return {"status": PUBLISHED, "action": "send_alert",
+            "message": message, "channel": channel,
+            "approved_by": decision.approved_by, "note": decision.note}
 ```
 
-Two things matter here:
+The first call suspends the A2A task in `TASK_STATE_AUTH_REQUIRED`; ADK
+re-executes this same function, with the same arguments, once a human answers.
+Four things matter:
 
-- **Every field needs a `description`.** It is compiled into the tool
-  declaration the *calling* model sees, and published as JSON Schema in this
-  agent's A2A card. It is the only instruction a caller gets about how to call
-  you, so an undescribed field is a silently mis-filled one.
-- **`case_id` and `document_refs` come free** from `PeerRequest`. Do not
-  redeclare them, and never add a field for a document's *contents* — pass the
-  reference and read it with `read_document`.
+- **`@gated` is not decoration.** It is what makes your agent a *sub-agent* of
+  its callers, and only a sub-agent can propagate a suspension. Forget it and
+  the caller attaches you as an `AgentTool`, which runs you to exhaustion and
+  drops the suspension — every request for approval is swallowed in silence.
+  `test_agents.py::test_every_tool_that_asks_for_approval_is_marked_gated`
+  reads your source and fails if you forget, because nothing at runtime will.
+- **Import `ToolContext` at runtime**, from `google.adk.tools.tool_context`,
+  never under `TYPE_CHECKING`. ADK evaluates the annotation to build the tool
+  declaration.
+- **Pass `proposal=` if you normalise your inputs.** The case records what you
+  declare there; without it, it records the model's raw arguments and the
+  caller compares them against your normalised result. Measured twice:
+  `391000000.0` against `391000000`, and `88000.0` against `88000`. Both were
+  correctly refused as `approved_not_confirmed`.
+- **Return a success status that is in `statuses.EFFECT_PERFORMED`.**
+  `cases.find_execution` accepts nothing else, so a new status runs perfectly
+  and is then reported as `approved_not_confirmed` — a vocabulary bug wearing a
+  model bug's clothes.
 
-`test_agents.py::test_every_delegatable_agent_declares_a_contract` fails if you
-skip this — the test is what makes a repo policy out of an optional mechanism.
+Validate *before* asking, if your action can be invalid: a reviewer should
+never be shown something that could not have run. `app/agents/trades/tools.py`
+is the worked example.
+
+[`docs/human-in-the-loop.md`](human-in-the-loop.md) has the full guide.
 
 ---
 
@@ -539,12 +547,13 @@ delegation in Cloud Trace — one trace spans every A2A hop.
 [ ] tools.py: Google-style docstrings; ToolContext imported at runtime
 [ ] agent.py: SPEC with a capability-style description
 [ ] Registered in app/agents/__init__.py
-[ ] Request contract added to app/agents/contracts.py + PAYLOADS
-[ ] Every contract field has a Field(description=...)
+[ ] Gated tool (if any) uses require_approval() and is marked @gated
+[ ] Gated tool's success status is in statuses.EFFECT_PERFORMED
 [ ] Added to the delegating agent's AgentSpec.peers
 [ ] test_registry_lists_expected_agents updated
 [ ] test_declared_peer_topology updated
-[ ] Instruction tells the agent it cannot see the caller's conversation
+[ ] test_the_split_is_derived_from_the_gated_tools updated (if gated)
+[ ] Instruction matches how the agent is reached (sub-agent vs tool)
 [ ] Tool tests added
 [ ] pytest + agents-cli lint green
 [ ] Exercised locally over a real A2A hop
@@ -567,9 +576,9 @@ delegation in Cloud Trace — one trace spans every A2A hop.
 | --- | --- | --- |
 | `KeyError: Unknown AGENT_NAME 'weather'` at startup | Not registered | Add it to `AGENTS` in `app/agents/__init__.py` |
 | Orchestrator never delegates to it | `description` too vague, or not in `peers` | Rewrite as a capability statement; check `AgentSpec.peers` / `A2A_PEERS` |
-| Caller sends one vague `request` string | No entry in `PAYLOADS` | Add the contract (step 2b); the tool fell back to `UnknownPeerRequest` |
-| Agent replies asking for context it was never sent | Its instruction assumes a conversation | It only ever sees the payload — add the missing field to its contract |
-| `Invalid payload for peer '<name>'` | Caller omitted a required field | Give the field a default, or make its `description` clearer |
+| Gated action never reaches a human; caller carries on | Tool not marked `@gated`, so the agent is attached as a tool and the suspension is swallowed | Add `@gated` (step 2b) |
+| Approved action runs but reports `approved_not_confirmed` | Success status missing from `EFFECT_PERFORMED`, or the tool normalises inputs without passing `proposal=` | Add the status; declare canonical values |
+| Caller delegates, gets an answer, then abandons the task half-done | The peer is gated but should not be — `transfer_to_agent` ended the caller's invocation | Only gate a tool that really needs a human |
 | Delegation hangs, then times out | Missing from `networkpolicy.yaml`, or allowed only from the orchestrator when the caller is another specialist | Add a rule naming the actual caller (step 6d) |
 | Delegation hangs, agent looks healthy | `APP_URL` wrong | Must equal `http://<service>.<namespace>.svc.cluster.local` |
 | Peer agent card `404` | Card is at `<svc>/a2a/app/.well-known/agent-card.json`, not the service root | Check `A2A_RPC_PATH` and that `App(name=...)` is still `"app"` |

@@ -23,11 +23,9 @@ That shape is worth being explicit about, because it is the thing people assume
 this architecture cannot do. Nothing in ``build_agent`` distinguishes a
 coordinator from a leaf — an agent that delegates is one whose spec declares
 ``peers`` — so ``orchestrator -> math -> currency`` needs no new machinery, and
-each hop is the same explicit typed request as the first. The rules do not
-loosen with depth: this agent sees a
-:class:`~app.agents.contracts.CurrencyRequest` and nothing else, and it can no
-more see the user's original question than ``math`` can see the conversation the
-orchestrator is holding.
+each hop is the same ``transfer_to_agent`` as the first. Depth matters for a
+different reason now: a question this agent raises has to survive two hops back
+to the user, which is what ``app/agents/reporting.py`` exists for.
 
 The rates are hardcoded; see ``app/agents/currency/tools.py``.
 """
@@ -48,37 +46,37 @@ SPEC = AgentSpec(
         "published reference rate table."
     ),
     instruction=(
-        "You are a currency conversion specialist. You receive a JSON request "
-        "with an `amount`, a `from_currency`, a `to_currency` and a `case_id`."
-        "\n\n"
+        "You are a currency conversion specialist. You are handed a "
+        "conversion from the conversation you can see: an amount, the "
+        "currency it is in, and the currency it should be in.\n\n"
         "1. Always use the `convert_currency` tool. Never apply a rate from "
-        "memory and never do the multiplication yourself -- the tool holds the "
-        "only rate table anyone here has agreed on.\n"
-        "2. Pass `from_currency` and `to_currency` through EXACTLY as the "
-        "request gave them, even when they are words rather than codes. If the "
-        "request says 'dollars', send 'dollars'. Resolving it yourself is the "
-        "one thing you must not do: you would be picking between six real "
-        "currencies on the user\u2019s behalf, silently, and the tool is what "
-        "knows the list.\n"
-        "3. The tool may answer with `needs_input` (the currency is ambiguous) "
-        "or `needs_confirmation` (the amount is over the threshold). Neither "
-        "is a failure and neither converted anything. Report the tool\u2019s "
-        "JSON verbatim and put its `question` to the caller as your own "
-        "closing line. Do NOT pick a candidate, do NOT convert anyway, and do "
-        "NOT reassure anyone that the amount looks fine -- you have no way to "
-        "know, and the person who typed it does.\n"
-        "4. Pass `confirmed` through from the request. Only the user can set "
-        "it; if it is absent, it is false.\n"
+        "memory and never do the multiplication yourself -- the tool holds "
+        "the only rate table anyone here has agreed on.\n"
+        "2. Pass the currencies through EXACTLY as you were given them, even "
+        "when they are words rather than codes. If the request says "
+        "'dollars', send 'dollars'. Resolving it yourself is the one thing "
+        "you must not do: you would be picking between six real currencies "
+        "on the user\u2019s behalf, silently, and the tool is what knows the "
+        "list.\n"
+        "3. The tool may answer with `needs_input` (the currency is "
+        "ambiguous) or `needs_confirmation` (the amount is over the "
+        "threshold). Neither is a failure and neither converted anything. "
+        "Report the tool\u2019s JSON verbatim and put its `question` to the "
+        "caller as your own closing line. Do NOT pick a candidate, do NOT "
+        "convert anyway, and do NOT reassure anyone that the amount looks "
+        "fine -- you have no way to know, and the person who typed it "
+        "does.\n"
+        "4. Set `confirmed` only when the conversation shows the user has "
+        "already answered that question. Nobody else can set it for them.\n"
         "5. Report the converted amount, the rate that produced it, and the "
-        "`as_of` date the tool returns. State plainly that the rate is a fixed "
-        f"reference rate frozen on {RATES_AS_OF}, not a live market quote. A "
-        "caller that relays your number as a live quote is a worse outcome "
-        "than one that cannot convert at all.\n"
+        "`as_of` date the tool returns. State plainly that the rate is a "
+        f"fixed reference rate frozen on {RATES_AS_OF}, not a live market "
+        "quote. A caller that relays your number as a live quote is a worse "
+        "outcome than one that cannot convert at all.\n"
         "6. If the tool reports an unsupported currency code, say so and list "
         "the codes it does support (`list_supported_currencies`). Do not "
         "substitute a currency you were not asked for.\n\n"
-        "The request is all the context you have: you cannot see the "
-        "conversation it came from. Return your answer as plain text."
+        "Answer in plain text."
     ),
     # `balanced`, not `fast`. This agent's job stopped being a table lookup the
     # moment it had to REFUSE: relay a question verbatim, never resolve an

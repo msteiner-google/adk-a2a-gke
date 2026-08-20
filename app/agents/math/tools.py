@@ -37,7 +37,18 @@ import operator
 from collections.abc import Callable
 from typing import Any
 
-from app.agents.contracts import APPROVAL_REQUIRED, PUBLISHED
+# ToolContext must be imported at RUNTIME (see app/agents/gating.py) -- ADK
+# evaluates this annotation with typing.get_type_hints() to build the tool's
+# declaration, and a TYPE_CHECKING-only import breaks every tool in the module.
+from google.adk.tools.tool_context import ToolContext
+
+from app.agents.gating import (
+    AWAITING_APPROVAL,
+    REFUSED,
+    gated,
+    require_approval,
+)
+from app.agents.statuses import PUBLISHED
 
 # Binary/unary operators allowed in the arithmetic evaluator. Anything outside
 # this set (calls, names, attributes, ...) is rejected, so `calculate` never
@@ -135,37 +146,45 @@ def canonical_value(value: str) -> str:
     return str(int(number)) if number.is_integer() else repr(number)
 
 
-def publish_result(
-    value: str, label: str, approved_by: str = "", note: str = ""
-) -> dict[str, Any]:
-    """Publish a computed result, or propose doing so if nobody has approved yet.
+@gated
+def publish_result(value: str, label: str, tool_context: ToolContext) -> dict[str, Any]:
+    """Publish a computed result, once a human has authorised it.
 
-    One function, two behaviours, chosen by whether an approval is present. That
-    is the whole gate: with no ``approved_by`` the effect below is unreachable,
-    so a model that decides to publish on its own simply cannot.
+    The first call performs nothing: it suspends the task and puts the exact
+    arguments in front of a reviewer. ADK re-executes this function with the
+    same arguments once the decision arrives, and only then is the append
+    below reachable. That is the whole gate -- a model that decides to publish
+    on its own simply cannot, because it has no way to fabricate a decision.
 
     Args:
         value: The result to publish.
         label: The label to publish it under.
-        approved_by: Who approved it. Empty means "not approved yet", and the
-            call returns a proposal instead of publishing.
-        note: Optional feedback the approver attached, recorded for audit.
+        tool_context: Injected by ADK. Carries the authorization decision.
 
     Returns:
-        Either ``status='approval_required'`` describing what would happen, or
-        ``status='published'`` confirming what did.
+        ``status='awaiting_approval'`` while suspended, ``status='refused'``
+        if a human declined, or ``status='published'`` confirming the effect.
     """
     value = canonical_value(value)
-    if not approved_by.strip():
-        return {
-            "status": APPROVAL_REQUIRED,
-            "action": PUBLISH_ACTION,
-            "proposal": {"action": PUBLISH_ACTION, "value": value, "label": label},
-            "summary": f"Publish {value!r} under label {label!r}.",
-        }
+    decision = require_approval(
+        tool_context,
+        summary=f"Publish {value!r} under label {label!r}.",
+        # The canonical value, not the model's spelling of it: `value` has
+        # already been through canonical_value above.
+        proposal={"action": PUBLISH_ACTION, "value": value, "label": label},
+    )
+    if decision.pending:
+        return {"status": AWAITING_APPROVAL, "action": PUBLISH_ACTION}
+    if not decision.granted:
+        return {"status": REFUSED, "action": PUBLISH_ACTION, "note": decision.note}
 
-    record = {"value": value, "label": label, "approved_by": approved_by}
+    record = {"value": value, "label": label, "approved_by": decision.approved_by}
     PUBLICATIONS.append(record)
     # `status` must stay a member of contracts.EFFECT_PERFORMED: it is what the
     # caller scans for to confirm the approved action actually ran.
-    return {"status": PUBLISHED, "action": PUBLISH_ACTION, "note": note, **record}
+    return {
+        "status": PUBLISHED,
+        "action": PUBLISH_ACTION,
+        "note": decision.note,
+        **record,
+    }

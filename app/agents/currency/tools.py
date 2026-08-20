@@ -29,7 +29,7 @@ invents is the kind of bug that only shows up in a number nobody double-checked.
 One anchor per currency makes an inconsistent triangle unrepresentable.
 
 Replacing this with a real feed means changing :func:`_rate` and the metadata it
-reports. The tool signatures, the contract in ``app/agents/contracts.py`` and
+reports. The tool signatures, the vocabulary in ``app/agents/statuses.py`` and
 everything downstream stay as they are.
 """
 
@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.agents.contracts import NEEDS_CONFIRMATION, NEEDS_INPUT
+from app.agents.statuses import NEEDS_CONFIRMATION, NEEDS_INPUT
 
 #: The day these indicative rates were frozen. Reported with every conversion:
 #: a stale rate that says so is usable, one that stays quiet is not.

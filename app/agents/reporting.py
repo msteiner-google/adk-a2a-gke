@@ -65,18 +65,25 @@ from typing import TYPE_CHECKING, Any
 
 from google.genai import types
 
-from app.agents.contracts import APPROVAL_REQUIRED, EFFECT_PERFORMED, NEEDS_USER
+from app.agents.statuses import (
+    AWAITING_APPROVAL,
+    EFFECT_PERFORMED,
+    NEEDS_USER,
+    REFUSED,
+)
 
 #: Tool-result statuses that must reach the caller intact rather than as prose:
 #: an action awaiting sign-off, the confirmation that an approved one ran, and a
 #: question only the user can answer.
 #:
 #: Derived from the contract vocabulary rather than written out, which is not
-#: tidiness. This set said `{APPROVAL_REQUIRED, "published"}` when the trades
+#: tidiness. This set said `{AWAITING_APPROVAL, "published"}` when the trades
 #: agent landed, so a gated *read* reporting `executed` was silently not
 #: restated -- it survived only because the model chose to repeat it, which is
 #: exactly the thing this callback exists to stop relying on.
-AUDITED_STATUSES = frozenset({APPROVAL_REQUIRED}) | EFFECT_PERFORMED | NEEDS_USER
+AUDITED_STATUSES = (
+    frozenset({AWAITING_APPROVAL, REFUSED}) | EFFECT_PERFORMED | NEEDS_USER
+)
 
 if TYPE_CHECKING:
     from google.adk.agents.callback_context import CallbackContext
@@ -92,12 +99,13 @@ RESULT_HEADER = "Structured result(s):"
 def _embedded(text: str) -> list[dict[str, Any]]:
     """Return JSON objects embedded anywhere in a string.
 
-    This is what makes the callback work more than one hop deep. A peer reached
-    through ``PeerTool`` answers as TEXT, so on the *caller* the reply is a
-    string tool result, not a dict -- and a proposal or a question raised two
-    levels down (``orchestrator -> math -> currency``) would be invisible to the
-    dict-only scan below, leaving it to the middle agent's model to relay
-    faithfully. That is precisely the dependency this module exists to remove.
+    This is what makes the callback work more than one hop deep. A peer's
+    reply crosses A2A as TEXT, so on the *caller* a structured result is a
+    string rather than a dict -- and a question or a pending authorization
+    raised two levels down (``orchestrator -> math -> currency``) would be
+    invisible to the dict-only scan below, leaving it to the middle agent's
+    model to relay faithfully. That is precisely the dependency this module
+    exists to remove.
 
     Args:
         text: A string tool result to scan.

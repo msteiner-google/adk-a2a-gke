@@ -10,7 +10,7 @@ the [A2A protocol](https://a2a-protocol.org/).
    user ───────────▶   │   orchestrator    │  entry point; plans and delegates
                        │  Deployment/Svc   │
                        └─────────┬─────────┘
-        A2A — one typed payload per call, never the transcript
+        A2A — sub-agent if it can suspend, tool otherwise
          ┌──────────────────┬────┴─────────────┬──────────────────┐
          ▼                  ▼                  ▼                  ▼
  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
@@ -56,7 +56,7 @@ scaffolding for the parts that are not.
 | **Agent definition** | Every agent is a declarative `AgentSpec` in a registry, built by one factory. There is no orchestrator class — the orchestrator is just the agent whose spec declares `peers` |
 | **One image, every agent** | `AGENT_NAME` selects which agent a process becomes at startup, so there is a single build and a single container to deploy |
 | **Service discovery** | Peers are declared in code, resolved from cluster DNS, and discovered through their published A2A agent cards |
-| **Share-nothing delegation** | A specialist is called with an explicit typed payload and sees nothing else — no transcript, no shared session state. Large inputs travel as object-store references it reads itself |
+| **Share-nothing delegation** | No shared session state, no shared artifact handles, no side channels. Large inputs travel as object-store references the specialist reads itself |
 | **Durable state** | Sessions, A2A tasks and approval cases persist in AlloyDB, each agent in its own PostgreSQL schema, with Alembic-managed migrations |
 | **Per-agent identity** | One Google service account per agent, bound by Workload Identity, authenticating to the database with IAM — no passwords anywhere |
 | **Human-in-the-loop** | A gated action is proposed, recorded as a durable case, and carried out later — so an approval can take a week and costs one row. The effect is unreachable without an approver. Two of them here: `math` publishing a figure, and `trades` running a BigQuery query — [docs/human-in-the-loop.md](docs/human-in-the-loop.md) |
@@ -95,7 +95,8 @@ mas-gke/
 │   ├── agents/                 # WHO the agents are
 │   │   ├── __init__.py         #   the registry (AGENTS + DEFAULT_AGENT)
 │   │   ├── base.py             #   AgentSpec + the single build_agent()
-│   │   ├── contracts.py        #   THE WIRE CONTRACTS: opt-in payload model per agent
+│   │   ├── statuses.py         #   THE STATUS VOCABULARY a caller keys on
+│   │   ├── gating.py           #   HUMAN AUTHORIZATION: @gated + require_approval()
 │   │   ├── documents.py        #   read_document (claim-check references)
 │   │   ├── reporting.py        #   keeps structured results intact across A2A
 │   │   ├── orchestrator/       #   entry point (declares peers)
@@ -106,7 +107,9 @@ mas-gke/
 │   │   └── currency/           #   second-tier specialist, reached only by math
 │   ├── cluster/                # The PLUMBING
 │   │   ├── config.py           #   env -> ClusterConfig / peers
-│   │   ├── resolver.py         #   peers -> typed PeerTool (agent-card discovery)
+│   │   ├── resolver.py         #   peers -> sub-agent or tool (agent-card discovery)
+│   │   ├── authorization.py    #   report a suspended tool as AUTH_REQUIRED
+│   │   ├── grants.py           #   deliver a decision to the owning agent
 │   │   ├── peer_tool.py        #   explicit-payload delegation (never the transcript)
 │   │   ├── di.py               #   injector modules
 │   │   ├── session.py          #   pluggable session + memory backends
@@ -252,10 +255,10 @@ the orchestrator is simply the agent whose spec declares `peers`.
 1. Create `app/agents/<name>/agent.py` exposing a `SPEC = AgentSpec(...)`
    (agent-specific tools go in `app/agents/<name>/tools.py`).
 2. Register it in `app/agents/__init__.py`.
-3. *Optional, but the convention here:* declare its request contract in
-   `app/agents/contracts.py` and add it to `PAYLOADS`. The default contract
-   between agents is a single free-text task plus a `case_id`; a model here
-   upgrades that to named, validated, card-published fields.
+3. If it gates an effect behind a human, write the tool with
+   `require_approval()` and mark it `@gated` (`app/agents/gating.py`). That
+   marker is what makes its callers reach it as a sub-agent, which is what lets
+   a suspended action reach a person at all.
 4. Add the name to another agent's `AgentSpec.peers` if it should be delegated to.
 
 Use a single lowercase word valid as **both** a Python identifier and a
@@ -344,32 +347,37 @@ The project-specific values to fill before step 3 — all of them come from
 
 ## Human-in-the-loop
 
-An action that needs sign-off is **proposed, not performed**. The specialist
-returns a proposal and finishes; the orchestrator records a durable case and
-answers the user. Nothing is held open, so an approval can take a fortnight and
-costs one row. When it arrives, the same request is re-sent with the approver
-attached, and the specialist recomputes the result from the same input — so
-there is nothing for anyone to retype incorrectly.
+An action that needs sign-off **suspends, rather than running**. The specialist
+leaves its A2A task in `TASK_STATE_AUTH_REQUIRED` — A2A's own In-Task
+Authorization state (spec 7.6) — and the orchestrator records a durable case and
+answers the user. Waiting costs one row, so an approval can take a fortnight.
+When the decision arrives it is delivered straight to the suspended task, and
+ADK re-executes the tool with the same arguments a human actually read.
 
 ```bash
-curl -X POST localhost:8080/cases/run -H 'content-type: application/json' \
-  -d '{"text":"Work out 17 * 23 and publish it as q3-revenue."}'
-# → status "awaiting_approval", with the proposal and what it would do
+# any A2A client; the A2A-Version header is mandatory
+curl -s localhost:8080/a2a/app -H 'A2A-Version: 1.0' -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{"message":{
+       "messageId":"m1","role":"ROLE_USER",
+       "parts":[{"text":"Work out 17 * 23 and publish it as q3-revenue."}]}}}' \
+  | jq -r '.result.status.state'
+# → TASK_STATE_AUTH_REQUIRED
+
+curl -s localhost:8080/cases | jq '.cases[0].proposal_id'
 curl -X POST localhost:8080/cases/<proposal_id> -H 'content-type: application/json' \
   -d '{"approved":true,"decided_by":"ops@example.com"}'
-# → status "executed"
+# → status "executed", with the tool's own result
 ```
 
 The same machinery gates a **read**. The `trades` specialist writes the SQL for
-a question, returns it as a proposal and touches BigQuery not at all; the query
-runs on the approved re-send. The one difference is that the approved SQL
-travels back in the request rather than being regenerated — arithmetic is
-reproducible from the expression, SQL generation is not.
+a question, suspends, and touches BigQuery not at all until a human decides —
+and because ADK re-runs the suspended call, the query that runs is byte-for-byte
+the one that was reviewed.
 
-Nothing is suspended between the two calls, so there is no recovery machinery —
-and nothing ADK-specific either, so a specialist on another framework implements
-the same two skills. **[docs/human-in-the-loop.md](docs/human-in-the-loop.md)**
-has the walkthrough and the known limits.
+The gate itself is a branch inside the tool, not the task state: spec 7.6.4 is
+explicit that the state authorises nothing on its own.
+**[docs/human-in-the-loop.md](docs/human-in-the-loop.md)** has the walkthrough
+and the known limits.
 
 ## Observability
 
