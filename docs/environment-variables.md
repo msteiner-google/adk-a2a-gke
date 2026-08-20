@@ -263,11 +263,15 @@ for ip_type, got 'INTERNAL'. Want one of: 'PUBLIC', 'PRIVATE', 'PSC'.`
 database option. See [Traps](#traps) — it is currently wired to nothing.
 
 `TASK_STORE_BACKEND=in_memory` is per-pod, so a task created by the pod that
-answered `message/send` is invisible to the pod that later receives `tasks/get`.
-Scaling an agent past one replica silently breaks task polling and
-resubscription; `database` fixes both. The database store is constructed with
-`create_table=False` because Alembic owns the schema, so if the migration has
-not run you get "relation does not exist" rather than an auto-created table.
+answered `SendMessage` (`message/send` before A2A v1.0) is invisible to the pod
+that later receives `GetTask` (`tasks/get`). Scaling an agent past one replica
+silently breaks task polling and resubscription; `database` fixes both. The
+database store is constructed with `create_table=False` because Alembic owns the
+schema, so if the migration has not run you get "relation does not exist" rather
+than an auto-created table — and if it has run but stops short of revision
+`0006`, you get `UndefinedColumn` on the first delegation instead, with the pod
+still reporting healthy. See
+[`a2a-v1-migration.md`](a2a-v1-migration.md).
 
 ## Artifacts
 

@@ -144,11 +144,26 @@ Peers are configured by environment (see `app/cluster/config.py`):
   `/a2a/app`; override only if you change the app name or mount path.
 
 Each agent must also advertise a reachable base URL in **its own** card via
-`APP_URL` (the card's `url`, which peers call). It defaults to
+`APP_URL` — in A2A v1.0 that is the `url` of the card's single
+`supportedInterfaces` entry, which peers call. It defaults to
 `http://0.0.0.0:8000` — unreachable from other pods — so the manifests set it per
 role to `http://<service-name>.<namespace>.svc.cluster.local` (see
 `infra/kustomize/base/orchestrator.yaml` and `workers.yaml`). It must match how
 peers address that Service.
+
+**The cards are A2A v1.0-shaped.** `supportedInterfaces[]` (each entry a `url`,
+a `protocolBinding` of `JSONRPC` and a `protocolVersion` of `1.0`) replaced the
+top-level `url` and `protocolVersion` fields, and
+`supportsAuthenticatedExtendedCard` moved to `capabilities.extendedAgentCard`.
+The mount paths did not change, so the resolver, the Makefile and the manifests
+did not either. The JSON-RPC route still answers 0.3-shaped requests
+(`enable_v0_3_compat=True`) while the cards advertise only 1.0 — accept, but
+do not advertise. The cost is borne by hand-rolled clients: a request with **no
+`A2A-Version` header is treated as 0.3**, so a v1.0 method name comes back as an
+HTTP 200 carrying JSON-RPC error `-32009` and an empty stream, which reads as
+"the agent had nothing to say". ADK's own client sends the header, so delegation
+was never affected. [`docs/a2a-v1-migration.md`](docs/a2a-v1-migration.md) has
+the rest of the upgrade.
 
 ## Context provisioning
 
@@ -277,10 +292,11 @@ in-memory behaviour.
 The cluster manifests default to AlloyDB for both session state and A2A tasks.
 
 **Why the task store matters too.** The default `InMemoryTaskStore` is per-pod,
-so a task created by the pod that answered `message/send` is invisible to the
-pod that later receives `tasks/get`. That silently breaks task polling and
-resubscription the moment an agent has more than one replica — it is a
-correctness bug, not just a durability gap.
+so a task created by the pod that answered `SendMessage` is invisible to the
+pod that later receives `GetTask` (`message/send` and `tasks/get` before A2A
+v1.0 renamed the methods). That silently breaks task polling and resubscription
+the moment an agent has more than one replica — it is a correctness bug, not
+just a durability gap.
 
 ### One database, one schema per agent
 
@@ -368,12 +384,23 @@ Two deliberate additions beyond what the libraries declare:
   timestamps at all, so tasks would accumulate with no way to identify old rows.
   A trigger is required because PostgreSQL has no `ON UPDATE` clause and
   `DatabaseTaskStore` writes through `session.merge()`, which touches only its
-  own columns. The columns stay invisible to the ORM.
+  own columns. The columns stay invisible to the ORM. a2a 1.x added a
+  `last_updated` of its own, which does **not** replace them: it is
+  ORM-maintained and NULL for every row 0.3.x wrote, so retention still keys off
+  the trigger-maintained `updated_at`.
 - Indexes on `sessions.update_time` and `tasks.updated_at`, so a retention sweep
   is a range scan rather than a full table scan.
 - `approval_cases` (revision `0005`), the approval store described next. Unlike
   the other two this table is ours, not a library's. Revision `0005` also drops
   `hitl_approvals`, the coroutine-era table it replaces.
+
+Revision `0006` is the A2A v1.0 upgrade, and it is the library's own doing
+rather than ours: three nullable columns a2a 1.x added to `tasks` (`owner`,
+`last_updated`, `protocol_version`) plus an index on `(owner, last_updated)`. It
+is a pure additive `ALTER TABLE`, safe against a live table — and skipping it
+fails in the worst way available. The table still exists and the health probe
+never touches it, so the pods go green and the **first delegation** fails with
+`UndefinedColumn` ([`docs/a2a-v1-migration.md`](docs/a2a-v1-migration.md)).
 
 ## Human-in-the-loop
 
@@ -679,6 +706,12 @@ kubectl -n agents get pods,svc
 The Job creates the `agents` database (the Terraform provider has no
 `google_alloydb_database` resource), then per agent creates its schema, runs
 every migration, and grants that agent's IAM role access to it.
+
+> **Upgrading an A2A v0.3 deployment:** the wait above still matters even
+> though the schema already exists. Revision `0006` adds the columns a2a 1.x
+> names in its own statements, and a pod that starts without them does *not*
+> crash-loop — it goes green and fails on the first delegation. Green pods are
+> not the check here; a completed Job is.
 
 ### 4. Try it
 

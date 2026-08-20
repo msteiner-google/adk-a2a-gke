@@ -13,7 +13,15 @@
 # limitations under the License.
 
 from google.adk.agents import BaseAgent
-from google.adk.agents.run_config import RunConfig, StreamingMode
+from google.adk.agents.run_config import (
+    RunConfig,
+    # ADK 2.7.0 moved StreamingMode into a private module and re-exports it
+    # here without an `__all__`, so pyright reads the re-export as private.
+    # `run_config` is still the public, documented location -- importing the
+    # private module to satisfy the checker would swap a cosmetic warning for
+    # a real coupling to an underscore-prefixed module.
+    StreamingMode,  # pyright: ignore[reportPrivateImportUsage]
+)
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types

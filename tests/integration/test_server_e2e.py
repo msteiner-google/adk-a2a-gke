@@ -27,13 +27,14 @@ import pytest
 import requests
 from a2a.types import (
     Message,
-    MessageSendParams,
     Part,
     Role,
-    SendStreamingMessageRequest,
-    SendStreamingMessageResponse,
-    TextPart,
+    SendMessageRequest,
+    StreamResponse,
+    TaskState,
 )
+from a2a.utils.constants import PROTOCOL_VERSION_1_0, VERSION_HEADER
+from google.protobuf.json_format import MessageToDict, ParseDict
 from requests.exceptions import RequestException
 
 # Configure logging
@@ -168,50 +169,129 @@ def test_adk_run_sse(server_fixture: subprocess.Popen[str]) -> None:
     assert has_text_content, "Expected at least one event with text content"
 
 
+def _stream_jsonrpc(
+    method: str, params: dict[str, Any], *, version: str | None
+) -> list[dict[str, Any]]:
+    """POST a JSON-RPC request to the A2A route and collect the SSE payloads.
+
+    ``version`` sets the ``A2A-Version`` header, and passing it is not optional
+    for a v1.0 call. With ``enable_v0_3_compat=True`` the server treats a request
+    that carries no version header as 0.3, so a 1.0 method name on an unversioned
+    request is rejected with ``VERSION_NOT_SUPPORTED`` (-32009) — an HTTP 200
+    carrying a JSON-RPC error, and therefore an empty SSE stream rather than an
+    obvious failure. Pass ``None`` to reproduce an old client.
+    """
+    headers = dict(HEADERS)
+    if version is not None:
+        headers[VERSION_HEADER] = version
+
+    response = requests.post(
+        A2A_RPC_URL,
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": "test-req-001",
+            "method": method,
+            "params": params,
+        },
+        stream=True,
+        timeout=60,
+    )
+    assert response.status_code == 200, response.text
+
+    payloads: list[dict[str, Any]] = []
+    for line in response.iter_lines():
+        if line:
+            decoded = line.decode("utf-8")
+            if decoded.startswith("data: "):
+                payloads.append(json.loads(decoded[6:]))
+
+    errors = [payload["error"] for payload in payloads if "error" in payload]
+    assert not errors, f"JSON-RPC error from {method}: {errors}"
+    return payloads
+
+
 def test_a2a_chat_stream(server_fixture: subprocess.Popen[str]) -> None:
-    """Test the A2A route using the JSON-RPC streaming protocol."""
+    """Test the A2A route using the v1.0 JSON-RPC streaming protocol.
+
+    Three things changed with A2A v1.0 and all three are asserted here, because
+    each one fails silently in a different direction:
+
+    * The method is ``SendStreamingMessage``, not ``message/stream``.
+    * Stream events are discriminated by JSON member (``statusUpdate`` /
+      ``artifactUpdate`` / ``task`` / ``message``) rather than by a ``kind``
+      field, and the ``final`` boolean is gone — completion is the terminal
+      state plus stream closure.
+    * ``TaskState`` is ``TASK_STATE_COMPLETED``, not ``completed``. Asserting on
+      the old lowercase string would simply never match and the test would read
+      as "no final response" rather than as a protocol mismatch.
+    """
     logger.info("Starting A2A chat stream test")
 
     message = Message(
         message_id=f"msg-user-{uuid.uuid4()}",
-        role=Role.user,
-        parts=[Part(root=TextPart(text="Hi!"))],
+        role=Role.ROLE_USER,
+        parts=[Part(text="Hi!")],
     )
-    request = SendStreamingMessageRequest(
-        id="test-req-001",
-        params=MessageSendParams(message=message),
+    params = MessageToDict(SendMessageRequest(message=message))
+
+    payloads = _stream_jsonrpc(
+        "SendStreamingMessage", params, version=PROTOCOL_VERSION_1_0
     )
-    response = requests.post(
-        A2A_RPC_URL,
-        headers=HEADERS,
-        json=request.model_dump(mode="json", exclude_none=True),
-        stream=True,
-        timeout=60,
-    )
-    assert response.status_code == 200
+    assert payloads, "No responses received from stream"
 
-    responses: list[SendStreamingMessageResponse] = []
-    for line in response.iter_lines():
-        if line:
-            line_str = line.decode("utf-8")
-            if line_str.startswith("data: "):
-                responses.append(
-                    SendStreamingMessageResponse.model_validate(
-                        json.loads(line_str[6:])
-                    )
-                )
-
-    assert responses, "No responses received from stream"
-
-    final_responses = [
-        r.root
-        for r in responses
-        if hasattr(r.root, "result")
-        and hasattr(r.root.result, "final")
-        and r.root.result.final is True
+    # Parse back into the proto so a shape change is a parse error here rather
+    # than a missing key three lines down.
+    events = [
+        ParseDict(payload["result"], StreamResponse())
+        for payload in payloads
+        if "result" in payload
     ]
-    assert final_responses, "No final response received"
-    assert final_responses[-1].result.status.state == "completed"
+    assert events, f"Stream carried no results: {payloads}"
+
+    # Compare against the enum, not the string it serializes to: on the proto
+    # types `state` is an int, so `== "TASK_STATE_COMPLETED"` is quietly always
+    # False and the assertion below would report an unfinished stream instead of
+    # a bad comparison.
+    terminal = [
+        event
+        for event in events
+        if event.HasField("status_update")
+        and event.status_update.status.state == TaskState.TASK_STATE_COMPLETED
+    ]
+    assert terminal, (
+        "No TASK_STATE_COMPLETED status update in the stream; saw "
+        f"{[e.WhichOneof('payload') for e in events]}"
+    )
+
+
+def test_a2a_chat_stream_accepts_v0_3_clients(
+    server_fixture: subprocess.Popen[str],
+) -> None:
+    """The route keeps answering 0.3-shaped requests during the rollout.
+
+    ``create_jsonrpc_routes(..., enable_v0_3_compat=True)`` in
+    `app/app_utils/a2a.py` is what allows a peer that has not upgraded yet to
+    keep calling this agent. That flag is invisible until a 0.3 client shows up
+    in production, so it is exercised here with a literal 0.3 payload: the old
+    ``message/stream`` method, the old lowercase ``role``, and the old ``kind``
+    discriminator on the part.
+    """
+    payloads = _stream_jsonrpc(
+        "message/stream",
+        {
+            "message": {
+                "messageId": f"msg-user-{uuid.uuid4()}",
+                "role": "user",
+                "parts": [{"kind": "text", "text": "Hi!"}],
+            }
+        },
+        version=None,
+    )
+    assert payloads, "No responses received for the v0.3-shaped request"
+    assert any("result" in payload for payload in payloads), (
+        f"v0.3 compat request returned only errors: {payloads}"
+    )
 
 
 def test_agent_card(server_fixture: subprocess.Popen[str]) -> None:
@@ -220,8 +300,17 @@ def test_agent_card(server_fixture: subprocess.Popen[str]) -> None:
     assert response.status_code == 200, f"A2A endpoint returned {response.status_code}"
 
     served_agent_card = response.json()
-    for field in ("name", "description", "skills", "capabilities", "url", "version"):
+    # `url` and `protocolVersion` are NOT in this list any more: A2A v1.0 moved
+    # both into `supportedInterfaces[]`, one entry per transport binding.
+    for field in ("name", "description", "skills", "capabilities", "version"):
         assert field in served_agent_card, f"Missing field in agent card: {field}"
+
+    interfaces = served_agent_card.get("supportedInterfaces")
+    assert interfaces, f"Card advertises no interfaces: {served_agent_card}"
+    assert any(
+        interface.get("url") and interface.get("protocolBinding") == "JSONRPC"
+        for interface in interfaces
+    ), f"No JSON-RPC interface on the card: {interfaces}"
 
 
 def test_collect_feedback(server_fixture: subprocess.Popen[str]) -> None:

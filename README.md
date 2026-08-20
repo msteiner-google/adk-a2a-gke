@@ -66,7 +66,9 @@ scaffolding for the parts that are not.
 
 **Status.** This is a working reference implementation, not a product. Several
 ADK features it relies on are marked experimental, so pin the ADK version
-deliberately.
+deliberately. It speaks **A2A protocol v1.0** (`a2a-sdk >= 1.1.2`, which is why
+the `google-adk` floor is `>= 2.5.0`), while still accepting v0.3 requests —
+[docs/a2a-v1-migration.md](docs/a2a-v1-migration.md) covers the upgrade.
 
 **Where to go next:**
 
@@ -80,6 +82,7 @@ deliberately.
 | Make an agent wait for a human | [docs/human-in-the-loop.md](docs/human-in-the-loop.md) |
 | Deploy to your own GCP project | [docs/deploy-to-another-project.md](docs/deploy-to-another-project.md) |
 | Inspect sessions, tasks and approvals in AlloyDB | [docs/inspecting-the-database.md](docs/inspecting-the-database.md) |
+| Upgrade a repo like this one from A2A v0.3 to v1.0 | [docs/a2a-v1-migration.md](docs/a2a-v1-migration.md) — what changed here, and the two ways it fails quietly |
 | Work on this with a coding agent | `AGENTS.md` — invariants, gotchas, verified commands |
 
 ## Project Structure
@@ -124,7 +127,8 @@ mas-gke/
 ├── tests/                      # unit / integration / eval
 ├── docs/                       # environment-variables, adding-an-agent,
 │                               #   inspecting-the-database, human-in-the-loop,
-│                               #   design-decisions, deploy-to-another-project
+│                               #   design-decisions, deploy-to-another-project,
+│                               #   a2a-v1-migration
 ├── AGENTS.md                   # AI-assisted development guide
 ├── cloudbuild.yaml             # Image build (Cloud Build); `make image` runs it
 └── pyproject.toml              # Project dependencies
@@ -382,4 +386,13 @@ Collector (Grafana Tempo, Jaeger, Datadog, ...) instead. See
 ## A2A Inspector
 
 This agent supports the [A2A Protocol](https://a2a-protocol.org/). Use the [A2A Inspector](https://github.com/a2aproject/a2a-inspector) to test interoperability.
-Each agent publishes its card at `/a2a/app/.well-known/agent-card.json`.
+Each agent publishes its card at `/a2a/app/.well-known/agent-card.json` — same
+path as before the v1.0 upgrade, but v1.0-shaped: `supportedInterfaces[]`
+replaced the top-level `url` and `protocolVersion`.
+
+The JSON-RPC route accepts v0.3 requests as well, and that is the trap for a
+hand-rolled client. A request with **no `A2A-Version` header is treated as
+0.3**, so a v1.0 method name (`SendMessage`, `GetTask`) comes back as an HTTP
+200 carrying JSON-RPC error `-32009` and an empty stream — which reads as the
+agent having nothing to say. Send `A2A-Version: 1.0`; see
+[docs/a2a-v1-migration.md](docs/a2a-v1-migration.md).

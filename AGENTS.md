@@ -61,7 +61,7 @@ code path.
 All of these were run in this repo and pass as of the last update to this file.
 
 ```bash
-# Unit tests — 342 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
+# Unit tests — 343 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
 # (see "Importing app hits the network" below).
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite \
 GEMINI_BALANCED_MODEL=gemini-2.5-flash \
@@ -163,7 +163,10 @@ Read the module docstrings; they are thorough. This is the index.
   `pathlib.Path`), so no bucket or credentials are involved.
   `test_migrations.py` renders the Alembic migrations **offline** (no database)
   and diffs them against ADK's and the a2a SDK's own metadata — it is the guard
-  that catches a library adding a column.
+  that catches a library adding a column. It compares the **effective** schema
+  at head, replaying `ALTER TABLE ... ADD/DROP COLUMN` over each `CREATE TABLE`,
+  so a column added by a later revision counts as present. Reading only the
+  `CREATE TABLE` would report every additive revision as missing drift forever.
 - `tests/unit/test_cases.py` — the approval case state machine, run against
   **both** backends (in-memory and SQLAlchemy-on-SQLite), plus recovering a
   proposal from a peer's text reply.
@@ -332,6 +335,31 @@ These are real traps that have bitten this codebase.
   appends `rpc_path` (`A2A_RPC_PATH`, default `/a2a/app`) + the well-known path.
   Pointing at the root's `/.well-known/...` 404s.
 
+- **A hand-rolled A2A client must send `A2A-Version: 1.0`.** The JSON-RPC route
+  runs with `enable_v0_3_compat=True`, so a request arriving with *no* version
+  header is treated as protocol 0.3 — and a v1.0 method name
+  (`SendStreamingMessage`, `GetTask`) on an unversioned request comes back as
+  **HTTP 200** carrying a JSON-RPC `-32009 VERSION_NOT_SUPPORTED` body. A client
+  that checks the status code and then reads SSE frames sees a successful
+  request with an empty stream, which reads as "the agent had nothing to say".
+  ADK's own client sends the header, so agent-to-agent delegation never hits
+  this; `curl`, the A2A Inspector and the integration tests do. See
+  [`docs/a2a-v1-migration.md`](docs/a2a-v1-migration.md).
+
+- **A2A v1.0 types are protobuf, so enum comparisons against strings silently
+  fail.** `task.status.state == "TASK_STATE_COMPLETED"` is always `False` —
+  `state` is an `int`. Compare against `TaskState.TASK_STATE_COMPLETED`. The
+  symptom is "the stream never completed", not a type error. Likewise
+  `model_dump()` / `model_validate()` are gone; use `MessageToDict` /
+  `ParseDict` from `google.protobuf.json_format`.
+
+- **The `google-adk>=2.5.0` floor is a correctness constraint, not a
+  preference.** ADK declares `a2a-sdk<2,>=0.3.4`, so the resolver will happily
+  pair ADK 2.4.0 with a2a-sdk 1.x. ADK isolates every 0.3-vs-1.x difference in
+  `google/adk/a2a/_compat.py` (`IS_A2A_V1` picks the branch at import), and that
+  module first ships in **2.5.0**. Below it, ADK builds 0.3-shaped parts and
+  cards against a 1.x SDK: pods start, probes pass, first delegation fails.
+
 - **`APP_URL` must be set per agent.** It is the URL the agent advertises in its
   own card — what peers call. It defaults to `http://0.0.0.0:8000`, unreachable
   from other pods. The kustomize Deployments set it per role; set it too for
@@ -400,6 +428,20 @@ These are real traps that have bitten this codebase.
   on PostgreSQL; a2a's `PydanticType` uses SQLAlchemy's generic `JSON`, which
   renders as `json`. The migrations differ accordingly — that is intentional,
   and matching each library exactly is what keeps the ORM's binding correct.
+
+- **A missing a2a task column fails at first delegation, not at startup.**
+  Migration `0006` adds the three columns a2a-sdk 1.x introduced (`owner`,
+  `last_updated`, `protocol_version`). Skip it and the `tasks` table still
+  exists, the pod still passes its health probe, and `DatabaseTaskStore` dies
+  with `UndefinedColumn` the first time an agent is actually delegated to. This
+  is the general shape of task-store drift, not a one-off: run the migration Job
+  to completion before treating green pods as a working deployment.
+
+- **a2a's `last_updated` is not this repo's `updated_at`.** `updated_at` (from
+  `0002`) is maintained by a trigger, so it advances on every write no matter
+  who made it — which is what makes it trustworthy for retention sweeps.
+  `last_updated` is ORM-maintained and is NULL for every row written before the
+  upgrade. Retention still keys off `updated_at`; do not "deduplicate" them.
 
 - **Alembic autogenerate is off.** The tables belong to two third-party
   libraries, so autogenerate would let a library upgrade rewrite production DDL
@@ -876,4 +918,6 @@ Three rules worth stating outright:
   changing architecture or commands. `docs/environment-variables.md` is the
   configuration reference; `docs/human-in-the-loop.md` is the approval guide;
   `docs/design-decisions.md` records why the architecture is what it is, with
-  the measurements and the rejected alternatives behind each choice.
+  the measurements and the rejected alternatives behind each choice;
+  `docs/a2a-v1-migration.md` is the A2A v0.3 → v1.0 upgrade record — what
+  changed here, and the two ways that upgrade fails quietly.

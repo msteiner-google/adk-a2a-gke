@@ -12,6 +12,14 @@ reintroduces failures that took real effort to find. The numbered decisions
 Everything quoted below was executed against ADK 2.6.1 / a2a-sdk 0.3.26 on
 Vertex AI. Where a claim is inference rather than measurement, it says so.
 
+The repo has since moved to **a2a-sdk 1.x (A2A protocol v1.0)** — see
+[`a2a-v1-migration.md`](a2a-v1-migration.md). Every decision below still holds
+and none was re-measured against 1.x: the upgrade changed the wire encoding and
+the server wiring, not the delegation topology these measurements are about. The
+one number to re-read with that in mind is D1's ten message parts. The mechanism
+that produced it — `RemoteA2aAgent` rebuilding an outbound message from the
+caller's session events — is unchanged in 1.x, so the leak it describes is too.
+
 ---
 
 ## The rule: share nothing at *runtime*, share code freely

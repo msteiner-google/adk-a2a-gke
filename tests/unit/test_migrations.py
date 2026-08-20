@@ -112,6 +112,41 @@ def _column_definitions(lines: list[str]) -> set[str]:
     }
 
 
+_ADD_COLUMN = re.compile(
+    r"ALTER TABLE (?P<name>[\w.]+) ADD COLUMN (?P<definition>.+?);", re.IGNORECASE
+)
+_DROP_COLUMN = re.compile(
+    r"ALTER TABLE (?P<name>[\w.]+) DROP COLUMN (?P<column>[\w\"]+);", re.IGNORECASE
+)
+
+
+def _effective_columns(sql: str, table: str) -> set[str]:
+    """Return `table`'s column set at head, after replaying every ALTER TABLE.
+
+    Reading only the CREATE TABLE would describe the schema as of the revision
+    that first created the table, not the one the code actually runs against. A
+    column added by a later revision would then read as missing, and — the
+    failure that matters — a column the library added and nobody migrated would
+    read as present the moment someone wrote *any* ALTER for that table. This
+    replays adds and drops in render order so the comparison is against the
+    schema `alembic upgrade head` really leaves behind.
+    """
+    columns = _column_definitions(_created_tables(sql)[table])
+
+    for match in _ADD_COLUMN.finditer(sql):
+        if match.group("name").split(".")[-1] != table:
+            continue
+        columns.add(" ".join(match.group("definition").split()))
+
+    for match in _DROP_COLUMN.finditer(sql):
+        if match.group("name").split(".")[-1] != table:
+            continue
+        dropped = match.group("column").strip('"')
+        columns -= {line for line in columns if line.split()[0].strip('"') == dropped}
+
+    return columns
+
+
 def _library_columns(table) -> set[str]:
     """Compile a library's own CREATE TABLE and return its column definitions."""
     ddl = str(CreateTable(table).compile(dialect=postgresql.dialect()))
@@ -178,7 +213,7 @@ def test_tasks_table_is_a_superset_of_a2a_columns(migration_sql: str) -> None:
     """`tasks` must carry every a2a column; extras (timestamps) are ours."""
     from a2a.server.models import TaskModel
 
-    ours = _column_definitions(_created_tables(migration_sql)["tasks"])
+    ours = _effective_columns(migration_sql, "tasks")
     theirs = _library_columns(TaskModel.__table__)
 
     missing = theirs - ours
@@ -193,7 +228,7 @@ def test_tasks_table_adds_retention_timestamps(migration_sql: str) -> None:
     """a2a's model has no timestamps, so tasks could never be expired."""
     from a2a.server.models import TaskModel
 
-    ours = _column_definitions(_created_tables(migration_sql)["tasks"])
+    ours = _effective_columns(migration_sql, "tasks")
     extra = {line.split()[0] for line in ours - _library_columns(TaskModel.__table__)}
 
     assert extra == {"created_at", "updated_at"}
@@ -206,6 +241,19 @@ def test_tasks_table_adds_retention_timestamps(migration_sql: str) -> None:
 def test_task_retention_indexes_exist(migration_sql: str) -> None:
     assert "idx_tasks_context_id" in migration_sql
     assert "idx_tasks_updated_at" in migration_sql
+
+
+def test_tasks_table_carries_the_a2a_v1_owner_index(migration_sql: str) -> None:
+    """a2a 1.x declares this one itself; scoped task listing orders by it.
+
+    Unlike `ix_tasks_id`, which duplicates the primary key and is deliberately
+    skipped, this composite has no equivalent in the table already.
+    """
+    from a2a.server.models import TaskModel
+
+    declared = {index.name for index in TaskModel.__table__.indexes}
+    assert "idx_tasks_owner_last_updated" in declared
+    assert "idx_tasks_owner_last_updated" in migration_sql
 
 
 # --- Approval cases (ours, not a library's) ----------------------------------
