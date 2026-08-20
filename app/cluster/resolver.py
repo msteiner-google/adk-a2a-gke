@@ -16,9 +16,9 @@
 
 The ``AgentResolver`` is the injectable "service discovery" layer for the
 cluster: given the ``ClusterConfig`` (which peers exist and where), it produces
-the ``RemoteA2aAgent`` instances a coordinating agent delegates to over A2A.
+the ``ResumingA2aAgent`` instances a coordinating agent delegates to over A2A.
 
-Discovery is **agent-card based**: for each peer we point ``RemoteA2aAgent`` at
+Discovery is **agent-card based**: for each peer we point ``ResumingA2aAgent`` at
 the peer's well-known agent-card URL. The A2A serving layer mounts the JSON-RPC
 endpoint and the agent card under ``/a2a/<app_name>`` (``/a2a/app`` by default,
 see ``ClusterConfig.rpc_path``), so the card lives at
@@ -31,8 +31,11 @@ does no network I/O.
 **How a peer is wired depends on whether it can suspend.** Neither wiring does
 both jobs, so the resolver picks per peer:
 
-* A peer that owns a gated tool becomes a **sub-agent**. In-task authorization
-  (A2A spec 7.6) suspends the specialist's Task in
+* A peer that owns a gated tool becomes a **sub-agent** — reached as a *task
+  delegation*, not by ``transfer_to_agent``: ``ResumingA2aAgent`` declares
+  ``mode="task"``, so ADK wraps it in a ``_TaskAgentTool`` and drives it as a
+  workflow node. The pause propagates *and* the caller resumes afterwards.
+  In-task authorization (A2A spec 7.6) suspends the specialist's Task in
   ``TASK_STATE_AUTH_REQUIRED``, and for that to reach a human every agent in
   between has to suspend too — "a chain of Tasks in
   ``TASK_STATE_AUTH_REQUIRED``" (spec 7.6.2). ``AgentTool`` cannot carry that
@@ -40,7 +43,7 @@ both jobs, so the resolver picks per peer:
   only ``state_delta``, ``error_message`` and ``content``
   (``google/adk/tools/agent_tool.py``), never ``long_running_tool_ids``. A
   suspended peer is then indistinguishable from one that answered with an empty
-  string. As a sub-agent, ``RemoteA2aAgent`` propagates the suspension and
+  string. As a sub-agent, ``ResumingA2aAgent`` propagates the suspension and
   records the remote ``task_id``, which is what makes the request reach a human
   at all.
 
@@ -52,22 +55,20 @@ both jobs, so the resolver picks per peer:
 
 The split is derived from the peers' own tools rather than declared twice: see
 ``app/agents/gating.py`` and ``ClusterModule`` in ``app/cluster/di.py``. The
-cost of the sub-agent half, accepted deliberately, is that
-``transfer_to_agent`` carries no arguments — a specialist is reached with the
-caller's recent conversation rather than a typed payload, so it sees context it
-has no need for. ``docs/design-decisions.md`` records the original measurement
-against that and why authorization overrode it.
+cost of the sub-agent half, accepted deliberately, is that a specialist is
+reached with the caller's recent conversation rather than a typed payload, so
+it sees context it has no need for. ``docs/design-decisions.md`` records the
+original measurement against that and why authorization overrode it.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from google.adk.agents.remote_a2a_agent import (
-    AGENT_CARD_WELL_KNOWN_PATH,
-    RemoteA2aAgent,
-)
+from google.adk.agents.remote_a2a_agent import AGENT_CARD_WELL_KNOWN_PATH
 from google.adk.tools.agent_tool import AgentTool
+
+from app.cluster.resume import ResumingA2aAgent
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -76,7 +77,7 @@ if TYPE_CHECKING:
 
 
 class AgentResolver:
-    """Resolves configured peers into ``RemoteA2aAgent`` sub-agents.
+    """Resolves configured peers into ``ResumingA2aAgent`` sub-agents.
 
     Construct it with a ``ClusterConfig`` (usually via dependency injection —
     see ``app/cluster/di.py``), then call :meth:`resolve_all` to get every peer
@@ -120,18 +121,18 @@ class AgentResolver:
         """
         return f"{peer.base_url}{self._config.rpc_path}{AGENT_CARD_WELL_KNOWN_PATH}"
 
-    def resolve_peer(self, peer: PeerSpec) -> RemoteA2aAgent:
-        """Build a ``RemoteA2aAgent`` for a single peer spec.
+    def resolve_peer(self, peer: PeerSpec) -> ResumingA2aAgent:
+        """Build a ``ResumingA2aAgent`` for a single peer spec.
 
         Args:
             peer: The peer to address.
 
         Returns:
-            A ``RemoteA2aAgent`` pointed at the peer's agent card. The card
+            A ``ResumingA2aAgent`` pointed at the peer's agent card. The card
             (and the peer's real description/capabilities) is resolved lazily by
             ADK on first invocation, so this call does no network I/O.
         """
-        return RemoteA2aAgent(
+        return ResumingA2aAgent(
             name=peer.name,
             agent_card=self.card_url(peer),
             description=(
@@ -140,14 +141,14 @@ class AgentResolver:
             ),
         )
 
-    def resolve(self, name: str) -> RemoteA2aAgent:
+    def resolve(self, name: str) -> ResumingA2aAgent:
         """Resolve a single peer by name.
 
         Args:
             name: The peer name to look up in the configuration.
 
         Returns:
-            The peer as a ``RemoteA2aAgent``.
+            The peer as a ``ResumingA2aAgent``.
 
         Raises:
             KeyError: If no peer with that name is configured.
@@ -168,11 +169,11 @@ class AgentResolver:
         """
         return name in self._suspending
 
-    def resolve_sub_agents(self) -> list[RemoteA2aAgent]:
+    def resolve_sub_agents(self) -> list[ResumingA2aAgent]:
         """Resolve the peers that must be sub-agents.
 
         Returns:
-            A ``RemoteA2aAgent`` per peer that can suspend, so an authorization
+            A ``ResumingA2aAgent`` per peer that can suspend, so an authorization
             request it raises propagates to this agent instead of being
             swallowed.
         """

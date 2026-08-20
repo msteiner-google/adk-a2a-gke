@@ -20,7 +20,9 @@ Kubernetes and connecting them over A2A. The agents themselves live in
 each other:
 
 - ``config``   — environment-driven cluster/agent/peer configuration (pure).
-- ``resolver`` — turns peers into ``RemoteA2aAgent`` children (discovery).
+- ``resolver`` — turns peers into ``ResumingA2aAgent`` children (discovery).
+- ``resume``   — keeps a human's decision a *function response* so the peer
+  that is paused on it can actually resume (google/adk-python#6721).
 - ``session``  — pluggable session/memory backends (in-memory or managed).
 - ``di``       — injector modules wiring the above.
 """

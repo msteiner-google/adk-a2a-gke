@@ -119,10 +119,11 @@ def test_build_agent_leaf_has_only_its_own_tools():
 
 
 def test_a_peer_that_can_suspend_is_a_sub_agent():
-    # An AgentTool runs the peer to exhaustion and drops long_running_tool_ids,
-    # so a peer suspended awaiting human authorization is indistinguishable
-    # from one that answered with an empty string -- the authorization request
-    # never reaches anyone. `math` owns a gated tool, so it must be here.
+    # A plain AgentTool runs the peer to exhaustion and drops
+    # long_running_tool_ids, so a peer suspended awaiting human authorization is
+    # indistinguishable from one that answered with an empty string -- the
+    # authorization request never reaches anyone. `math` owns a gated tool, so
+    # it must be a sub-agent, which ADK then drives as a task delegation.
     orchestrator = build_agent(
         AGENTS["orchestrator"], _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS)
     )
@@ -131,15 +132,18 @@ def test_a_peer_that_can_suspend_is_a_sub_agent():
     assert all(isinstance(a, RemoteA2aAgent) for a in orchestrator.sub_agents)
 
 
-def test_a_peer_that_cannot_suspend_is_a_tool():
-    # transfer_to_agent is a one-way handoff: the caller's invocation ends, so
-    # it can never use what the peer returned. Measured -- math transferred to
-    # currency and never resumed to finish the sum. A peer with nothing to
-    # suspend belongs in `tools`, where its answer comes back.
+def test_every_peer_is_callable_as_a_tool():
+    # Both halves of the split end up callable, by different routes. `research`
+    # is an explicit AgentTool; `math` is a task-mode sub-agent, which ADK wraps
+    # in a _TaskAgentTool of its own accord. That second route is what lets the
+    # caller keep going after a peer answers -- transfer_to_agent ended the
+    # caller's invocation, so a turn needing two specialists stopped at the
+    # first. Measured before task mode: math transferred to currency and never
+    # resumed to finish the sum.
     orchestrator = build_agent(
         AGENTS["orchestrator"], _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS)
     )
-    assert _tool_names(orchestrator) == {"research"}
+    assert _tool_names(orchestrator) == {"research", "math"}
 
 
 def test_the_split_is_derived_from_the_gated_tools():
@@ -183,7 +187,8 @@ def test_build_agent_keeps_own_tools_alongside_peers():
         peers=("research",),
     )
     agent = build_agent(spec, _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS))
-    assert _tool_names(agent) == {"calculate", "research"}
+    # "math" is the task-mode wrapper ADK adds for the suspending sub-agent.
+    assert _tool_names(agent) == {"calculate", "research", "math"}
     assert {a.name for a in agent.sub_agents} == {"math"}
 
 
@@ -191,7 +196,7 @@ def test_build_agent_peers_come_from_config_not_spec():
     # Even a normally-leaf agent gets peers if the config resolved some (e.g. via
     # an A2A_PEERS override): peers are attached uniformly from the resolver.
     agent = build_agent(AGENTS["research"], _FAKE_MODELS, _resolver(_CONFIG_WITH_PEERS))
-    assert _tool_names(agent) == {"web_search", "read_document", "research"}
+    assert _tool_names(agent) == {"web_search", "read_document", "research", "math"}
     assert {a.name for a in agent.sub_agents} == {"math"}
 
 

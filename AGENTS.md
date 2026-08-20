@@ -134,7 +134,8 @@ Read the module docstrings; they are thorough. This is the index.
 | `app/cluster/grants.py` | Delivers a decision **straight to the agent that owns the suspended tool**. ADK cannot resolve a peer's confirmation locally, so a grant sent to the caller is silently dropped — see the module docstring. |
 | `app/cluster/cases.py` | The approval case store (`pending → approved → executed`), both backends (in-memory / `approval_cases`), and the helpers that read a proposal back out of a peer's text reply. |
 | `app/cluster/config.py` | **Pure stdlib** (no ADK/genai imports). `PeerSpec`, `ClusterConfig.from_env()`, `service_dns_url()`. Parses `AGENT_NAME` / `A2A_*`. |
-| `app/cluster/resolver.py` | `AgentResolver` — turns peers into `RemoteA2aAgent`s pointed at their well-known agent cards. No network I/O at construction (ADK resolves cards lazily). |
+| `app/cluster/resolver.py` | `AgentResolver` — turns peers into `ResumingA2aAgent`s pointed at their well-known agent cards. No network I/O at construction (ADK resolves cards lazily). |
+| `app/cluster/resume.py` | `ResumingA2aAgent` — makes a human's decision actually reach a suspended peer. Two fixes in one class: `rerun_on_resume=True` so the workflow scheduler re-enters the peer node instead of fast-forwarding it, and forwarding the decision **as a function response** rather than the text ADK 2.7.x flattens it to (google/adk-python#6721). |
 | `app/cluster/di.py` | `ClusterModule` (config + resolver) and `SessionModule` (`Database`, session + memory + artifact services, A2A `TaskStore`). |
 | `app/cluster/session.py` | `build_session_service()` / `build_memory_service()` — backend selected by env. |
 | `app/cluster/artifacts.py` | `build_artifact_service()` — the shared `CloudPathArtifactService` when `ARTIFACT_STORAGE_URI` is set, else in-memory. Same URI for every agent on purpose (artifacts are keyed by the ADK app name `app`, not `AGENT_NAME`). |
@@ -267,16 +268,26 @@ Violating these is how this codebase breaks. They are deliberate.
    split from the registry; marking a tool `@gated` is the single act that
    wires its agent correctly. Both uniform rules were tried and each breaks
    something:
-   - *All tools*: `AgentTool` runs the peer to exhaustion and never reads
-     `long_running_tool_ids`, so a peer suspended awaiting human authorization
-     returns the empty string and the caller carries on. Every authorization
-     request is silently swallowed.
-   - *All sub-agents*: `transfer_to_agent` is a one-way handoff — the caller's
-     invocation **ends**. Measured: `math` transferred to `currency`, the
-     conversion succeeded, and the sum was abandoned with no addition, no
+   - *All plain `AgentTool`s*: `AgentTool` runs the peer to exhaustion and never
+     reads `long_running_tool_ids`, so a peer suspended awaiting human
+     authorization returns the empty string and the caller carries on. Every
+     authorization request is silently swallowed.
+   - *All sub-agents reached by `transfer_to_agent`*: a one-way handoff — the
+     caller's invocation **ends**. Measured: `math` transferred to `currency`,
+     the conversion succeeded, and the sum was abandoned with no addition, no
      publish and no case.
 
-   `tests/unit/test_agents.py` and `test_cluster_resolver.py` guard the split;
+   **The sub-agent half is reached as a task delegation, not by
+   `transfer_to_agent`.** `ResumingA2aAgent` declares `mode="task"`, so ADK
+   wraps it in a `_TaskAgentTool` and the workflow layer drives it as a node:
+   the pause still propagates *and* the caller gets a function response back and
+   carries on. That is why a suspending peer now appears in both `sub_agents`
+   and (via ADK's own wrapper) the agent's tool list — one turn can approve a
+   `trades` query and then go on to `math -> currency`, which the
+   `transfer_to_agent` wiring could not do.
+
+   `tests/unit/test_agents.py`, `test_cluster_resolver.py` and
+   `test_resume.py` guard the split;
    `test_every_tool_that_asks_for_approval_is_marked_gated` reads the source of
    every registered tool and fails if a gated one is missing its marker. That
    omission is the dangerous one: it wires the agent as a tool and swallows
@@ -506,6 +517,46 @@ These are real traps that have bitten this codebase.
     move between VPCs in place anyway, so a real `var.network` change is a
     manual migration — and the AlloyDB cluster's own `network_config` is
     deliberately *not* ignored, so such a change still surfaces there.
+
+- **Delegating successfully once can break every later delegation in the same
+  turn.** A completed task delegation leaves a synthesized function response
+  authored by `user` in the caller's session. ADK's history rebuild
+  (`_construct_message_parts_from_session`) re-serializes it verbatim, so the
+  *next* peer receives a message carrying a function response **and** text and
+  rejects it — "Message cannot contain both function responses and text". The
+  first hop looks perfect and everything after it fails.
+  `ResumingA2aAgent` renders call/response parts as text on that path and drops
+  the HITL bookkeeping outright.
+
+- **A resumed peer node is FAST-FORWARDED unless it sets `rerun_on_resume`.**
+  An agent with sub-agents is driven by ADK's workflow scheduler, which on
+  resume replays each node from the session. A node whose only interrupt has
+  just been answered completes *using the decision as its own output*
+  (`workflow/utils/_replay_interceptor.py`, case 4) — right for a local
+  `request_input`, wrong for a remote peer, which is a live A2A task waiting to
+  be re-driven. Measured: `node orchestrator@1/trades@1 schedule:
+  Fast-forwarding completed execution`, no request to the peer, **zero events**
+  in the turn. `ResumingA2aAgent` sets `rerun_on_resume=True`. The `curl` path
+  never showed this because an agent with no sub-agents skips the scheduler
+  entirely, so a decision posted straight at the tool's owner always worked.
+
+- **A decision answered in the ADK dev UI reaches a remote peer as TEXT unless
+  `ResumingA2aAgent` is in the way.** The second half of the same failure, and
+  it only becomes reachable once the node above actually re-runs. ADK 2.7.x
+  decides what to flatten by
+  function-call *name*, and a pause relayed up from a peer carries the same
+  `adk_request_confirmation` name as one the caller raised itself
+  (google/adk-python#6721, fix pending in #6759). Flattened, the peer's
+  suspended tool is never re-executed — the gated effect does not happen while
+  the peer's model narrates that it did. `app/cluster/resume.py` classifies by
+  *origin* instead. The `curl` path never hit this because
+  `app/cluster/grants.py` posts the decision straight at the peer.
+  Two related traps in the dev UI itself: the confirmation widget's
+  **`confirmed` checkbox defaults to unchecked**, so pressing Submit without
+  ticking it records a refusal; and typing anything after the widget makes the
+  *last* session event text-only, so `find_matching_function_call` returns
+  `None`, ADK rebuilds the request from raw history, and the peer rejects the
+  result with "Message cannot contain both function responses and text".
 
 - **A plausible answer is not proof the flow ran.** Three separate failures
   (a skipped graph node, a graph output that never reached the caller, an A2A
