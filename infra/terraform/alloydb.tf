@@ -32,6 +32,22 @@ data "google_compute_network" "vpc" {
   name    = var.network
   project = var.project_id
 
+  # This stays, and it has a cost the two resources below have to absorb.
+  #
+  # A greenfield project needs it: enabling the compute API is what auto-creates
+  # the `default` network this reads, so without the dependency the very first
+  # plan fails on a project that has not been pre-enabled -- which
+  # docs/deploy-to-another-project.md explicitly promises is unnecessary.
+  #
+  # The cost is that a data source with `depends_on` is deferred to APPLY time
+  # whenever that dependency has any pending change, which makes its `id`
+  # unknown at plan time. Indexing to one instance does not help: the deferral
+  # is decided per-resource, not per-instance, so
+  # `services["compute.googleapis.com"]` (already applied, unchanged) defers the
+  # read just the same -- verified against this state.
+  #
+  # That unknown reaches `network` on the two PSA resources below, where it is
+  # ForceNew. See the lifecycle block on each for what stops it there.
   depends_on = [google_project_service.services]
 }
 
@@ -43,12 +59,36 @@ resource "google_compute_global_address" "alloydb_psa" {
   address_type  = "INTERNAL"
   prefix_length = var.alloydb_psa_prefix_length
   network       = data.google_compute_network.vpc.id
+
+  # Without this, adding ANY api to local.services plans a destroy-and-recreate
+  # of this reserved range under a live AlloyDB cluster -- because the network
+  # read above is deferred to apply time and `network` is ForceNew. Adding
+  # bigquery + cloudbuild produced exactly that plan: "2 to destroy", with
+  # `address` becoming "known after apply", so even a successful recreate could
+  # hand back a different /16.
+  #
+  # Ignoring it is the honest thing rather than a plaster: a reserved peering
+  # range cannot be moved between VPCs in place anyway. Changing var.network on
+  # a live deployment is a manual PSA migration, not something an apply should
+  # attempt -- and the AlloyDB cluster's own network_config is NOT ignored, so
+  # such a change still surfaces there rather than passing silently.
+  lifecycle {
+    ignore_changes = [network]
+  }
 }
 
 resource "google_service_networking_connection" "alloydb_psa" {
   network                 = data.google_compute_network.vpc.id
   service                 = "servicenetworking.googleapis.com"
   reserved_peering_ranges = [google_compute_global_address.alloydb_psa.name]
+
+  # Same reasoning as the global address above, and this is the dangerous half:
+  # this connection IS the peering that carries pod traffic to the instance's
+  # private IP. Replacing it under a live cluster either fails (leaving a
+  # half-applied peering) or succeeds and cuts every pod off from the database.
+  lifecycle {
+    ignore_changes = [network]
+  }
 
   depends_on = [google_project_service.services]
 }

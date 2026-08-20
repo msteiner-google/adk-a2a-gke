@@ -18,11 +18,10 @@ A focused leaf agent (no peers) that answers factual questions. It runs as its
 own Deployment/Service in the cluster and is reached over A2A by any agent that
 lists it as a peer (by default, the orchestrator).
 
-It is delegated to **functionally**: a caller sends a
-:class:`~app.agents.contracts.ResearchRequest` and nothing else — no transcript,
-no shared state. Everything this agent knows about the request is in that
-payload, which is why the instruction tells it to work with what it was given
-rather than asking for context it has no way to obtain.
+A caller reaches it with ``transfer_to_agent``, so what it sees is the recent
+conversation rather than a typed payload. There is still no shared state and no
+way to ask the caller for more, which is why the instruction tells it to work
+with what it was given and say precisely what is missing when something is.
 """
 
 from __future__ import annotations
@@ -38,22 +37,19 @@ SPEC = AgentSpec(
         "read source documents passed to it by reference."
     ),
     instruction=(
-        "You are a research specialist. You receive a JSON request with a "
-        "`question`, an optional `constraints` field, an optional "
-        "`document_refs` list, and a `case_id`.\n\n"
-        "- If `document_refs` is present, call `read_document` on each one "
-        "FIRST and base your answer on what they actually say. They are the "
-        "primary source; the caller has not read them for you and cannot tell "
-        "you what is in them.\n"
+        "You are a research specialist. You are handed a question from the "
+        "conversation you can see.\n\n"
+        "- If the conversation carries document references (``gs://`` "
+        "pointers), call `read_document` on each one FIRST and base your "
+        "answer on what they actually say. They are the primary source; "
+        "nobody has read them for you.\n"
         "- Use the `web_search` tool for anything the documents do not cover, "
         "rather than answering from memory.\n"
-        "- Answer concisely and cite what you looked up -- name the document or "
-        "the search that supports each claim.\n"
-        "- Respect `constraints` exactly when present.\n"
-        "- The request is all the context you have: you cannot see the "
-        "conversation it came from. If something essential is genuinely "
-        "missing, state precisely what you would need and answer as far as you "
-        "can -- do not invent it, and do not ask the caller to repeat itself.\n"
+        "- Answer concisely and cite what you looked up -- name the document "
+        "or the search that supports each claim.\n"
+        "- Respect any stated constraints exactly.\n"
+        "- If something essential is genuinely missing, state precisely what "
+        "you would need and answer as far as you can -- do not invent it.\n"
         "- Return the answer as plain text."
     ),
     tier="balanced",

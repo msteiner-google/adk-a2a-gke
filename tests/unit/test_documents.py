@@ -19,7 +19,6 @@ same code path that reads ``gs://`` is exercised against ``tmp_path`` with no
 bucket and no credentials — the same trick ``test_cluster_artifacts.py`` uses.
 """
 
-from app.agents.contracts import PAYLOADS, ResearchRequest
 from app.agents.documents import MAX_CHARS, read_document
 
 
@@ -63,22 +62,16 @@ def test_long_documents_are_truncated_and_say_so(tmp_path):
     assert result["chars"] == MAX_CHARS + 500
 
 
-def test_every_contract_can_carry_document_references():
-    # The claim-check field belongs to the envelope, not to one specialist: any
-    # agent may be handed a document.
-    for schema in PAYLOADS.values():
-        assert "document_refs" in schema.model_fields
+def test_every_agent_that_may_read_a_document_has_the_tool():
+    # The claim-check read belongs to the toolbox, not to one specialist. This
+    # replaces three tests that asserted `document_refs` was a field on every
+    # peer contract; those contracts are gone (peers are sub-agents, and
+    # transfer_to_agent carries no typed arguments), so a pointer now arrives
+    # as text and what matters is that the reader tool is present.
+    from app.agents import AGENTS
 
-
-def test_document_refs_default_to_empty():
-    assert ResearchRequest(case_id="c1", question="q").document_refs == []
-
-
-def test_document_refs_are_declared_in_the_tool_schema():
-    schema = ResearchRequest.model_json_schema()
-    prop = schema["properties"]["document_refs"]
-    assert prop["type"] == "array"
-    assert prop["items"]["type"] == "string"
-    # The description is what tells the calling model to pass a pointer rather
-    # than pasting the document in.
-    assert "reference" in prop["description"]
+    tools = {
+        getattr(tool, "name", None) or getattr(tool, "__name__", "?")
+        for tool in AGENTS["research"].tools
+    }
+    assert "read_document" in tools

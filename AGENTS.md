@@ -17,24 +17,42 @@ GKE Autopilot with Terraform + Kustomize.
    user ───────────▶   │   orchestrator    │  tier=balanced
                        │  Deployment/Svc   │  holds the conversation
                        └─────────┬─────────┘
-        A2A — one typed payload per call, never the transcript
-                 ┌───────────────┴───────────────┐
-                 ▼                               ▼
-        ┌────────────────┐              ┌────────────────┐
-        │    research    │              │      math      │  leaf specialists
-        │ Deployment/Svc │              │ Deployment/Svc │  tier=balanced
-        └────────────────┘              └────────────────┘
+        A2A — sub-agent if it can suspend, tool otherwise
+      ┌──────────────┬───────────┼───────────────┐
+      ▼              ▼           ▼               ▼
+┌──────────┐   ┌──────────┐ ┌─────────┐    ┌──────────┐
+│ research │   │  math    │ │ planner │    │  trades  │  specialists
+│  tool    │   │sub-agent │ │  tool   │    │sub-agent │
+│ balanced │   │ balanced │ │balanced │    │ capable  │
+└──────────┘   └────┬─────┘ └─────────┘    └──────────┘
+                    │ A2A (tool)            gated: a query
+                    ▼                       runs only after
+              ┌──────────┐                  a human approves
+              │ currency │  tier=balanced
+              └──────────┘  reached ONLY by math
 ```
 
-**The agents share no runtime state.** A specialist is reached with an explicit
-request and sees nothing else — no conversation history, no shared session
-state, no shared artifact handles. The *default* request is a single free-text
-task; every agent here opts into a typed contract from
-`app/agents/contracts.py` instead, which is a choice you can make per peer. Large
-inputs travel as object-store references it reads itself, and an action needing
-human sign-off is a proposal plus a durable case record rather than a suspended
-invocation. See [`docs/design-decisions.md`](docs/design-decisions.md) for the
-reasoning and the measurements behind it.
+**Delegation is a graph, not one level.** `math` declares `currency` as a peer,
+so `orchestrator -> math -> currency` is an ordinary chain of A2A calls that
+needed no new machinery: an agent that coordinates is simply one whose
+`AgentSpec.peers` is non-empty, at any depth. The rules do not loosen further
+down — `math` reaches `currency` exactly as the orchestrator reaches `math`.
+
+**How a peer is reached depends on whether it can suspend.** A peer owning a
+`@gated` tool is a **sub-agent** (`transfer_to_agent`), because only that
+propagates an A2A task suspended awaiting human authorization. Every other peer
+is an **`AgentTool`**, because `transfer_to_agent` ends the caller's invocation
+and a caller that needs an answer would never get one. The split is derived
+from the registry by `suspending_agents()`, not declared twice.
+
+**The agents share no runtime state.** No shared session state, no shared
+artifact handles, no side channels. A gated peer does see the caller's recent
+conversation — the accepted cost of the sub-agent half above — and large inputs
+travel as object-store references it reads itself. An action needing human
+sign-off suspends its A2A task in `TASK_STATE_AUTH_REQUIRED` (A2A spec 7.6) and
+is resumed by a decision delivered straight to it. See
+[`docs/design-decisions.md`](docs/design-decisions.md) for the reasoning and the
+measurements behind all of it.
 
 **Shared *code* is fine and encouraged** — `app/shared/**` is a library every
 agent imports, and one another squad could vendor. The rule is about shared
@@ -49,7 +67,7 @@ code path.
 All of these were run in this repo and pass as of the last update to this file.
 
 ```bash
-# Unit tests — 260 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
+# Unit tests — 343 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
 # (see "Importing app hits the network" below).
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite \
 GEMINI_BALANCED_MODEL=gemini-2.5-flash \
@@ -74,9 +92,10 @@ Other commands (require a server / GCP creds, not part of the fast loop):
 
 | Command | Purpose |
 | --- | --- |
-| `make up` / `make down` | Start or stop all four agents locally, peers wired (see the Makefile) |
+| `make up` / `make down` | Start or stop all six agents locally, peers wired — including `math -> currency` (see the Makefile) |
 | `make check` | Preflight: ADC, project, location, model reachability |
 | `make demo` | Drive the approval flow end to end and assert it worked |
+| `make image` / `make image TAG=x` | Build + push the image with Cloud Build (`cloudbuild.yaml`) |
 | `uv sync` | Install deps (or `agents-cli install`) |
 | `agents-cli playground` | Interactive local UI |
 | `uv run adk web` | ADK dev UI (becomes `DEFAULT_AGENT` unless `AGENT_NAME` set) |
@@ -85,9 +104,10 @@ Other commands (require a server / GCP creds, not part of the fast loop):
 | `agents-cli eval generate` / `grade` / `compare` / `analyze` / `optimize` | Eval loop; needs GCP creds |
 
 Tooling this repo assumes on your PATH: `agents-cli`, `uv`, `kubectl`,
-`terraform` (>= 1.9, see "Deploy to GKE"), `gcloud`, and an OCI image builder
-(`docker` or `podman`). Read the `--platform` warning in "Deploy to GKE" before
-building an image.
+`terraform` (>= 1.9, see "Deploy to GKE") and `gcloud`. A local OCI image
+builder (`docker` or `podman`) is **optional**: images are built by Cloud Build
+(`make image`). If you do build locally, read the `--platform` warning in
+"Deploy to GKE" first.
 
 ## File map
 
@@ -100,17 +120,22 @@ Read the module docstrings; they are thorough. This is the index.
 | `app/agent.py` | Entry point. Calls `configure_observability()`, builds the `Injector`, selects this process's agent by `AGENT_NAME`, exports `root_agent` and `app = App(name="app")`. |
 | `app/agents/__init__.py` | **The registry.** `AGENTS: dict[str, AgentSpec]` + `DEFAULT_AGENT`. Single source of truth for which agents exist. |
 | `app/agents/base.py` | `AgentSpec` (frozen dataclass: name, description, instruction, tier, tools, peers) and the single `build_agent()`. `TIERS = ("fast","balanced","capable")`. |
-| `app/agents/contracts.py` | **The wire contracts.** One pydantic model per delegatable agent + `PAYLOADS`. The interface both a caller and a specialist agree on. Opt-in per agent: a peer with no model here is delegated to with a single free-text `task` instead (see its module docstring for the tiers). |
+| `app/agents/statuses.py` | **The status vocabulary.** `AWAITING_APPROVAL`, `REFUSED`, `NEEDS_INPUT`, `NEEDS_CONFIRMATION`, `PUBLISHED`, `EXECUTED` + the derived sets. Plain strings a non-ADK agent produces without importing anything. What remains of the deleted per-peer payload contracts. |
+| `app/agents/gating.py` | **The human-authorization gate.** `require_approval()` suspends the task and returns the decision when ADK re-executes the tool; `@gated` marks a tool, which is what makes its agent a sub-agent of its callers. |
 | `app/agents/documents.py` | `read_document` — reads a claim-check reference (`gs://…`) the caller passed in `document_refs`. |
-| `app/agents/reporting.py` | `restate_structured_results` — the after-agent callback that makes a proposal survive the A2A text boundary instead of being paraphrased. |
-| `app/agents/orchestrator/agent.py` | `SPEC` with `peers=("research","math","planner")`, `tier="balanced"`. |
+| `app/agents/reporting.py` | Makes a proposal survive the A2A text boundary instead of being paraphrased. **Two** callbacks: `attach_structured_results` (after-model) folds the JSON into the model's own reply so a turn stays *one* message; `restate_structured_results` (after-agent) is the fallback, and emits only what that reply does not already carry. |
+| `app/agents/orchestrator/agent.py` | `SPEC` with `peers=("research","math","planner","trades")`, `tier="balanced"`. |
 | `app/agents/research/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, tool `web_search`. |
-| `app/agents/math/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, tool `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. |
+| `app/agents/math/agent.py` + `tools.py` | `tier="balanced"`, `peers=("currency",)`. Gated, so its callers reach it as a **sub-agent**. Tools: `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. **Not a leaf** — it delegates conversions rather than applying a rate itself. |
 | `app/agents/planner/` | Leaf agent, `tier="balanced"`, no tools. Drafts a plan and returns it for review. |
-| `app/cluster/peer_tool.py` | `PeerTool` — an `AgentTool` that gives a remote peer a **typed payload declaration**, so delegation sends an explicit request instead of the transcript. |
+| `app/agents/currency/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, reached only by `math`. Hardcoded USD-anchored rate table; every pair is derived from it, so no triangle of rates can disagree with itself. **Refuses rather than guesses**: an ambiguous term ("dollars" is six currencies) returns `needs_input`, an amount over `LARGE_AMOUNT_USD` returns `needs_confirmation`, and both carry a question for the user. |
+| `app/agents/trades/agent.py` + `tools.py` + `dataset.py` | Leaf agent, `tier="capable"`. Writes SQL against the `cymbal_investments.trade_capture_report` BigQuery public dataset; `run_trade_query` is the **second gated action**. `dataset.py` holds both the schema the instruction is built from and the one-table allow-list the validator enforces. |
+| `app/cluster/authorization.py` | Reports a suspended gated tool as `TASK_STATE_AUTH_REQUIRED` instead of the `input_required` ADK derives for any long-running call, via an `ExecuteInterceptor`. Also records the approval case. |
+| `app/cluster/grants.py` | Delivers a decision **straight to the agent that owns the suspended tool**. ADK cannot resolve a peer's confirmation locally, so a grant sent to the caller is silently dropped — see the module docstring. |
 | `app/cluster/cases.py` | The approval case store (`pending → approved → executed`), both backends (in-memory / `approval_cases`), and the helpers that read a proposal back out of a peer's text reply. |
 | `app/cluster/config.py` | **Pure stdlib** (no ADK/genai imports). `PeerSpec`, `ClusterConfig.from_env()`, `service_dns_url()`. Parses `AGENT_NAME` / `A2A_*`. |
-| `app/cluster/resolver.py` | `AgentResolver` — turns peers into `RemoteA2aAgent`s pointed at their well-known agent cards. No network I/O at construction (ADK resolves cards lazily). |
+| `app/cluster/resolver.py` | `AgentResolver` — turns peers into `ResumingA2aAgent`s pointed at their well-known agent cards. No network I/O at construction (ADK resolves cards lazily). |
+| `app/cluster/resume.py` | `ResumingA2aAgent` — makes a human's decision actually reach a suspended peer. Two fixes in one class: `rerun_on_resume=True` so the workflow scheduler re-enters the peer node instead of fast-forwarding it, and forwarding the decision **as a function response** rather than the text ADK 2.7.x flattens it to (google/adk-python#6721). |
 | `app/cluster/di.py` | `ClusterModule` (config + resolver) and `SessionModule` (`Database`, session + memory + artifact services, A2A `TaskStore`). |
 | `app/cluster/session.py` | `build_session_service()` / `build_memory_service()` — backend selected by env. |
 | `app/cluster/artifacts.py` | `build_artifact_service()` — the shared `CloudPathArtifactService` when `ARTIFACT_STORAGE_URI` is set, else in-memory. Same URI for every agent on purpose (artifacts are keyed by the ADK app name `app`, not `AGENT_NAME`). |
@@ -147,7 +172,10 @@ Read the module docstrings; they are thorough. This is the index.
   `pathlib.Path`), so no bucket or credentials are involved.
   `test_migrations.py` renders the Alembic migrations **offline** (no database)
   and diffs them against ADK's and the a2a SDK's own metadata — it is the guard
-  that catches a library adding a column.
+  that catches a library adding a column. It compares the **effective** schema
+  at head, replaying `ALTER TABLE ... ADD/DROP COLUMN` over each `CREATE TABLE`,
+  so a column added by a later revision counts as present. Reading only the
+  `CREATE TABLE` would report every additive revision as missing drift forever.
 - `tests/unit/test_cases.py` — the approval case state machine, run against
   **both** backends (in-memory and SQLAlchemy-on-SQLite), plus recovering a
   proposal from a peer's text reply.
@@ -155,6 +183,15 @@ Read the module docstrings; they are thorough. This is the index.
   not the transcript, and session state never reaches the wire.
 - `tests/unit/test_two_phase_approval.py` — propose causes no effect, a tampered
   proposal is refused, and the approval survives serialization.
+- `tests/unit/test_trades.py` — the same properties for the gated *read*, plus
+  the SQL validator (a keyword inside a string literal is not a keyword; a
+  comment cannot hide a second statement) and the full propose → approve →
+  re-execute → `find_execution` round trip, including the negative case. The one
+  function that would touch BigQuery is stubbed, which is why it exists.
+- `tests/unit/test_currency.py` — the conversions, the no-arbitrage property the
+  USD-anchored table exists to give, and the wiring that lets `math` reach
+  `currency` as a tool rather than a sub-agent (it owns no gated tool, and
+  `math` needs its answer back).
 - `tests/unit/test_documents.py` — claim-check reads against `tmp_path`.
 - `tests/integration/` — `test_agent.py`, `test_server_e2e.py`. Needs a server.
 - `tests/eval/` — `eval_config.yaml`, `response_quality.py`, `datasets/`. Needs GCP creds.
@@ -172,20 +209,27 @@ Terraform for the Google Cloud side, Kustomize for the Kubernetes side.
 | `infra/terraform/main.tf` | GKE Autopilot cluster, Artifact Registry, APIs, **one GSA per agent** + a migrator GSA, IAM roles, Workload Identity bindings. |
 | `infra/terraform/alloydb.tf` | AlloyDB cluster + instance (`c4a-highmem-1`, 1 vCPU / 8 GB), private-services-access peering, IAM database users. |
 | `infra/terraform/artifacts.tf` | GCS bucket for ADK artifacts (uniform access, public-access prevention, 30-day lifecycle) + `roles/storage.objectUser` per agent GSA on that bucket. One shared bucket by design — see the header comment. |
+| `infra/terraform/cloudbuild.tf` | The `agent-builder` GSA that Cloud Build runs as: repository-scoped `artifactregistry.writer`, `logging.logWriter`, `storage.objectUser`. Deliberately **not** Cloud Build's legacy default SA, which carries `roles/editor`. |
 | `infra/kustomize/base/` | `namespace.yaml`, `serviceaccounts.yaml`, `configmap.yaml`, `networkpolicy.yaml`, `migrate-job.yaml`, `orchestrator.yaml`, `workers.yaml`. |
 | `infra/kustomize/overlays/dev/` | Image name/tag overlay. |
-| `Dockerfile` | The single image every agent runs. Copies only `./app`. |
+| `Dockerfile` | The single image every agent runs. **Multi-stage**; the runtime stage carries the venv and `./app` and no `uv`. |
+| `cloudbuild.yaml` + `.gcloudignore` | How the image is built (`make image`). The ignore file keeps the uploaded source to a few hundred KB. |
 
 Key vars in `variables.tf`: `project_id` (required), `region` (default
-`us-central1`), `agents` (default `["orchestrator","research","math"]` — must
-match `app/agents/`), `service_account_prefix` (`agent`), `alloydb_machine_type`
+`us-central1`), `agents` (default
+`["orchestrator","research","math","planner","trades","currency"]` — must match
+`app/agents/`), `agent_extra_iam_roles` (default
+`{ trades = ["roles/bigquery.jobUser"] }` — the one agent that may start a query
+job, and it holds `dataViewer` on nothing), `service_account_prefix` (`agent`),
+`builder_service_account_id` (`agent-builder`), `alloydb_machine_type`
 (`c4a-highmem-1`), `alloydb_database` (`agents`), `artifact_bucket_name`
 (default `<project_id>-agent-artifacts`), `artifact_retention_days` (30).
 
 **Placeholders to fill before `kubectl apply`** (all from
 `terraform output -json kustomize_values`):
 1. `infra/kustomize/base/serviceaccounts.yaml` → the
-   `iam.gke.io/gcp-service-account` annotation on each of the 4 ServiceAccounts.
+   `iam.gke.io/gcp-service-account` annotation on each of the 7 ServiceAccounts
+   (six agents + the migrator).
 2. `infra/kustomize/base/configmap.yaml` → `ALLOYDB_INSTANCE_URI`,
    `ARTIFACT_STORAGE_URI`.
 3. `orchestrator.yaml` / `workers.yaml` → `ALLOYDB_IAM_USER` per agent.
@@ -215,32 +259,53 @@ Violating these is how this codebase breaks. They are deliberate.
    `AgentSpec` built by the single `build_agent()`. The "orchestrator" is just
    the agent whose spec declares `peers`; `build_agent` attaches whatever peers
    the cluster config resolved (empty for a leaf). **Do not reintroduce a
-   per-role builder or an orchestrator subclass.**
-2. **Peers are TOOLS, never `sub_agents`.** `build_agent` puts resolved peers in
-   `tools` and leaves `sub_agents` empty. A peer in `sub_agents` is reached with
-   `transfer_to_agent`, and `RemoteA2aAgent` then rebuilds the outbound message
-   from the caller's **session events** — measured at ten message parts,
-   including the user's phone number and a different specialist's answer, where
-   the task needed one (`docs/design-decisions.md`, D1). A peer
-   in `tools` gets only the payload the caller composed. This looks like a
-   harmless wiring detail and is the most damaging thing in the repo to undo;
-   `tests/unit/test_peer_tool.py` guards it.
-3. **Every delegatable agent declares a contract in `app/agents/contracts.py` —
-   a policy of this repo, not a requirement of the mechanism.** Contracts are
-   **optional**. A peer with no entry in `PAYLOADS` is still reachable and still
-   answers; its tool falls back to `UnknownPeerRequest` (a `case_id` plus one
-   free-text `task`), which is the honest tier for a peer another squad owns
-   whose schema lives in its own agent card. Declare the contract for an agent
-   this repo owns: one free-text field is where a caller starts pasting the
-   conversation back in, which erodes invariant 2. The three tiers — session
-   transcript, free text, declared contract — are laid out in the
-   `app/agents/contracts.py` module docstring.
-   `test_agents.py::test_every_delegatable_agent_declares_a_contract` enforces
-   the policy; it is a repo convention you could drop, unlike invariant 2.
-4. **No implicit cross-agent context.** No shared session state, no shared
-   artifact handles, no transcript forwarding. Anything a specialist needs is a
-   field in its contract; large inputs travel as `document_refs` pointers, never
-   as content. A tool that stashes state for another agent to pick up is the
+   per-role builder or an orchestrator subclass.** This is also what makes depth
+   free: `math` declares `currency` and becomes a caller as well as a callee,
+   with no new type, no new code path and no change to `build_agent`.
+2. **A peer's slot follows from whether it can suspend — never pick one by
+   taste.** `build_agent` puts a peer in `sub_agents` if that peer owns a
+   `@gated` tool, and in `tools` otherwise. `suspending_agents()` derives the
+   split from the registry; marking a tool `@gated` is the single act that
+   wires its agent correctly. Both uniform rules were tried and each breaks
+   something:
+   - *All plain `AgentTool`s*: `AgentTool` runs the peer to exhaustion and never
+     reads `long_running_tool_ids`, so a peer suspended awaiting human
+     authorization returns the empty string and the caller carries on. Every
+     authorization request is silently swallowed.
+   - *All sub-agents reached by `transfer_to_agent`*: a one-way handoff — the
+     caller's invocation **ends**. Measured: `math` transferred to `currency`,
+     the conversion succeeded, and the sum was abandoned with no addition, no
+     publish and no case.
+
+   **The sub-agent half is reached as a task delegation, not by
+   `transfer_to_agent`.** `ResumingA2aAgent` declares `mode="task"`, so ADK
+   wraps it in a `_TaskAgentTool` and the workflow layer drives it as a node:
+   the pause still propagates *and* the caller gets a function response back and
+   carries on. That is why a suspending peer now appears in both `sub_agents`
+   and (via ADK's own wrapper) the agent's tool list — one turn can approve a
+   `trades` query and then go on to `math -> currency`, which the
+   `transfer_to_agent` wiring could not do.
+
+   `tests/unit/test_agents.py`, `test_cluster_resolver.py` and
+   `test_resume.py` guard the split;
+   `test_every_tool_that_asks_for_approval_is_marked_gated` reads the source of
+   every registered tool and fails if a gated one is missing its marker. That
+   omission is the dangerous one: it wires the agent as a tool and swallows
+   every request for approval.
+3. **A gated effect is unreachable without a decision — the task state is not
+   the gate.** A2A spec 7.6.4 says `TASK_STATE_AUTH_REQUIRED` "by itself"
+   authorises nothing, and that an implementation must define how the
+   authorized operation is checked before it is performed. Here that is the
+   branch on `Approval.granted` inside the tool (`app/agents/gating.py`).
+   Suspending is how the human is *asked*. Adding a second path that acts
+   without that branch removes the guarantee entirely, however well the prompt
+   is worded — and so does trusting the task state in its place, since anything
+   able to resume a task could then perform the effect.
+4. **No implicit cross-agent context.** No shared session state and no shared
+   artifact handles. A gated peer does receive the caller's recent conversation
+   — that is the accepted cost of the sub-agent half of invariant 2 — but
+   nothing is passed by side channel, and large inputs travel as `gs://`
+   pointers, never as content. A tool that stashes state for another agent to pick up is the
    thing to reject in review — D3 measured that the transport does not carry it,
    so it cannot work as advertised.
 5. **`agents/` = who the agents are. `cluster/` = the plumbing.** Keep config,
@@ -262,6 +327,16 @@ Violating these is how this codebase breaks. They are deliberate.
 9. **`App(name=...)` must equal the agent directory** (`"app"`). It determines
    the A2A mount path `/a2a/app`. Renaming one without the other breaks peer
    discovery.
+10. **A delegation edge in `AgentSpec.peers` needs a matching rule in
+    `infra/kustomize/base/networkpolicy.yaml`.** The namespace is deny-by-default
+    for ingress, so an edge added in code and missed there fails as a connection
+    **timeout**, not an error — the pods stay green and delegation just hangs.
+    `math -> currency` is the case that makes this more than bookkeeping:
+    "workers accept traffic from the orchestrator" is no longer the whole
+    policy, and `currency` accepts traffic from `math` and from nobody else,
+    including the orchestrator.
+    `test_agents.py::test_declared_peer_topology` pins the shape the policy has
+    to mirror; it cannot check the YAML for you.
 
 ## Gotchas
 
@@ -288,6 +363,31 @@ These are real traps that have bitten this codebase.
   service root.** A `PeerSpec.base_url` is the service **root**; the resolver
   appends `rpc_path` (`A2A_RPC_PATH`, default `/a2a/app`) + the well-known path.
   Pointing at the root's `/.well-known/...` 404s.
+
+- **A hand-rolled A2A client must send `A2A-Version: 1.0`.** The JSON-RPC route
+  runs with `enable_v0_3_compat=True`, so a request arriving with *no* version
+  header is treated as protocol 0.3 — and a v1.0 method name
+  (`SendStreamingMessage`, `GetTask`) on an unversioned request comes back as
+  **HTTP 200** carrying a JSON-RPC `-32009 VERSION_NOT_SUPPORTED` body. A client
+  that checks the status code and then reads SSE frames sees a successful
+  request with an empty stream, which reads as "the agent had nothing to say".
+  ADK's own client sends the header, so agent-to-agent delegation never hits
+  this; `curl`, the A2A Inspector and the integration tests do. See
+  [`docs/a2a-v1-migration.md`](docs/a2a-v1-migration.md).
+
+- **A2A v1.0 types are protobuf, so enum comparisons against strings silently
+  fail.** `task.status.state == "TASK_STATE_COMPLETED"` is always `False` —
+  `state` is an `int`. Compare against `TaskState.TASK_STATE_COMPLETED`. The
+  symptom is "the stream never completed", not a type error. Likewise
+  `model_dump()` / `model_validate()` are gone; use `MessageToDict` /
+  `ParseDict` from `google.protobuf.json_format`.
+
+- **The `google-adk>=2.5.0` floor is a correctness constraint, not a
+  preference.** ADK declares `a2a-sdk<2,>=0.3.4`, so the resolver will happily
+  pair ADK 2.4.0 with a2a-sdk 1.x. ADK isolates every 0.3-vs-1.x difference in
+  `google/adk/a2a/_compat.py` (`IS_A2A_V1` picks the branch at import), and that
+  module first ships in **2.5.0**. Below it, ADK builds 0.3-shaped parts and
+  cards against a 1.x SDK: pods start, probes pass, first delegation fails.
 
 - **`APP_URL` must be set per agent.** It is the URL the agent advertises in its
   own card — what peers call. It defaults to `http://0.0.0.0:8000`, unreachable
@@ -335,6 +435,13 @@ These are real traps that have bitten this codebase.
   migration Job — which has to run the same image as the agents. Run it with
   `-c app/migrations/alembic.ini`.
 
+- **There is no `uv` in the runtime image, so no `uv run` in a manifest.** The
+  `Dockerfile` is multi-stage: the build stage has uv, the runtime stage gets
+  the finished venv with `/code/.venv/bin` on `PATH` and nothing else. Call
+  `python`, `uvicorn` and `alembic` directly — `migrate-job.yaml` does. `uv run`
+  in a pod fails with `command not found`, which reads as a broken image rather
+  than a stale command line. On a workstation `uv run` is still correct.
+
 - **Never let ADK or a2a create their own tables.** Both would call
   `create_all()` at startup — that races across replicas, needs DDL privileges
   the agent roles deliberately lack, and bypasses the migration history. ADK's
@@ -350,6 +457,20 @@ These are real traps that have bitten this codebase.
   on PostgreSQL; a2a's `PydanticType` uses SQLAlchemy's generic `JSON`, which
   renders as `json`. The migrations differ accordingly — that is intentional,
   and matching each library exactly is what keeps the ORM's binding correct.
+
+- **A missing a2a task column fails at first delegation, not at startup.**
+  Migration `0006` adds the three columns a2a-sdk 1.x introduced (`owner`,
+  `last_updated`, `protocol_version`). Skip it and the `tasks` table still
+  exists, the pod still passes its health probe, and `DatabaseTaskStore` dies
+  with `UndefinedColumn` the first time an agent is actually delegated to. This
+  is the general shape of task-store drift, not a one-off: run the migration Job
+  to completion before treating green pods as a working deployment.
+
+- **a2a's `last_updated` is not this repo's `updated_at`.** `updated_at` (from
+  `0002`) is maintained by a trigger, so it advances on every write no matter
+  who made it — which is what makes it trustworthy for retention sweeps.
+  `last_updated` is ORM-maintained and is NULL for every row written before the
+  upgrade. Retention still keys off `updated_at`; do not "deduplicate" them.
 
 - **Alembic autogenerate is off.** The tables belong to two third-party
   libraries, so autogenerate would let a library upgrade rewrite production DDL
@@ -369,12 +490,73 @@ These are real traps that have bitten this codebase.
   the `terraform_version` recorded in an existing state file will refuse that
   state until it is upgraded.
 
-- **Read the plan before applying — it is not purely additive.** Against an
-  already-deployed environment a plan can include **destroys**, notably
-  `google_compute_global_address.alloydb_psa` and
-  `google_service_networking_connection.alloydb_psa` being *replaced* under a
-  live AlloyDB cluster. Adding an agent to `var.agents` is not automatically a
-  safe, additive apply. Never blind-apply.
+- **Read the plan before applying.** It should now be additive against an
+  already-deployed environment — the last measured plan is *48 to add, 1 to
+  change, 0 to destroy* — but that is a property to re-check, not to assume.
+
+- **A `depends_on` on a data source can plan a destroy you never asked for.**
+  `data.google_compute_network.vpc` (`infra/terraform/alloydb.tf`) depends on
+  `google_project_service.services`, so adding *any* API to `local.services`
+  gives that resource pending changes, which defers the data-source read to
+  apply time, which makes its `id` unknown at plan time. That unknown lands on
+  `network` in `google_compute_global_address.alloydb_psa` and
+  `google_service_networking_connection.alloydb_psa`, where it is **ForceNew** —
+  so adding `bigquery.googleapis.com` planned a destroy-and-recreate of the
+  private-services-access peering underneath a live AlloyDB cluster. Replacing
+  that connection either fails half-way or cuts every pod off from the database,
+  and the reserved range could come back as a different /16.
+  - Indexing the dependency does **not** help: the deferral is decided
+    per-resource, not per-instance, so
+    `services["compute.googleapis.com"]` (already applied, unchanged) defers the
+    read just the same. Verified against this state.
+  - The `depends_on` has to stay — enabling the compute API is what auto-creates
+    the `default` network the data source reads, which is what lets a greenfield
+    project apply without pre-enabling anything. So the chain is broken at the
+    other end instead: both PSA resources carry
+    `lifecycle { ignore_changes = [network] }`. A reserved peering range cannot
+    move between VPCs in place anyway, so a real `var.network` change is a
+    manual migration — and the AlloyDB cluster's own `network_config` is
+    deliberately *not* ignored, so such a change still surfaces there.
+
+- **Delegating successfully once can break every later delegation in the same
+  turn.** A completed task delegation leaves a synthesized function response
+  authored by `user` in the caller's session. ADK's history rebuild
+  (`_construct_message_parts_from_session`) re-serializes it verbatim, so the
+  *next* peer receives a message carrying a function response **and** text and
+  rejects it — "Message cannot contain both function responses and text". The
+  first hop looks perfect and everything after it fails.
+  `ResumingA2aAgent` renders call/response parts as text on that path and drops
+  the HITL bookkeeping outright.
+
+- **A resumed peer node is FAST-FORWARDED unless it sets `rerun_on_resume`.**
+  An agent with sub-agents is driven by ADK's workflow scheduler, which on
+  resume replays each node from the session. A node whose only interrupt has
+  just been answered completes *using the decision as its own output*
+  (`workflow/utils/_replay_interceptor.py`, case 4) — right for a local
+  `request_input`, wrong for a remote peer, which is a live A2A task waiting to
+  be re-driven. Measured: `node orchestrator@1/trades@1 schedule:
+  Fast-forwarding completed execution`, no request to the peer, **zero events**
+  in the turn. `ResumingA2aAgent` sets `rerun_on_resume=True`. The `curl` path
+  never showed this because an agent with no sub-agents skips the scheduler
+  entirely, so a decision posted straight at the tool's owner always worked.
+
+- **A decision answered in the ADK dev UI reaches a remote peer as TEXT unless
+  `ResumingA2aAgent` is in the way.** The second half of the same failure, and
+  it only becomes reachable once the node above actually re-runs. ADK 2.7.x
+  decides what to flatten by
+  function-call *name*, and a pause relayed up from a peer carries the same
+  `adk_request_confirmation` name as one the caller raised itself
+  (google/adk-python#6721, fix pending in #6759). Flattened, the peer's
+  suspended tool is never re-executed — the gated effect does not happen while
+  the peer's model narrates that it did. `app/cluster/resume.py` classifies by
+  *origin* instead. The `curl` path never hit this because
+  `app/cluster/grants.py` posts the decision straight at the peer.
+  Two related traps in the dev UI itself: the confirmation widget's
+  **`confirmed` checkbox defaults to unchecked**, so pressing Submit without
+  ticking it records a refusal; and typing anything after the widget makes the
+  *last* session event text-only, so `find_matching_function_call` returns
+  `None`, ADK rebuilds the request from raw history, and the peer rejects the
+  result with "Message cannot contain both function responses and text".
 
 - **A plausible answer is not proof the flow ran.** Three separate failures
   (a skipped graph node, a graph output that never reached the caller, an A2A
@@ -405,11 +587,69 @@ These are real traps that have bitten this codebase.
   re-drive by calling `POST /cases/{proposal_id}` again — unlike the mechanism
   this replaced, every such row is actionable.
 
-- **The gate is that the effect is unreachable without an approver**, not an
-  instruction the model is asked to follow. `publish_result` returns a proposal
-  when `approved_by` is empty and only performs the write when it is set. Adding
-  a second code path that publishes without that check removes the guarantee
-  entirely, however well the prompt is worded.
+- **A specialist can ask the USER a question, and that is not an approval.**
+  `contracts.NEEDS_INPUT` (the request is ambiguous) and
+  `contracts.NEEDS_CONFIRMATION` (the amount is unusual) mean the specialist did
+  nothing and needs an answer. They are deliberately NOT approval cases: there
+  is no effect to gate, nothing to record for audit, and the answer is a
+  corrected *request* rather than a decision on a case. Every agent between the
+  specialist and the user must relay the question rather than answer it — the
+  instructions say so at all three levels, and `app/agents/reporting.py` is what
+  makes the JSON survive intact so the relay cannot quietly become a paraphrase.
+
+- **`reporting.py` has to scan INSIDE a peer's reply, not just its own tools.**
+  A peer's reply crosses A2A as text, and ADK delivers a tool result as
+  `{"result": "<the peer's text>"}` — `FunctionResponse.response` is typed
+  `dict | None`, so the peer's JSON is a value inside the wrapper, never the
+  payload. Without scanning that string, anything raised two hops down
+  (`orchestrator -> math -> currency`) reaches the user only if the middle
+  agent's model chooses to repeat it, which is the exact dependency that
+  callback exists to remove.
+
+- **An after-agent callback's content is an EXTRA event, so restating there
+  duplicates the reply.** ADK appends whatever `after_agent_callback` returns
+  after the agent's own events (`base_agent.py:_handle_after_agent_callback`);
+  it does not replace them. `reporting.py` used to return the model's wording
+  plus the JSON, which rendered the same answer **twice** in the ADK web UI on
+  every HITL turn. The structure is folded into the model's reply by an
+  *after-model* callback instead (that one returns an `LlmResponse` and ADK
+  builds the event from it), and the after-agent hook only emits results the
+  reply does not already contain — the fallback for a turn that ends without the
+  model speaking. Keep it conditional; making it unconditional brings the double
+  reply straight back.
+
+- **`AUDITED_STATUSES` is derived from the contract vocabulary, not written
+  out.** It was a literal `{"approval_required", "published"}` when the `trades`
+  agent landed, so a gated *read* reporting `executed` was silently not
+  restated. Add a status to `app/agents/statuses.py` and it is audited
+  everywhere; hardcode one and you get a flow that works until the model has an
+  off day.
+
+- **A gated action must report a status in `contracts.EFFECT_PERFORMED`.**
+  `cases.find_execution` confirms an execution by scanning the reply for
+  `"published"` or `"executed"` and then matching the values against the
+  approved proposal. A new gated action that invents its own success string runs
+  perfectly and is reported as `approved_not_confirmed` — a vocabulary bug
+  wearing a model bug's clothes. Add the status to the frozenset in
+  `app/agents/statuses.py`.
+
+- **A gated tool that normalises its input must declare the normalised values.**
+  Pass them as `require_approval(..., proposal=...)`. Without it the case
+  records the model's raw arguments while the tool acts on the canonical ones,
+  and the caller correctly refuses to confirm a perfectly good execution.
+  Measured twice: `391000000.0` against `391000000`, then `88000.0` against
+  `88000`. Do not "fix" a mismatch by loosening the comparison — canonicalise
+  at the source, or the check stops catching a genuinely different action.
+  (Nothing has to travel back any more: ADK re-executes the suspended call
+  itself, so the approved arguments *are* the arguments that run.)
+
+- **The gate is the branch on the decision, not the task state.** A2A spec
+  7.6.4 says `TASK_STATE_AUTH_REQUIRED` authorises nothing by itself.
+  `publish_result` returns without acting while `Approval.pending` is set and
+  performs the write only once `granted` is true. Adding a second code path
+  that acts without that check removes the guarantee entirely, however well the
+  prompt is worded — and so does trusting the task state in its place, since
+  anything able to resume a task could then perform the effect.
 
 - **Execution is confirmed by comparing content, not by trusting prose.**
   `cases.find_execution` accepts a result only if the values it reports match
@@ -417,7 +657,17 @@ These are real traps that have bitten this codebase.
   reported as `approved_not_confirmed` rather than recorded as success.
 
 - **`agents-cli` uses `uv`.** Run Python as `uv run python ...`, never bare
-  `python`.
+  `python`. (In the container it is the other way round — see the no-`uv`
+  gotcha above.)
+
+- **The trades agent's SQL validator is a guard rail, not the boundary.** It
+  rejects anything that is not a single read-only statement against the one
+  allowed table, and it works on text whose comments and string literals have
+  been masked first — both directions matter, since a keyword in a literal must
+  neither trip it nor evade it. What actually confines the agent is the human
+  who reads the SQL, the pod's IAM (`roles/bigquery.jobUser`, `dataViewer` on
+  nothing) and `maximum_bytes_billed`. Do not add a bypass for a "trusted"
+  caller.
 
 - **Model 404s** are a location problem, not a model-name problem — fix
   `GOOGLE_CLOUD_LOCATION` (`global` usually works). **Never change the model
@@ -522,6 +772,7 @@ The handful that bite most often:
 | `A2A_PEERS` | *(agent's `AgentSpec.peers`)* | Comma-separated `name` or `name=url`; the url is a service **root** |
 | `DB_BACKEND` | `none` | Gates the session, task and approval-case stores all at once |
 | `ARTIFACT_STORAGE_URI` | *(unset → in-memory)* | The scheme *is* the backend; a typo'd scheme silently writes to local disk. Need not match across agents |
+| `TRADES_*` | `US` / 1 GiB / 50 rows | `TRADES_LOCATION`, `TRADES_MAX_BYTES_BILLED`, `TRADES_MAX_ROWS`. Read at call time, and only by the `trades` agent |
 
 Local development reads a gitignored `.env`; copy `.env.example` and set at
 least `GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, and
@@ -538,27 +789,34 @@ Full walkthrough, checklist, and troubleshooting table:
 1. `app/agents/<name>/` with `__init__.py` (**needs a docstring** — `D104`),
    `tools.py`, and `agent.py` exposing `SPEC = AgentSpec(...)`.
 2. Register it in `app/agents/__init__.py` (`AGENTS`).
-3. **Declare its contract** in `app/agents/contracts.py`: a `PeerRequest`
-   subclass with a `Field(description=...)` on every field, added to `PAYLOADS`.
-   Those descriptions are the only instructions a caller's model gets about how
-   to call it. Optional in the mechanism — skip it and the agent is delegated to
-   with a single free-text `task` — but required by this repo's policy and its
-   test (invariant 3).
+3. **If it gates an effect**, write the tool with `require_approval()` and mark
+   it `@gated` (`app/agents/gating.py`). That marker is what makes the agent a
+   sub-agent of its callers; without it every authorization request it raises is
+   swallowed. Report a success status that is in
+   `statuses.EFFECT_PERFORMED`, or a correct execution is reported as
+   `approved_not_confirmed`.
 4. If an existing agent should delegate to it, add the name to that agent's
    `AgentSpec.peers`.
-5. Update **two** tests in `tests/unit/test_agents.py`:
-   `test_registry_lists_expected_agents` and
-   `test_orchestrator_declares_peers_others_do_not`.
+5. Update the tests in `tests/unit/test_agents.py`:
+   `test_registry_lists_expected_agents`, `test_declared_peer_topology`, and —
+   if it is gated — `test_the_split_is_derived_from_the_gated_tools`.
 6. Cluster only — five files:
    - `infra/terraform/variables.tf` → add to `var.agents`, then `terraform apply`
      (creates the GSA, IAM roles, WI binding, and AlloyDB user via `for_each`).
+     If it needs a role no other agent needs, put that in
+     `var.agent_extra_iam_roles` rather than widening the shared baseline — see
+     `trades` and `roles/bigquery.jobUser`.
    - `serviceaccounts.yaml` → KSA `agent-<name>` + its GSA annotation.
    - `workers.yaml` → copy a Deployment/Service pair; set `AGENT_NAME`,
      `APP_URL`, `ALLOYDB_IAM_USER`, `serviceAccountName`.
-   - `networkpolicy.yaml` → add to the workers allow-list. **Easy to miss:**
-     omitting it leaves the agent with no ingress at all, and delegation fails
-     as a timeout rather than an error.
+   - `networkpolicy.yaml` → allow ingress from **whichever agents call it**, not
+     reflexively from the orchestrator (invariant 10). **Easy to miss:** omitting
+     it leaves the agent with no ingress at all, and delegation fails as a
+     timeout rather than an error.
    - `migrate-job.yaml` → add to `MIGRATE_AGENTS`.
+7. Local dev — `Makefile`: add it to `AGENTS`, give it a `PORT_<name>` and a
+   `PORTS` entry, add a `serve-<name>` target, and if an existing agent should
+   call it, add it to that agent's peer list (`PEERS` / `MATH_PEERS`).
 
 No new migration and no new database are needed: every agent gets the same
 tables in its own schema, and `DB_SCHEMA` defaults to `AGENT_NAME`.
@@ -574,6 +832,8 @@ spec's `tools` tuple.
 
 ### Run two agents locally to exercise A2A
 
+`make up` starts all six with the peers wired. By hand, for two:
+
 ```bash
 # Terminal 1 — the specialist
 AGENT_NAME=math APP_URL=http://127.0.0.1:8091 \
@@ -582,6 +842,17 @@ AGENT_NAME=math APP_URL=http://127.0.0.1:8091 \
 # Terminal 2 — the orchestrator delegating to it
 AGENT_NAME=orchestrator A2A_PEERS=math=http://127.0.0.1:8091 \
   uv run uvicorn app.fast_api_app:app --port 8090
+```
+
+An agent in the middle of the graph needs **both**: an `APP_URL` so its caller
+can reach it, and its own `A2A_PEERS` so it can reach further. Miss the second
+and everything still starts and reports healthy — `math` simply has no currency
+tool.
+
+```bash
+AGENT_NAME=math APP_URL=http://127.0.0.1:8091 \
+  A2A_PEERS=currency=http://127.0.0.1:8095 \
+  uv run uvicorn app.fast_api_app:app --port 8091
 ```
 
 ### Deploy to GKE
@@ -593,29 +864,36 @@ terraform init
 terraform plan -var-file=terraform.tfvars   # READ THE PLAN, see gotchas
 terraform apply -var-file=terraform.tfvars
 eval "$(terraform output -raw get_credentials_command)"
+cd -
 
-REPO=$(terraform output -raw artifact_registry_repo)
+# Build the image IN Cloud Build. No local docker/podman, no registry login,
+# no --platform trap: the workers are amd64. Only the source tarball leaves
+# your machine (a few hundred KB -- see .gcloudignore).
+make image TAG=demo-1
+# equivalently: terraform output -raw build_command
 
-# Auth. Either configure the gcloud credential helper once
-# (`gcloud auth configure-docker "${REPO%%/*}"`) or log the builder in directly:
-docker login -u oauth2accesstoken \
-  -p "$(gcloud auth print-access-token)" "${REPO%%/*}"
-
-# --platform linux/amd64 is REQUIRED — see the warning below.
-docker build --platform linux/amd64 -t "$REPO/agent:latest" .
-docker push "$REPO/agent:latest"
-
-# fill the two placeholders, then:
+# set newTag to the same value in the overlay, fill the placeholders, then:
 kubectl apply -k infra/kustomize/overlays/dev
 kubectl -n agents port-forward svc/orchestrator 8080:80
 ```
 
-**Always pass `--platform linux/amd64` when building.** The GKE Autopilot nodes
-these manifests target are **amd64** (nothing sets a `kubernetes.io/arch: arm64`
-nodeSelector), so on an arm64 workstation a native build produces an arm64 image
-whose pods fail on the cluster with `exec format error` — which looks like an app
-bug, not a build bug. The base image (`python:3.14-slim`) is multi-arch, so the
-cross-build works fine; it is just slower under emulation.
+Building locally is still possible and is now the fallback, not the default:
+
+```bash
+REPO=$(cd infra/terraform && terraform output -raw artifact_registry_repo)
+docker login -u oauth2accesstoken \
+  -p "$(gcloud auth print-access-token)" "${REPO%%/*}"
+docker build --platform linux/amd64 -t "$REPO/agent:demo-1" .
+docker push "$REPO/agent:demo-1"
+```
+
+**If you build locally, always pass `--platform linux/amd64`.** The GKE Autopilot
+nodes these manifests target are **amd64** (nothing sets a
+`kubernetes.io/arch: arm64` nodeSelector), so on an arm64 workstation a native
+build produces an arm64 image whose pods fail on the cluster with `exec format
+error` — which looks like an app bug, not a build bug. The base image
+(`python:3.14-slim`) is multi-arch, so the cross-build works fine; it is just
+slower under emulation. `make image` sidesteps the whole question.
 
 **Deploying requires explicit human approval. Never run `terraform apply` or
 `kubectl apply` without being asked.**
@@ -638,8 +916,10 @@ through `uv`. Install it once with `uv tool install google-agents-cli`.
 4. **Pre-deployment checks** — the hermetic unit-test command at the top of this
    file, `agents-cli lint`, then `uv run pytest tests/integration` against a
    running server. Fix until green.
-5. **Deploy** — build the image and apply the Kustomize overlay ("Deploy to GKE").
-   **Requires explicit human approval**; only after the user confirms.
+5. **Deploy** — `make image TAG=...`, then apply the Kustomize overlay ("Deploy
+   to GKE"). **Requires explicit human approval**; only after the user confirms.
+   A build is not a deploy, but it does write to a registry and cost money — ask
+   before running that too.
 
 ### Command reference
 
@@ -664,7 +944,7 @@ through `uv`. Install it once with `uv tool install google-agents-cli`.
 | Cluster plumbing | `app/cluster/**`, `app/migrations/**` | Config, peer resolution, DI, session/artifact/task backends, schema |
 | Serving | `app/fast_api_app.py`, `app/app_utils/**` | The HTTP + A2A surface. `fast_api_app.py` is the seam to edit; `app_utils/` is stable low-level plumbing — wire things up in `fast_api_app.py` rather than changing it |
 | Shared library | `app/shared/**` | Cross-cutting, project-agnostic utilities (models, telemetry, logging, secrets, artifacts) |
-| Infrastructure | `infra/**`, `Dockerfile` | Terraform, Kustomize, the container image |
+| Infrastructure | `infra/**`, `Dockerfile`, `cloudbuild.yaml`, `.dockerignore`, `.gcloudignore` | Terraform, Kustomize, the container image and how it is built |
 | Tooling config | `pyproject.toml`, `ruff.toml`, `ty.toml`, `pyrightconfig.json` | See "Code style" |
 
 Three rules worth stating outright:
@@ -711,4 +991,6 @@ Three rules worth stating outright:
   changing architecture or commands. `docs/environment-variables.md` is the
   configuration reference; `docs/human-in-the-loop.md` is the approval guide;
   `docs/design-decisions.md` records why the architecture is what it is, with
-  the measurements and the rejected alternatives behind each choice.
+  the measurements and the rejected alternatives behind each choice;
+  `docs/a2a-v1-migration.md` is the A2A v0.3 → v1.0 upgrade record — what
+  changed here, and the two ways that upgrade fails quietly.

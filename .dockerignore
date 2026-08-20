@@ -1,0 +1,53 @@
+# Build context filter.
+#
+# The Dockerfile copies only pyproject.toml, README.md, uv.lock and ./app, but
+# without this file the builder still tars the whole 1.6 GB working tree --
+# .venv, .git, Terraform provider plugins, pytest/ruff caches. Beyond being
+# slow, that is a correctness problem: a file that changes size while the
+# context is being streamed makes podman fail the build with
+# "archive/tar: write too long", which reads like a builder bug and is not.
+#
+# Keep this in sync with the COPY lines in the Dockerfile.
+
+# Virtualenvs and Python build artefacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ty_cache/
+.cache/
+
+# VCS and local scratch
+.git/
+.gitignore
+.run/
+
+# Secrets and local configuration -- must never reach an image layer
+.env
+.env.*
+!.env.example
+
+# Infrastructure: Terraform state, provider plugins, Kubernetes manifests.
+# None of it is needed at runtime, and state files carry connection details.
+infra/
+
+# Tests and docs
+tests/
+docs/
+*.md
+!README.md
+
+# Tooling configuration that only matters on a workstation
+ruff.toml
+ty.toml
+pyrightconfig.json
+Makefile
+scripts/

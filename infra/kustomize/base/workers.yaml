@@ -239,3 +239,171 @@ spec:
     - name: http
       port: 80
       targetPort: 8080
+---
+# The trades agent answers questions about the Cymbal Investments trade data by
+# writing SQL against a BigQuery public dataset -- and running that query needs
+# a human's approval first (app/agents/trades/tools.py).
+#
+# It is the one agent with roles/bigquery.jobUser, granted through
+# var.agent_extra_iam_roles rather than the shared baseline. Its GSA holds
+# dataViewer on nothing, so even a query that got past the validator and the
+# human can only read public data.
+#
+# The approval CASE lives on the orchestrator (whoever asks the human owns the
+# record), so nothing about the gate depends on this pod's own database.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trades
+  labels:
+    app: trades
+    app.kubernetes.io/component: specialist
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trades
+  template:
+    metadata:
+      labels:
+        app: trades
+    spec:
+      serviceAccountName: agent-trades
+      containers:
+        - name: agent
+          image: agent-image
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: agent-config
+          env:
+            - name: AGENT_NAME
+              value: trades
+            # AlloyDB IAM database role: this pod's GSA email minus the
+            # ".gserviceaccount.com" suffix. DB_SCHEMA defaults to AGENT_NAME.
+            - name: ALLOYDB_IAM_USER
+              value: agent-trades@msteiner.iam
+            - name: APP_URL
+              value: http://trades.agents.svc.cluster.local
+            # bigquery-public-data lives in the US multi-region. A query job
+            # submitted in another location fails with "dataset not found",
+            # which reads like a permissions problem and is not.
+            - name: TRADES_LOCATION
+              value: "US"
+            # Ceiling on bytes BILLED per query (1 GiB against a ~300 MB table).
+            # The job is killed rather than billed past it -- the one control a
+            # human approving the SQL cannot apply by reading it.
+            - name: TRADES_MAX_BYTES_BILLED
+              value: "1073741824"
+            # Rows returned to the caller. They cross A2A as text inside a
+            # model's context, so this is a payload budget: aggregate in SQL.
+            - name: TRADES_MAX_ROWS
+              value: "50"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trades
+  labels:
+    app: trades
+spec:
+  type: ClusterIP
+  selector:
+    app: trades
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+# The currency agent is the cluster's second-tier specialist: its caller is
+# `math`, not the orchestrator (app/agents/math/agent.py). Nothing about this
+# Deployment says so -- the topology lives in AgentSpec.peers and in the
+# NetworkPolicy, and this file stays identical in shape to every other worker.
+#
+# It holds a hardcoded rate table and calls nothing, so it needs no IAM beyond
+# the shared baseline and no state at all.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: currency
+  labels:
+    app: currency
+    app.kubernetes.io/component: specialist
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: currency
+  template:
+    metadata:
+      labels:
+        app: currency
+    spec:
+      serviceAccountName: agent-currency
+      containers:
+        - name: agent
+          image: agent-image
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: agent-config
+          env:
+            - name: AGENT_NAME
+              value: currency
+            # AlloyDB IAM database role: this pod's GSA email minus the
+            # ".gserviceaccount.com" suffix. DB_SCHEMA defaults to AGENT_NAME.
+            - name: ALLOYDB_IAM_USER
+              value: agent-currency@msteiner.iam
+            - name: APP_URL
+              value: http://currency.agents.svc.cluster.local
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: currency
+  labels:
+    app: currency
+spec:
+  type: ClusterIP
+  selector:
+    app: currency
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

@@ -54,8 +54,9 @@ from pydantic import BaseModel
 from app.app_utils import services
 from app.app_utils.a2a import attach_a2a_routes
 from app.app_utils.typing import Feedback
-from app.cluster import cases
+from app.cluster import cases, grants
 from app.cluster.artifacts import ARTIFACT_STORAGE_URI_ENV
+from app.cluster.authorization import build_executor_config
 from app.cluster.db import DatabaseConfig
 from app.shared.telemetry import instrument_fastapi_app
 
@@ -180,6 +181,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         artifact_service,
         case_store,
         database,
+        resolver,
         root_agent,
         session_service,
         task_store,
@@ -205,6 +207,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The one store the injector built. Only this agent writes it: a case
     # belongs to whoever asked the human, not to the specialist that proposed.
     app.state.case_store = case_store
+    app.state.cluster_config = resolver.config
+
+    async def record_request(
+        context: Any,
+        call: dict[str, Any],
+        peer: tuple[str, str, str] | None,
+    ) -> None:
+        """Open an approval case for a tool this agent just suspended."""
+        if peer is None:
+            # The gated tool is this agent's own. Nothing to record here: the
+            # agent that relayed the request to a human is the one that owns
+            # the case, and it records the hop to us.
+            return
+        name, owner_task_id, owner_context_id = peer
+        case = cases.case_from_confirmation(
+            call,
+            session_id=context.session_id,
+            case_id=context.session_id,
+            agent=name,
+            owner_task_id=owner_task_id,
+            owner_context_id=owner_context_id,
+        )
+        if await case_store.open(case):
+            log.info(
+                "case {}: {} on {} awaiting authorization",
+                case.proposal_id,
+                case.action,
+                case.agent,
+            )
+
     await attach_a2a_routes(
         app,
         agent=root_agent,
@@ -213,6 +245,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # in-memory, exactly as before.
         task_store=task_store,
         rpc_path=f"/a2a/{adk_app.name}",
+        # Report a suspended confirmation as TASK_STATE_AUTH_REQUIRED instead
+        # of the input_required ADK derives for any long-running call, so a
+        # caller can tell "a human must authorise this" apart from "the agent
+        # asked a question". No-op for an agent that never asks.
+        executor_config=build_executor_config(record_request),
     )
 
     # No recovery task. Nothing is held open between a proposal and its
@@ -334,16 +371,19 @@ async def case_detail(proposal_id: str) -> dict[str, Any]:
 
 
 @app.post("/cases/{proposal_id}")
-async def case_decide(
-    proposal_id: str, decision: CaseDecision, user_id: str = "case-user"
-) -> dict[str, Any]:
-    """Decide a pending case and, if approved, carry the action out.
+async def case_decide(proposal_id: str, decision: CaseDecision) -> dict[str, Any]:
+    """Decide a pending case and, if approved, deliver it to the owning agent.
 
-    The decision is written FIRST and separately from the execution. That
+    The decision is written FIRST and separately from the delivery. That
     ordering is what makes this recoverable with no lease and no sweeper: if the
-    pod dies before or during the execution turn, the decision still stands on
-    the row, and calling this endpoint again re-drives it. A retry is safe
-    because a closed case short-circuits below rather than running twice.
+    pod dies before or during delivery, the decision still stands on the row,
+    and calling this endpoint again re-drives it. A retry is safe because a
+    closed case short-circuits below rather than acting twice.
+
+    The grant goes **straight to the agent that owns the suspended tool**, not
+    back through this agent's own invocation. ADK cannot resolve a peer's
+    confirmation locally -- it looks for the tool among its own and silently
+    drops the grant when it is not there. See ``app/cluster/grants.py``.
     """
     store: cases.CaseStore = app.state.case_store
 
@@ -356,46 +396,84 @@ async def case_decide(
     if outcome is cases.DecisionOutcome.NOT_FOUND or case is None:
         raise HTTPException(status_code=404, detail="unknown proposal_id")
     if case.status == cases.REJECTED:
+        # Still delivered: the specialist is suspended and has to be told, or
+        # its task leaks for as long as the process lives.
+        await _deliver(case, confirmed=False)
         return {"status": "rejected", "case": case.public()}
     if case.status in (cases.EXECUTED, cases.FAILED):
         # Idempotent: the action already ran, so report it instead of repeating.
         return {"status": "already_executed", "case": case.public()}
 
-    # Approved. Ask the agent to carry the action out: an ordinary new turn, not
-    # a resumed invocation, which is why the elapsed time since the proposal
-    # costs nothing.
-    turn = await _run_turn(
-        app.state.runner,
-        user_id=user_id,
-        session_id=case.session_id,
-        text=cases.execution_instruction(case),
-    )
+    if not case.owner_task_id or not case.confirmation_id:
+        # A case opened before grant routing existed, or one whose request was
+        # recorded without a suspended task. The decision stands; there is
+        # simply nowhere to send it.
+        log.warning("case {}: approved, but no suspended task to resume", proposal_id)
+        return {"status": "approved_not_routable", "case": case.public()}
 
-    performed = cases.find_execution(turn.texts, case.proposal)
+    try:
+        task = await _deliver(case, confirmed=True)
+    except grants.GrantDeliveryError as exc:
+        log.warning("case {}: approved, but delivery failed: {}", proposal_id, exc)
+        return {
+            "status": "approved_not_delivered",
+            "case": case.public(),
+            "detail": str(exc),
+        }
+
+    performed = cases.find_execution(cases.task_texts(task), case.proposal)
     if performed is None:
         # "No exception" is not proof the effect happened -- the trap this repo
-        # has hit before (docs/design-decisions.md). Say so plainly and
-        # leave the case re-drivable rather than recording it as done.
+        # has hit before (docs/design-decisions.md). Say so plainly and leave
+        # the case re-drivable rather than recording it as done.
         log.warning(
-            "case {}: approved, but the reply carried no confirmed execution",
+            "case {}: delivered, but the owner reported no confirmed execution",
             proposal_id,
         )
         return {
             "status": "approved_not_confirmed",
             "case": (await store.get(proposal_id) or case).public(),
-            "final_text": turn.final_text,
-            "trace": turn.trace,
+            "owner_state": task.get("status", {}).get("state"),
         }
 
     updated = await store.record_execution(
         proposal_id, succeeded=True, result=performed
     )
-    return {
-        "status": "executed",
-        "case": (updated or case).public(),
-        "final_text": turn.final_text,
-        "trace": turn.trace,
-    }
+    return {"status": "executed", "case": (updated or case).public()}
+
+
+async def _deliver(case: cases.ApprovalCase, *, confirmed: bool) -> dict[str, Any]:
+    """Send a decision to the agent whose tool is suspended.
+
+    Args:
+        case: The decided case, carrying the owner's task and confirmation ids.
+        confirmed: Whether the human approved.
+
+    Returns:
+        The owner's task as it stood when the call returned, or ``{}`` when
+        there was nothing to deliver to.
+
+    Raises:
+        grants.GrantDeliveryError: If the owner could not be reached.
+    """
+    if not case.owner_task_id or not case.confirmation_id:
+        return {}
+    config = app.state.cluster_config
+    peer = next((p for p in config.peers if p.name == case.agent), None)
+    if peer is None:
+        raise grants.GrantDeliveryError(
+            f"Case names agent {case.agent!r}, which is not a configured peer"
+        )
+    return await grants.deliver(
+        peer,
+        rpc_path=config.rpc_path,
+        task_id=case.owner_task_id,
+        context_id=case.owner_context_id,
+        confirmation_id=case.confirmation_id,
+        confirmed=confirmed,
+        approved_by=case.decided_by,
+        note=case.note,
+    )
 
 
 # Main execution

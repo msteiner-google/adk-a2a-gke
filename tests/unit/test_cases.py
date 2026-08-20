@@ -21,12 +21,13 @@ worth nothing in the cluster.
 
 import json
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 import pytest_asyncio
 import sqlalchemy as sa
 
-from app.agents.contracts import APPROVAL_REQUIRED
+from app.agents.statuses import AWAITING_APPROVAL, PUBLISHED
 from app.cluster.cases import (
     APPROVED,
     CASES,
@@ -40,11 +41,13 @@ from app.cluster.cases import (
     DatabaseCaseStore,
     DecisionOutcome,
     InMemoryCaseStore,
+    case_from_confirmation,
     case_from_proposal,
     execution_instruction,
     find_execution,
     find_proposals,
     new_proposal_id,
+    task_texts,
 )
 from app.cluster.db import Database, DatabaseConfig
 
@@ -237,7 +240,7 @@ def _proposal_reply(value: str = "42", label: str = "q3") -> str:
     proposal = {"action": "publish_result", "value": value, "label": label}
     blob = json.dumps(
         {
-            "status": APPROVAL_REQUIRED,
+            "status": AWAITING_APPROVAL,
             "action": "publish_result",
             "proposal": proposal,
             "summary": f"Publish {value!r} under label {label!r}.",
@@ -342,3 +345,120 @@ def test_unwrapping_finds_json_inside_a_wrapped_tool_result():
     inner = _proposal_reply()
     texts = _unpack({"result": inner})
     assert find_proposals(texts), "proposal must survive the {'result': ...} wrapper"
+
+
+# --- Building a case from a suspended confirmation ----------------------------
+
+
+def _confirmation(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """An adk_request_confirmation call as it arrives over A2A."""
+    return {
+        "id": "adk-confirm",
+        "name": "adk_request_confirmation",
+        "args": {
+            "originalFunctionCall": {
+                "id": "adk-original",
+                "name": "publish_result",
+                # The model's raw spelling, which the tool normalises.
+                "args": {"value": "391000000.0", "label": "q3"},
+            },
+            "toolConfirmation": {"hint": "Publish it.", "payload": payload},
+        },
+    }
+
+
+async def test_a_case_records_where_the_decision_must_be_delivered():
+    case = case_from_confirmation(
+        _confirmation(
+            {"action": "publish_result", "value": "391000000", "label": "q3"}
+        ),
+        session_id="s1",
+        case_id="s1",
+        agent="math",
+        owner_task_id="task-m",
+        owner_context_id="ctx-m",
+    )
+    assert case.agent == "math"
+    assert case.owner_task_id == "task-m"
+    assert case.owner_context_id == "ctx-m"
+    assert case.confirmation_id == "adk-confirm"
+    assert case.action == "publish_result"
+    assert case.status == PENDING
+
+
+async def test_the_proposal_prefers_the_tools_canonical_values():
+    # Measured: a proposal recorded from the model's raw arguments said
+    # '391000000.0' while the tool published '391000000', and find_execution
+    # correctly refused to confirm a perfectly good execution. The tool
+    # declares what it will act on; that is what goes on the record.
+    canonical = {"action": "publish_result", "value": "391000000", "label": "q3"}
+    case = case_from_confirmation(
+        _confirmation(canonical),
+        session_id="s1",
+        case_id="s1",
+        agent="math",
+        owner_task_id="t",
+        owner_context_id="c",
+    )
+    assert case.proposal == canonical
+
+    performed = {
+        "status": PUBLISHED,
+        "action": "publish_result",
+        "value": "391000000",
+        "label": "q3",
+    }
+    assert find_execution([json.dumps(performed)], case.proposal) is not None
+
+
+async def test_a_tool_that_declares_nothing_falls_back_to_its_arguments():
+    # A gated tool that does not normalise its inputs need not pass a proposal;
+    # the pending call's own arguments are still an honest description.
+    case = case_from_confirmation(
+        _confirmation(None),
+        session_id="s1",
+        case_id="s1",
+        agent="math",
+        owner_task_id="t",
+        owner_context_id="c",
+    )
+    assert case.proposal == {
+        "value": "391000000.0",
+        "label": "q3",
+        "action": "publish_result",
+    }
+
+
+async def test_task_texts_finds_a_result_buried_in_task_history():
+    # A tool's result crosses A2A as a data part inside the task history, not
+    # as prose, so confirming an execution means reading the history rather
+    # than the final message.
+    task = {
+        "status": {"message": {"parts": [{"text": "All done."}]}},
+        "history": [
+            {"parts": [{"text": "Please publish it."}]},
+            {
+                "parts": [
+                    {
+                        "data": {
+                            "name": "publish_result",
+                            "response": {
+                                "status": PUBLISHED,
+                                "action": "publish_result",
+                                "value": "391000000",
+                                "label": "q3",
+                            },
+                        }
+                    }
+                ]
+            },
+        ],
+    }
+    texts = task_texts(task)
+    assert "All done." in texts
+    proposal = {"action": "publish_result", "value": "391000000", "label": "q3"}
+    assert find_execution(texts, proposal) is not None
+
+
+async def test_task_texts_is_empty_for_a_task_that_did_nothing():
+    assert task_texts({}) == []

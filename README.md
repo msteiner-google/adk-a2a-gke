@@ -10,19 +10,27 @@ the [A2A protocol](https://a2a-protocol.org/).
    user ───────────▶   │   orchestrator    │  entry point; plans and delegates
                        │  Deployment/Svc   │
                        └─────────┬─────────┘
-        A2A — one typed payload per call, never the transcript
-                 ┌───────────────┴───────────────┐
-                 ▼                               ▼
-        ┌────────────────┐              ┌────────────────┐
-        │    research    │              │      math      │  specialists
-        │ Deployment/Svc │              │ Deployment/Svc │
-        └────────────────┘              └────────────────┘
-
-        ┌────────────────┐
-        │    planner     │  drafts a plan for a human to review
-        │ Deployment/Svc │
-        └────────────────┘
+        A2A — sub-agent if it can suspend, tool otherwise
+         ┌──────────────────┬────┴─────────────┬──────────────────┐
+         ▼                  ▼                  ▼                  ▼
+ ┌────────────────┐ ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
+ │    research    │ │      math      │ │    planner     │ │     trades     │
+ │ Deployment/Svc │ │ Deployment/Svc │ │ Deployment/Svc │ │ Deployment/Svc │
+ └────────────────┘ └───────┬────────┘ └────────────────┘ └────────────────┘
+                            │  the same A2A call, one level deeper
+                            ▼
+                    ┌────────────────┐
+                    │    currency    │
+                    │ Deployment/Svc │
+                    └────────────────┘
 ```
+
+Six agents, and the graph is not a star: `math` declares `currency` as a peer,
+so `orchestrator → math → currency` is an ordinary chain of A2A calls. Nothing
+in the agent builder distinguishes a coordinator from a leaf — an agent that
+delegates is one whose spec lists `peers`, at any depth — and the rules do not
+loosen further down: `currency` sees the request `math` composed and no more of
+the conversation than `math` itself was given.
 
 ## What this is
 
@@ -37,7 +45,8 @@ hops away — when the approval might take a week? And how much of that can you 
 without the agents secretly sharing state, so a squad on LangGraph can join in?
 
 Those answers are the substance of this repo. The agents themselves are
-deliberately trivial — arithmetic, a web search, a plan draft — because they are
+deliberately small — arithmetic, a web search, a plan draft, a currency
+conversion, one SQL query against one public table — because they are
 scaffolding for the parts that are not.
 
 **What is wired up:**
@@ -47,16 +56,19 @@ scaffolding for the parts that are not.
 | **Agent definition** | Every agent is a declarative `AgentSpec` in a registry, built by one factory. There is no orchestrator class — the orchestrator is just the agent whose spec declares `peers` |
 | **One image, every agent** | `AGENT_NAME` selects which agent a process becomes at startup, so there is a single build and a single container to deploy |
 | **Service discovery** | Peers are declared in code, resolved from cluster DNS, and discovered through their published A2A agent cards |
-| **Share-nothing delegation** | A specialist is called with an explicit typed payload and sees nothing else — no transcript, no shared session state. Large inputs travel as object-store references it reads itself |
+| **Share-nothing delegation** | No shared session state, no shared artifact handles, no side channels. Large inputs travel as object-store references the specialist reads itself |
 | **Durable state** | Sessions, A2A tasks and approval cases persist in AlloyDB, each agent in its own PostgreSQL schema, with Alembic-managed migrations |
 | **Per-agent identity** | One Google service account per agent, bound by Workload Identity, authenticating to the database with IAM — no passwords anywhere |
-| **Human-in-the-loop** | A gated action is proposed, recorded as a durable case, and carried out later — so an approval can take a week and costs one row. The effect is unreachable without an approver — [docs/human-in-the-loop.md](docs/human-in-the-loop.md) |
+| **Human-in-the-loop** | A gated action is proposed, recorded as a durable case, and carried out later — so an approval can take a week and costs one row. The effect is unreachable without an approver. Two of them here: `math` publishing a figure, and `trades` running a BigQuery query — [docs/human-in-the-loop.md](docs/human-in-the-loop.md) |
+| **Per-agent authorization** | Only `trades` holds `roles/bigquery.jobUser`, and only `math` may reach `currency` on the network. Widening one agent widens no other |
 | **Observability** | Structured logs and distributed traces that follow a request across every hop, so one trace covers the whole cluster |
 | **Infrastructure** | Terraform for the Google Cloud side, Kustomize for the Kubernetes side, both in `infra/` |
 
 **Status.** This is a working reference implementation, not a product. Several
 ADK features it relies on are marked experimental, so pin the ADK version
-deliberately.
+deliberately. It speaks **A2A protocol v1.0** (`a2a-sdk >= 1.1.2`, which is why
+the `google-adk` floor is `>= 2.5.0`), while still accepting v0.3 requests —
+[docs/a2a-v1-migration.md](docs/a2a-v1-migration.md) covers the upgrade.
 
 **Where to go next:**
 
@@ -70,6 +82,7 @@ deliberately.
 | Make an agent wait for a human | [docs/human-in-the-loop.md](docs/human-in-the-loop.md) |
 | Deploy to your own GCP project | [docs/deploy-to-another-project.md](docs/deploy-to-another-project.md) |
 | Inspect sessions, tasks and approvals in AlloyDB | [docs/inspecting-the-database.md](docs/inspecting-the-database.md) |
+| Upgrade a repo like this one from A2A v0.3 to v1.0 | [docs/a2a-v1-migration.md](docs/a2a-v1-migration.md) — what changed here, and the two ways it fails quietly |
 | Work on this with a coding agent | `AGENTS.md` — invariants, gotchas, verified commands |
 
 ## Project Structure
@@ -82,16 +95,21 @@ mas-gke/
 │   ├── agents/                 # WHO the agents are
 │   │   ├── __init__.py         #   the registry (AGENTS + DEFAULT_AGENT)
 │   │   ├── base.py             #   AgentSpec + the single build_agent()
-│   │   ├── contracts.py        #   THE WIRE CONTRACTS: opt-in payload model per agent
+│   │   ├── statuses.py         #   THE STATUS VOCABULARY a caller keys on
+│   │   ├── gating.py           #   HUMAN AUTHORIZATION: @gated + require_approval()
 │   │   ├── documents.py        #   read_document (claim-check references)
 │   │   ├── reporting.py        #   keeps structured results intact across A2A
 │   │   ├── orchestrator/       #   entry point (declares peers)
 │   │   ├── research/           #   specialist + web_search tool
-│   │   ├── math/               #   specialist + calculate, propose/execute_publish
-│   │   └── planner/            #   specialist that drafts a plan for review
+│   │   ├── math/               #   calculate + gated publish; delegates to currency
+│   │   ├── planner/            #   specialist that drafts a plan for review
+│   │   ├── trades/             #   writes SQL; the query itself needs approval
+│   │   └── currency/           #   second-tier specialist, reached only by math
 │   ├── cluster/                # The PLUMBING
 │   │   ├── config.py           #   env -> ClusterConfig / peers
-│   │   ├── resolver.py         #   peers -> typed PeerTool (agent-card discovery)
+│   │   ├── resolver.py         #   peers -> sub-agent or tool (agent-card discovery)
+│   │   ├── authorization.py    #   report a suspended tool as AUTH_REQUIRED
+│   │   ├── grants.py           #   deliver a decision to the owning agent
 │   │   ├── peer_tool.py        #   explicit-payload delegation (never the transcript)
 │   │   ├── di.py               #   injector modules
 │   │   ├── session.py          #   pluggable session + memory backends
@@ -112,8 +130,10 @@ mas-gke/
 ├── tests/                      # unit / integration / eval
 ├── docs/                       # environment-variables, adding-an-agent,
 │                               #   inspecting-the-database, human-in-the-loop,
-│                               #   design-decisions, deploy-to-another-project
+│                               #   design-decisions, deploy-to-another-project,
+│                               #   a2a-v1-migration
 ├── AGENTS.md                   # AI-assisted development guide
+├── cloudbuild.yaml             # Image build (Cloud Build); `make image` runs it
 └── pyproject.toml              # Project dependencies
 ```
 
@@ -126,9 +146,9 @@ Before you begin, ensure you have:
 - **uv**: Python package manager (used for all dependency management in this project) - [Install](https://docs.astral.sh/uv/getting-started/installation/) ([add packages](https://docs.astral.sh/uv/concepts/dependencies/) with `uv add <package>`)
 - **agents-cli**: Agents CLI - Install with `uv tool install google-agents-cli`
 - **Google Cloud SDK**: For GCP services - [Install](https://cloud.google.com/sdk/docs/install)
-- For deploying: **kubectl**, **terraform** (>= 1.9), and an OCI image builder
-  (**docker** or **podman** — the commands below show `docker`; podman accepts
-  the same arguments)
+- For deploying: **kubectl** and **terraform** (>= 1.9). The image is built by
+  **Cloud Build** (`make image`), so no local OCI builder is required; **docker**
+  or **podman** is only needed if you choose to build on your workstation
 
 ## Quick Start
 
@@ -162,17 +182,24 @@ You can also use features from the [ADK](https://adk.dev/) CLI with `uv run adk`
 ### Run the whole cluster locally
 
 The agents only behave like a distributed system when they are genuinely in
-separate processes, so the Makefile starts all four and wires the peer URLs:
+separate processes, so the Makefile starts all six and wires the peer URLs:
 
 ```bash
 make check     # credentials, location, and that the model is actually reachable
-make up        # orchestrator :8090, math :8091, research :8092, planner :8093
+make up        # orchestrator :8090, math :8091, research :8092, planner :8093,
+               # trades :8094, currency :8095
 make demo      # the approval flow end to end, asserted rather than eyeballed
 make down
 ```
 
+There are two sets of peer URLs, not one: the orchestrator is pointed at
+`research`, `math`, `planner` and `trades`, and `math` is pointed at `currency`.
+Omitting the second set is silent — every agent still starts and reports
+healthy, `math` simply has no currency tool and declines the conversion.
+
 `make status` shows health and the resolved model per agent; `make logs A=math`
-follows one; `make serve-math` runs a single agent in the foreground.
+follows one; `make serve-math` runs a single agent in the foreground (there is a
+`serve-<agent>` target for each of the six).
 
 `make check` is worth running first. Two settings break this in ways that look
 like something else — a stale `GOOGLE_CLOUD_LOCATION` produces a 403 that reads
@@ -228,10 +255,10 @@ the orchestrator is simply the agent whose spec declares `peers`.
 1. Create `app/agents/<name>/agent.py` exposing a `SPEC = AgentSpec(...)`
    (agent-specific tools go in `app/agents/<name>/tools.py`).
 2. Register it in `app/agents/__init__.py`.
-3. *Optional, but the convention here:* declare its request contract in
-   `app/agents/contracts.py` and add it to `PAYLOADS`. The default contract
-   between agents is a single free-text task plus a `case_id`; a model here
-   upgrades that to named, validated, card-published fields.
+3. If it gates an effect behind a human, write the tool with
+   `require_approval()` and mark it `@gated` (`app/agents/gating.py`). That
+   marker is what makes its callers reach it as a sub-agent, which is what lets
+   a suspended action reach a person at all.
 4. Add the name to another agent's `AgentSpec.peers` if it should be delegated to.
 
 Use a single lowercase word valid as **both** a Python identifier and a
@@ -280,11 +307,12 @@ cp terraform.tfvars.example terraform.tfvars   # set project_id
 terraform init && terraform apply
 eval "$(terraform output -raw get_credentials_command)"
 
-# 2. Build and push the image
-REPO=$(terraform output -raw artifact_registry_repo)
-docker login -u oauth2accesstoken -p "$(gcloud auth print-access-token)" "${REPO%%/*}"
-docker build --platform linux/amd64 -t "$REPO/agent:latest" .
-docker push "$REPO/agent:latest"
+# 2. Build and push the image with Cloud Build. Only the source tarball leaves
+#    this machine (a few hundred KB — see .gcloudignore); the wheels come down
+#    and the layers go up inside Google's network. For the raw gcloud form,
+#    run `terraform output build_command` while still in infra/terraform.
+cd ../..            # the Makefile and cloudbuild.yaml live at the repo root
+make image TAG=demo-1
 
 # 3. Fill the placeholders below, then deploy. Let the Alembic Job finish first:
 #    the agents have no CREATE privilege by design and crash-loop until the
@@ -296,10 +324,11 @@ kubectl -n agents get pods,svc
 kubectl -n agents port-forward svc/orchestrator 8080:80
 ```
 
-> ⚠️ `--platform linux/amd64` is **required**. The GKE Autopilot nodes these
-> manifests target are amd64, so on an arm64 workstation a native build produces
-> an image whose pods fail with `exec format error` — which reads like an
-> application bug rather than a build one.
+> ⚠️ **If you must build locally**, pass `--platform linux/amd64`. The GKE
+> Autopilot nodes these manifests target are amd64, so on an arm64 workstation a
+> native build produces an image whose pods fail with `exec format error` —
+> which reads like an application bug rather than a build one. Cloud Build's
+> workers are amd64, which is one reason step 2 no longer runs on a workstation.
 
 The project-specific values to fill before step 3 — all of them come from
 `terraform output -json kustomize_values`:
@@ -310,33 +339,45 @@ The project-specific values to fill before step 3 — all of them come from
 - `orchestrator.yaml` / `workers.yaml` / `migrate-job.yaml` → `ALLOYDB_IAM_USER`
   (each agent's GSA email minus `.gserviceaccount.com`)
 - `infra/kustomize/overlays/dev/kustomization.yaml` → the image repo
-  (`terraform output artifact_registry_repo`)
+  (`terraform output artifact_registry_repo`) and `newTag`, matching the `TAG`
+  step 2 built. The cluster pulls what that file names, not what was built last
 - `infra/kustomize/base/configmap.yaml` → `OTEL_RESOURCE_ATTRIBUTES:
   "gcp.project_id=<project>"`. Not cosmetic: Cloud Trace rejects every span
   batch whose resource lacks it, so tracing fails silently if it's stale.
 
 ## Human-in-the-loop
 
-An action that needs sign-off is **proposed, not performed**. The specialist
-returns a proposal and finishes; the orchestrator records a durable case and
-answers the user. Nothing is held open, so an approval can take a fortnight and
-costs one row. When it arrives, the same request is re-sent with the approver
-attached, and the specialist recomputes the result from the same input — so
-there is nothing for anyone to retype incorrectly.
+An action that needs sign-off **suspends, rather than running**. The specialist
+leaves its A2A task in `TASK_STATE_AUTH_REQUIRED` — A2A's own In-Task
+Authorization state (spec 7.6) — and the orchestrator records a durable case and
+answers the user. Waiting costs one row, so an approval can take a fortnight.
+When the decision arrives it is delivered straight to the suspended task, and
+ADK re-executes the tool with the same arguments a human actually read.
 
 ```bash
-curl -X POST localhost:8080/cases/run -H 'content-type: application/json' \
-  -d '{"text":"Work out 17 * 23 and publish it as q3-revenue."}'
-# → status "awaiting_approval", with the proposal and what it would do
+# any A2A client; the A2A-Version header is mandatory
+curl -s localhost:8080/a2a/app -H 'A2A-Version: 1.0' -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{"message":{
+       "messageId":"m1","role":"ROLE_USER",
+       "parts":[{"text":"Work out 17 * 23 and publish it as q3-revenue."}]}}}' \
+  | jq -r '.result.status.state'
+# → TASK_STATE_AUTH_REQUIRED
+
+curl -s localhost:8080/cases | jq '.cases[0].proposal_id'
 curl -X POST localhost:8080/cases/<proposal_id> -H 'content-type: application/json' \
   -d '{"approved":true,"decided_by":"ops@example.com"}'
-# → status "executed"
+# → status "executed", with the tool's own result
 ```
 
-Nothing is suspended between the two calls, so there is no recovery machinery —
-and nothing ADK-specific either, so a specialist on another framework implements
-the same two skills. **[docs/human-in-the-loop.md](docs/human-in-the-loop.md)**
-has the walkthrough and the known limits.
+The same machinery gates a **read**. The `trades` specialist writes the SQL for
+a question, suspends, and touches BigQuery not at all until a human decides —
+and because ADK re-runs the suspended call, the query that runs is byte-for-byte
+the one that was reviewed.
+
+The gate itself is a branch inside the tool, not the task state: spec 7.6.4 is
+explicit that the state authorises nothing on its own.
+**[docs/human-in-the-loop.md](docs/human-in-the-loop.md)** has the walkthrough
+and the known limits.
 
 ## Observability
 
@@ -353,4 +394,13 @@ Collector (Grafana Tempo, Jaeger, Datadog, ...) instead. See
 ## A2A Inspector
 
 This agent supports the [A2A Protocol](https://a2a-protocol.org/). Use the [A2A Inspector](https://github.com/a2aproject/a2a-inspector) to test interoperability.
-Each agent publishes its card at `/a2a/app/.well-known/agent-card.json`.
+Each agent publishes its card at `/a2a/app/.well-known/agent-card.json` — same
+path as before the v1.0 upgrade, but v1.0-shaped: `supportedInterfaces[]`
+replaced the top-level `url` and `protocolVersion`.
+
+The JSON-RPC route accepts v0.3 requests as well, and that is the trap for a
+hand-rolled client. A request with **no `A2A-Version` header is treated as
+0.3**, so a v1.0 method name (`SendMessage`, `GetTask`) comes back as an HTTP
+200 carrying JSON-RPC error `-32009` and an empty stream — which reads as the
+agent having nothing to say. Send `A2A-Version: 1.0`; see
+[docs/a2a-v1-migration.md](docs/a2a-v1-migration.md).

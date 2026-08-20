@@ -40,7 +40,7 @@ imports it, and ``App(name=...)`` must equal the agent directory (``app``).
 import os
 
 from a2a.server.tasks import TaskStore
-from google.adk.apps import App
+from google.adk.apps import App, ResumabilityConfig
 from google.adk.artifacts.base_artifact_service import BaseArtifactService
 from google.adk.memory import BaseMemoryService
 from google.adk.sessions import BaseSessionService
@@ -107,8 +107,18 @@ root_agent = build_agent(AGENTS[_name], models, resolver)
 # The `App` wraps the root agent for serving/deployment.
 # NOTE: `name` must match the agent directory (default: "app").
 #
-# No `resumability_config` and no capture plugin: an invocation here always runs
-# to completion. Human approval is modelled as business state instead -- a
-# specialist proposes, the caller records a case, and the approved action is a
-# fresh call later (app/cluster/cases.py, docs/design-decisions.md D5).
-app = App(root_agent=root_agent, name="app")
+# `resumability_config` keeps a suspended invocation replayable from session
+# history, which is what lets a gated tool be re-executed with a human's
+# decision minutes or days after it asked (app/agents/gating.py). Resumption
+# replays from the session, so it needs a durable session service -- DB_BACKEND
+# must not be `none` for an agent that owns a gated tool.
+#
+# It does NOT make a grant cascade down a chain of callers. That was tried and
+# does not work: ADK resolves a confirmation against the *local* tool set, so a
+# caller silently drops a grant for a peer's tool. Decisions are delivered
+# straight to the owning agent instead -- see app/cluster/grants.py.
+app = App(
+    root_agent=root_agent,
+    name="app",
+    resumability_config=ResumabilityConfig(is_resumable=True),
+)

@@ -57,6 +57,8 @@ locals {
     "storage.googleapis.com",           # GCS: the artifact bucket (see artifacts.tf)
     "alloydb.googleapis.com",           # AlloyDB cluster + instance
     "servicenetworking.googleapis.com", # Private services access peering for AlloyDB
+    "bigquery.googleapis.com",          # The trades agent's query jobs
+    "cloudbuild.googleapis.com",        # Image builds (see ../../cloudbuild.yaml)
   ]
 
   agent_identities = toset(var.agents)

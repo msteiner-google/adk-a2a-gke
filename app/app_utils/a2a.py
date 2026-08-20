@@ -18,6 +18,28 @@ func:`attach_a2a_routes` registers the dynamic
 agent-card endpoint and the JSON-RPC endpoint so the same app serves A2A
 alongside the adk_api routes, reachable by A2A clients and Gemini Enterprise A2A
 registration.
+
+**A2A protocol v1.0 (a2a-sdk 1.x).** The 0.3-era wrapper classes
+(``A2AFastAPIApplication`` / ``A2AStarletteApplication``) were removed; routes
+now come from factory functions in ``a2a.server.routes`` that return plain
+Starlette ``Route`` objects. Three consequences are load-bearing here:
+
+* ``DefaultRequestHandler`` now *requires* ``agent_card``. In 0.3 the card was
+  handed to the application wrapper, so the handler never saw it; in 1.0 the
+  handler answers ``GetExtendedAgentCard`` itself and cannot be built without it.
+* ``add_a2a_routes_to_fastapi`` is used rather than ``FastAPI(routes=...)`` or a
+  bare ``app.routes.extend``. All three mount working endpoints, but only this
+  helper registers them as ``APIRoute`` instances, so the A2A endpoints keep
+  appearing in ``/docs`` and ``/openapi.json`` — which is how this app was
+  discoverable before the upgrade.
+* ``EXTENDED_AGENT_CARD_PATH`` no longer exists. The authenticated extended card
+  moved from its own well-known URL to the ``GetExtendedAgentCard`` RPC method
+  on the JSON-RPC route, so there is no third URL to mount.
+
+``enable_v0_3_compat=True`` keeps the JSON-RPC route answering 0.3-shaped
+requests as well as 1.0 ones. It costs one extra dispatch branch and is what
+lets a peer still running a 0.3 client — another squad's agent, an older
+sidecar, the A2A Inspector — keep working while the fleet rolls forward.
 """
 
 from __future__ import annotations
@@ -25,15 +47,17 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
-from a2a.server.apps import A2AFastAPIApplication
 from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import (
+    add_a2a_routes_to_fastapi,
+    create_agent_card_routes,
+    create_jsonrpc_routes,
+)
 from a2a.server.tasks import TaskStore
 from a2a.types import AgentCapabilities, AgentExtension
-from a2a.utils.constants import (
-    AGENT_CARD_WELL_KNOWN_PATH,
-    EXTENDED_AGENT_CARD_PATH,
-)
+from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 from google.adk.a2a.executor.a2a_agent_executor import A2aAgentExecutor
+from google.adk.a2a.executor.config import A2aAgentExecutorConfig
 from google.adk.a2a.utils.agent_card_builder import AgentCardBuilder
 from google.adk.workflow import Workflow
 
@@ -70,6 +94,7 @@ async def attach_a2a_routes(
     runner: Runner,
     task_store: TaskStore,
     rpc_path: str,
+    executor_config: A2aAgentExecutorConfig | None = None,
     capabilities: AgentCapabilities | None = None,
     agent_version: str | None = None,
     app_url: str | None = None,
@@ -98,14 +123,20 @@ async def attach_a2a_routes(
     ).build()
 
     request_handler = DefaultRequestHandler(
-        agent_executor=A2aAgentExecutor(runner=runner),
+        agent_executor=A2aAgentExecutor(runner=runner, config=executor_config),
         task_store=task_store,
+        agent_card=agent_card,
     )
 
-    a2a_app = A2AFastAPIApplication(agent_card=agent_card, http_handler=request_handler)
-    a2a_app.add_routes_to_app(
+    add_a2a_routes_to_fastapi(
         app,
-        agent_card_url=f"{rpc_path}{AGENT_CARD_WELL_KNOWN_PATH}",
-        rpc_url=rpc_path,
-        extended_agent_card_url=f"{rpc_path}{EXTENDED_AGENT_CARD_PATH}",
+        agent_card_routes=create_agent_card_routes(
+            agent_card,
+            card_url=f"{rpc_path}{AGENT_CARD_WELL_KNOWN_PATH}",
+        ),
+        jsonrpc_routes=create_jsonrpc_routes(
+            request_handler,
+            rpc_path,
+            enable_v0_3_compat=True,
+        ),
     )

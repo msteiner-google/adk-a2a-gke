@@ -12,13 +12,23 @@
 # the network enforce the same shape:
 #
 #     orchestrator ---> research
-#                  \--> math
+#                  |--> math ---> currency
+#                  |--> planner
+#                  \--> trades
 #     research  -X-> math          (workers cannot reach each other)
 #     research  -X-> orchestrator  (no callbacks upstream)
+#     trades    -X-> currency      (only math may reach currency)
 #
 # Keep these in sync with AgentSpec.peers. If you add a delegation edge in code
 # without adding it here, the call fails with a connection timeout rather than a
 # clear error -- that is the usual symptom of a missing rule below.
+#
+# `math -> currency` is the edge that makes this file more than bookkeeping. The
+# delegation graph is not one level deep, so "workers accept traffic from the
+# orchestrator" is no longer the whole policy: currency accepts traffic from
+# math and from nobody else, including the orchestrator. A blanket
+# "any agent may call any agent" rule would have hidden that distinction and
+# handed a prompt-injected `research` a path to every specialist.
 #
 # GKE Autopilot enforces NetworkPolicy natively (GKE Dataplane V2); no add-on
 # needed.
@@ -74,7 +84,7 @@ spec:
     matchExpressions:
       - key: app
         operator: In
-        values: ["research", "math", "planner"]
+        values: ["research", "math", "planner", "trades"]
   policyTypes:
     - Ingress
   ingress:
@@ -82,6 +92,29 @@ spec:
         - podSelector:
             matchLabels:
               app: orchestrator
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# `currency` is deliberately NOT in the list above. It is a second-tier
+# specialist reached only by `math` (app/agents/math/agent.py), so the
+# orchestrator has no path to it either -- the policy states the topology the
+# code declares, rather than the looser one that would also work.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: currency-ingress-from-math
+spec:
+  podSelector:
+    matchLabels:
+      app: currency
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: math
       ports:
         - protocol: TCP
           port: 8080

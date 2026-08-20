@@ -4,27 +4,46 @@
 # which is the point: the coupling this architecture removes is only observable
 # when the agents are genuinely in different processes.
 #
-#   make up            start all four agents
+#   make up            start every agent
 #   make status        are they up, and on which models
 #   make demo          run the human-in-the-loop flow end to end
 #   make down          stop them
+#   make image         build and push the container image with Cloud Build
 #
 # Targets `serve-<agent>` run one agent in the foreground when you want to watch
 # it, e.g. `make serve-math`.
 
-AGENTS := orchestrator math research planner
+AGENTS := orchestrator math research planner trades currency
 
 PORT_orchestrator := 8090
 PORT_math         := 8091
 PORT_research     := 8092
 PORT_planner      := 8093
+PORT_trades       := 8094
+PORT_currency     := 8095
+
+# The same ports again, in a form a shell loop can look up. Every loop below
+# iterates over $(AGENTS) and needs that agent's port; a `case` inside each loop
+# meant four places to edit when an agent was added, and missing one yields an
+# empty port and a curl to `http://127.0.0.1:` -- which reads as "the agent is
+# down". Use it as `port=$(PORT_OF)` with `$$a` holding the agent name.
+PORTS  := orchestrator=$(PORT_orchestrator) math=$(PORT_math) \
+          research=$(PORT_research) planner=$(PORT_planner) \
+          trades=$(PORT_trades) currency=$(PORT_currency)
+PORT_OF = $$(echo "$(PORTS)" | tr ' ' '\n' | sed -n "s/^$$a=//p")
 
 RUN_DIR := .run
 HOST    := 127.0.0.1
 
-# The orchestrator's peers, addressed explicitly. In the cluster these come from
-# Kubernetes DNS; locally they are loopback ports (see app/cluster/config.py).
-PEERS := research=http://$(HOST):$(PORT_research),math=http://$(HOST):$(PORT_math),planner=http://$(HOST):$(PORT_planner)
+# Peers, addressed explicitly. In the cluster these come from Kubernetes DNS;
+# locally they are loopback ports (see app/cluster/config.py).
+#
+# There are TWO sets, because delegation is not one level deep: `math` sends
+# currency conversions on to `currency`. Omit MATH_PEERS and everything still
+# starts and still reports healthy -- the math agent just has no currency tool,
+# and a conversion quietly turns into something it declines to do.
+PEERS      := research=http://$(HOST):$(PORT_research),math=http://$(HOST):$(PORT_math),planner=http://$(HOST):$(PORT_planner),trades=http://$(HOST):$(PORT_trades)
+MATH_PEERS := currency=http://$(HOST):$(PORT_currency)
 
 # --- Environment -------------------------------------------------------------
 #
@@ -70,7 +89,7 @@ help:
 	@echo "Local multi-agent cluster"
 	@echo ""
 	@echo "  make check          verify credentials and configuration first"
-	@echo "  make up             start all four agents in the background"
+	@echo "  make up             start every agent in the background"
 	@echo "  make status         show health, port and resolved model per agent"
 	@echo "  make logs           follow every agent's log"
 	@echo "  make logs A=math    follow one agent's log"
@@ -81,6 +100,9 @@ help:
 	@echo "  make serve-math     run one agent in the foreground"
 	@echo "  make test           hermetic unit tests"
 	@echo "  make lint           ruff + codespell + ty"
+	@echo ""
+	@echo "  make image          build + push the image with Cloud Build"
+	@echo "  make image TAG=x    ... under an explicit tag"
 	@echo ""
 	@echo "  project=$(GOOGLE_CLOUD_PROJECT)  location=$(GOOGLE_CLOUD_LOCATION)"
 	@echo "  orchestrator UI: http://$(HOST):$(PORT_orchestrator)/dev-ui/"
@@ -122,11 +144,12 @@ up: $(RUN_DIR)
 		echo "  make up GOOGLE_CLOUD_PROJECT=<a project that can call Vertex>"; \
 		exit 1; }
 	@for a in $(AGENTS); do \
-		eval port=\$$PORT_$$a; \
-		case $$a in orchestrator) port=$(PORT_orchestrator); peers="A2A_PEERS=$(PEERS)";; \
-			math) port=$(PORT_math); peers=;; \
-			research) port=$(PORT_research); peers=;; \
-			planner) port=$(PORT_planner); peers=;; esac; \
+		port=$(PORT_OF); \
+		case $$a in \
+			orchestrator) peers="A2A_PEERS=$(PEERS)";; \
+			math)         peers="A2A_PEERS=$(MATH_PEERS)";; \
+			*)            peers=;; \
+		esac; \
 		if lsof -ti tcp:$$port >/dev/null 2>&1; then \
 			echo "skip  $$a already listening on $$port"; continue; fi; \
 		env $(BASE_ENV) $$peers AGENT_NAME=$$a APP_URL=http://$(HOST):$$port \
@@ -137,8 +160,7 @@ up: $(RUN_DIR)
 	done
 	@echo "waiting for agent cards..."
 	@for a in $(AGENTS); do \
-		case $$a in orchestrator) port=$(PORT_orchestrator);; math) port=$(PORT_math);; \
-			research) port=$(PORT_research);; planner) port=$(PORT_planner);; esac; \
+		port=$(PORT_OF); \
 		for i in $$(seq 1 60); do \
 			if curl -sf -o /dev/null -m 2 http://$(HOST):$$port/a2a/app/.well-known/agent-card.json; \
 				then break; fi; sleep 1; \
@@ -151,8 +173,7 @@ $(RUN_DIR):
 
 down:
 	@for a in $(AGENTS); do \
-		case $$a in orchestrator) port=$(PORT_orchestrator);; math) port=$(PORT_math);; \
-			research) port=$(PORT_research);; planner) port=$(PORT_planner);; esac; \
+		port=$(PORT_OF); \
 		pids=$$(lsof -ti tcp:$$port 2>/dev/null); \
 		if [ -n "$$pids" ]; then kill $$pids 2>/dev/null; echo "stop  $$a ($$port)"; \
 		else echo "--    $$a not running"; fi; \
@@ -160,8 +181,7 @@ down:
 	done
 	@sleep 2
 	@for a in $(AGENTS); do \
-		case $$a in orchestrator) port=$(PORT_orchestrator);; math) port=$(PORT_math);; \
-			research) port=$(PORT_research);; planner) port=$(PORT_planner);; esac; \
+		port=$(PORT_OF); \
 		pids=$$(lsof -ti tcp:$$port 2>/dev/null); \
 		if [ -n "$$pids" ]; then kill -9 $$pids 2>/dev/null || true; fi; \
 	done
@@ -172,8 +192,7 @@ restart:
 
 status:
 	@for a in $(AGENTS); do \
-		case $$a in orchestrator) port=$(PORT_orchestrator);; math) port=$(PORT_math);; \
-			research) port=$(PORT_research);; planner) port=$(PORT_planner);; esac; \
+		port=$(PORT_OF); \
 		code=$$(curl -s -o /dev/null -m 5 -w "%{http_code}" \
 			http://$(HOST):$$port/a2a/app/.well-known/agent-card.json 2>/dev/null); \
 		model=$$(grep -oE 'gemini-[0-9][^"'"'"' ,]*' $(RUN_DIR)/$$a.log 2>/dev/null | head -1); \
@@ -199,9 +218,20 @@ serve-orchestrator:
 		APP_URL=http://$(HOST):$(PORT_orchestrator) \
 		uv run uvicorn app.fast_api_app:app --host $(HOST) --port $(PORT_orchestrator)
 
+# The math agent gets peers of its own: it delegates currency conversions on to
+# the currency specialist rather than applying a rate it recalled.
 serve-math:
-	@env $(BASE_ENV) AGENT_NAME=math APP_URL=http://$(HOST):$(PORT_math) \
+	@env $(BASE_ENV) A2A_PEERS=$(MATH_PEERS) AGENT_NAME=math \
+		APP_URL=http://$(HOST):$(PORT_math) \
 		uv run uvicorn app.fast_api_app:app --host $(HOST) --port $(PORT_math)
+
+serve-trades:
+	@env $(BASE_ENV) AGENT_NAME=trades APP_URL=http://$(HOST):$(PORT_trades) \
+		uv run uvicorn app.fast_api_app:app --host $(HOST) --port $(PORT_trades)
+
+serve-currency:
+	@env $(BASE_ENV) AGENT_NAME=currency APP_URL=http://$(HOST):$(PORT_currency) \
+		uv run uvicorn app.fast_api_app:app --host $(HOST) --port $(PORT_currency)
 
 serve-research:
 	@env $(BASE_ENV) AGENT_NAME=research APP_URL=http://$(HOST):$(PORT_research) \
@@ -241,6 +271,45 @@ print(d['pending'][0]['proposal_id'] if d['pending'] else '')"); \
 		-d '{"approved":true,"decided_by":"cfo@example.com","note":"reconciled"}' \
 		| uv run python -c "import json,sys; d=json.load(sys.stdin); \
 print('   status:', d['status']); print('   result:', d['case']['result'])"
+
+# --- Image -------------------------------------------------------------------
+#
+# Builds in Cloud Build, not here. Only the source tarball leaves this machine
+# (a few hundred KB -- see .gcloudignore); the ~400 MB of wheels and the ~550 MB
+# of pushed layers move inside Google's network. It also removes the
+# `--platform linux/amd64` trap: Cloud Build workers are amd64, so an arm64
+# workstation can no longer produce an image whose pods die with
+# `exec format error`.
+#
+#   make image                 build and push :$(TAG)
+#   make image TAG=demo-2      ... under a different tag
+#
+# Keep TAG in step with newTag in infra/kustomize/overlays/dev/kustomization.yaml
+# -- the cluster pulls what that file names, not what was built last.
+
+TAG    ?= demo-1
+REGION ?= europe-west4
+REPO   ?= agents
+
+# The image lives where the CLUSTER lives, which is not necessarily the project
+# you run models against locally. Keeping this separate from
+# GOOGLE_CLOUD_PROJECT means `make up` and `make image` can disagree without
+# either being wrong -- and without a build quietly pushing into the wrong
+# registry. Override with `make image BUILD_PROJECT=other-project`.
+BUILD_PROJECT ?= msteiner
+BUILDER       ?= agent-builder@$(BUILD_PROJECT).iam.gserviceaccount.com
+
+.PHONY: image
+image:
+	@echo "building $(REGION)-docker.pkg.dev/$(BUILD_PROJECT)/$(REPO)/agent:$(TAG)"
+	@gcloud builds submit \
+		--config cloudbuild.yaml \
+		--project $(BUILD_PROJECT) \
+		--service-account projects/$(BUILD_PROJECT)/serviceAccounts/$(BUILDER) \
+		--substitutions _REGION=$(REGION),_REPO=$(REPO),_TAG=$(TAG)
+	@echo ""
+	@echo "set newTag: $(TAG) in infra/kustomize/overlays/dev/kustomization.yaml,"
+	@echo "then deploy it -- which needs a human, not this Makefile."
 
 # --- Quality -----------------------------------------------------------------
 

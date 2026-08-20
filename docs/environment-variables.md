@@ -5,8 +5,9 @@ what it actually does. This file is the **single source of truth** — when you
 add, rename or remove a variable, update it here (see
 [Maintaining this file](#maintaining-this-file)).
 
-Audited against the code at `d20f1ea`. Behaviour marked "silently" was confirmed
-by executing the parsers, not just by reading them.
+Audited against the code at `d20f1ea`, plus the three `TRADES_*` variables added
+with the trades agent. Behaviour marked "silently" was confirmed by executing
+the parsers, not just by reading them.
 
 - [How configuration is resolved](#how-configuration-is-resolved)
 - [Quick reference](#quick-reference) — every variable, one line each
@@ -16,6 +17,7 @@ by executing the parsers, not just by reading them.
   [session, memory & tasks](#session-memory--tasks) ·
   [artifacts](#artifacts) ·
   [approval cases](#approval-cases) ·
+  [the trades agent](#the-trades-agent--appagentstradestoolspy) ·
   [observability](#observability) ·
   [serving](#serving) ·
   [migrations & scripts](#migrations--scripts)
@@ -117,6 +119,20 @@ Legend: **R** = raises at startup if invalid · **S** = silently falls back ·
 | `ALLOW_ORIGINS` | *(unset → no CORS middleware)* | Comma-separated CORS origins | S |
 | `AGENT_VERSION` | `0.1.0` in code, `0.0.0` in the image | `version` field of the A2A card | S |
 
+### The trades agent — `app/agents/trades/tools.py`
+
+The only per-agent variables in the system, and they break two habits this page
+otherwise relies on. They are read at **call time** rather than at import, so
+they can be changed without restarting the pod; and they are meaningless in any
+pod whose `AGENT_NAME` is not `trades`, which is why they are set in that one
+Deployment rather than in the shared ConfigMap.
+
+| Variable | Default | Effect | Bad value |
+| --- | --- | --- | --- |
+| `TRADES_LOCATION` | `US` | BigQuery job location. `bigquery-public-data` lives in the US multi-region | L |
+| `TRADES_MAX_BYTES_BILLED` | `1073741824` (1 GiB) | BigQuery `maximum_bytes_billed`. The job is killed rather than billed past it | S |
+| `TRADES_MAX_ROWS` | `50` | Hard cap on rows returned to the caller | S |
+
 ### Migrations & scripts
 
 | Variable | Default | Effect | Consumer |
@@ -124,7 +140,7 @@ Legend: **R** = raises at startup if invalid · **S** = silently falls back ·
 | `DB_AGENT_ROLE` | `""` → **silent no-op** | Role that migration `0003` grants USAGE + DML to | Alembic |
 | `DB_READERS` | `""` → nothing granted | Comma-separated principals to grant read-only access | `scripts/grant_readers.py` |
 | `DB_READER_SCHEMAS` | `""` → error if `DB_READERS` is set | Schemas to grant on; commas or whitespace | `scripts/grant_readers.py` |
-| `CHECK_SCHEMAS` | `orchestrator research math` | Whitespace-separated schemas to report on | `scripts/dbcheck.py` |
+| `CHECK_SCHEMAS` | `orchestrator research math` | Whitespace-separated schemas to report on. Predates `trades`/`currency`; pass them explicitly | `scripts/dbcheck.py` |
 | `MIGRATE_AGENTS` | — | Space-separated agents the migration Job loops over | Job shell script |
 | `AGENT_ROLE_PREFIX` / `AGENT_ROLE_SUFFIX` | — | Compose `DB_AGENT_ROLE` as `<prefix>-<agent>@<suffix>` | Job shell script |
 
@@ -247,11 +263,15 @@ for ip_type, got 'INTERNAL'. Want one of: 'PUBLIC', 'PRIVATE', 'PSC'.`
 database option. See [Traps](#traps) — it is currently wired to nothing.
 
 `TASK_STORE_BACKEND=in_memory` is per-pod, so a task created by the pod that
-answered `message/send` is invisible to the pod that later receives `tasks/get`.
-Scaling an agent past one replica silently breaks task polling and
-resubscription; `database` fixes both. The database store is constructed with
-`create_table=False` because Alembic owns the schema, so if the migration has
-not run you get "relation does not exist" rather than an auto-created table.
+answered `SendMessage` (`message/send` before A2A v1.0) is invisible to the pod
+that later receives `GetTask` (`tasks/get`). Scaling an agent past one replica
+silently breaks task polling and resubscription; `database` fixes both. The
+database store is constructed with `create_table=False` because Alembic owns the
+schema, so if the migration has not run you get "relation does not exist" rather
+than an auto-created table — and if it has run but stops short of revision
+`0006`, you get `UndefinedColumn` on the first delegation instead, with the pod
+still reporting healthy. See
+[`a2a-v1-migration.md`](a2a-v1-migration.md).
 
 ## Artifacts
 
@@ -291,6 +311,31 @@ heartbeat interval, no owner token, no recovery sweep. See
 With `DB_BACKEND=none` it is a per-pod dict, so a restart loses every pending
 approval and only the replica that recorded a case can act on it. Scaling an
 agent past one replica therefore requires a database.
+
+**The set of gated actions is code, not configuration.** There are two —
+`math`'s `publish_result` and `trades`'s `run_trade_query` — and neither can be
+turned off with an environment variable, deliberately. The gate is that the
+effect is unreachable without an approver, so there is no flag to set to the
+wrong value.
+
+## The trades agent
+
+`TRADES_MAX_BYTES_BILLED` is the only one of the three that is a control rather
+than a setting. It becomes BigQuery's `maximum_bytes_billed`, so a query that
+would exceed it is **killed rather than billed** — the one protection a human
+approving the SQL cannot apply by reading it, since cost is a property of the
+data scanned and not of the text. The default of 1 GiB is generous against a
+~300 MB table and still stops a runaway self-join.
+
+`TRADES_MAX_ROWS` is a payload budget, not a database limit. Rows cross A2A as
+text inside a model's context window, so the answer to "I need more rows" is
+almost always an aggregate in SQL. The agent clamps whatever the caller asked
+for to this value rather than refusing, and the clamped number appears in the
+proposal, so the reviewer sees what will actually come back.
+
+`TRADES_LOCATION` earns a variable only because getting it wrong is
+unrecognisable: a job submitted in the wrong location fails with *dataset not
+found*, which reads like a permissions problem and sends you to IAM.
 
 ## Observability
 
@@ -432,6 +477,27 @@ AGENT_NAME=math APP_URL=http://127.0.0.1:8091 \
   uv run uvicorn app.fast_api_app:app --port 8091
 
 # Terminal 2 — the orchestrator delegating to it
+AGENT_NAME=orchestrator A2A_PEERS=math=http://127.0.0.1:8091 \
+  uv run uvicorn app.fast_api_app:app --port 8090
+```
+
+**Three agents, two levels of delegation** — the case that catches a wrong
+mental model. `math` is a callee *and* a caller, so it needs both an `APP_URL`
+(for the orchestrator to reach it) and its own `A2A_PEERS` (to reach
+`currency`). Omit the latter and everything still starts and reports healthy;
+the math agent simply has no currency tool. `make up` wires all of this.
+
+```bash
+# Terminal 1 — the leaf
+AGENT_NAME=currency APP_URL=http://127.0.0.1:8095 \
+  uv run uvicorn app.fast_api_app:app --port 8095
+
+# Terminal 2 — a specialist that is also a caller
+AGENT_NAME=math APP_URL=http://127.0.0.1:8091 \
+  A2A_PEERS=currency=http://127.0.0.1:8095 \
+  uv run uvicorn app.fast_api_app:app --port 8091
+
+# Terminal 3 — the orchestrator
 AGENT_NAME=orchestrator A2A_PEERS=math=http://127.0.0.1:8091 \
   uv run uvicorn app.fast_api_app:app --port 8090
 ```

@@ -55,7 +55,7 @@ from google.adk.memory import BaseMemoryService
 from google.adk.sessions import BaseSessionService
 from injector import Module, provider, singleton
 
-from app.agents import AGENTS, DEFAULT_AGENT, PAYLOADS
+from app.agents import AGENTS, DEFAULT_AGENT, suspending_agents
 from app.cluster.artifacts import build_artifact_service
 from app.cluster.cases import CaseStore, build_case_store
 from app.cluster.config import AGENT_NAME_ENV, ClusterConfig
@@ -92,8 +92,10 @@ class ClusterModule(Module):
     def provide_resolver(self, config: ClusterConfig) -> AgentResolver:
         """Provide the (singleton) peer resolver.
 
-        The payload contracts are handed over here rather than imported by the
-        resolver, so ``app/cluster`` keeps knowing nothing about ``app.agents``.
+        The set of peers that can suspend is derived from the registry here,
+        where importing ``app.agents`` is safe. The resolver cannot do it
+        itself: ``agents.base`` imports the resolver, so the reverse import
+        would cycle.
 
         Args:
             config: The injected cluster configuration.
@@ -101,7 +103,7 @@ class ClusterModule(Module):
         Returns:
             An :class:`AgentResolver` bound to the configuration.
         """
-        return AgentResolver(config, payload_schemas=PAYLOADS)
+        return AgentResolver(config, suspending=suspending_agents())
 
 
 class SessionModule(Module):

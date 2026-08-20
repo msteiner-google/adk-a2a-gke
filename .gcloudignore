@@ -1,0 +1,52 @@
+# What `gcloud builds submit` must NOT upload.
+#
+# Without this file gcloud synthesises one from .gitignore, which is close but
+# not the same: it would still ship tests/, docs/ and infra/ (Terraform state
+# included) to the build worker. The build needs pyproject.toml, uv.lock,
+# README.md and ./app -- a few hundred KB. That is the whole point of building
+# remotely on a slow connection, so keep this list tight.
+#
+# Keep it in sync with .dockerignore and with the COPY lines in the Dockerfile.
+
+.gcloudignore
+
+# Virtualenvs and Python build artefacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ty_cache/
+.cache/
+
+# VCS and local scratch
+.git/
+.gitignore
+.run/
+
+# Secrets and local configuration -- must never leave this machine
+.env
+.env.*
+!.env.example
+
+# Infrastructure: Terraform state and provider plugins (hundreds of MB), and
+# the Kubernetes manifests, none of which the image needs.
+infra/
+
+# Tests, docs and tooling configuration
+tests/
+docs/
+scripts/
+*.md
+!README.md
+ruff.toml
+ty.toml
+pyrightconfig.json
+Makefile
