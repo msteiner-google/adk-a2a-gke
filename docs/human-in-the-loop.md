@@ -253,8 +253,9 @@ They are not approval cases, for three reasons worth being explicit about:
 
 What they *do* share with an approval is the hard part: reaching the user
 un-paraphrased, from two hops down. That is `app/agents/reporting.py` — both
-statuses are in `AUDITED_STATUSES`, and the callback scans inside a peer's reply
-as well as its own tool results, so the question survives
+statuses are in `AUDITED_STATUSES`, and it scans inside a peer's reply as well
+as its own tool results, then folds the JSON into the agent's own reply — one
+message carrying both the prose and the structure — so the question survives
 `currency -> math -> orchestrator` as verbatim JSON rather than as whatever the
 middle agent chose to say about it. The instructions at all three levels then
 say the same thing: relay it, do not answer it.

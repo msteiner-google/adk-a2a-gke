@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Guards for the callback that makes structured results survive A2A.
+"""Guards for the callbacks that make structured results survive A2A.
 
 This is the one piece of machinery in the approval flow that is not obvious, so
 it is worth stating what breaks without it: in the first live two-process run
 the specialist replied *"I can propose to publish '391.0'…"* — accurate prose,
 no structure — and the orchestrator opened no case while telling the user it had
-published the result. The callback removes the model from that hop.
+published the result. The callbacks remove the model from that hop.
+
+There are two of them, and the last section of this file is why: the after-model
+hook folds the JSON into the model's own reply so a turn stays one message, and
+the after-agent hook only fills a gap that hook left. While the after-agent hook
+restated unconditionally — repeating the model's wording above the JSON — every
+HITL turn rendered twice in the ADK web UI, once per event.
 """
 
 import json
@@ -27,6 +33,7 @@ from typing import Any, cast
 
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.events.event import Event
+from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 
 from app.agents.contracts import (
@@ -39,6 +46,7 @@ from app.agents.contracts import (
 from app.agents.reporting import (
     AUDITED_STATUSES,
     RESULT_HEADER,
+    attach_structured_results,
     restate_structured_results,
 )
 
@@ -87,6 +95,19 @@ def _context(events: list[Event]) -> CallbackContext:
     )
 
 
+def _model_reply(text: str = "", *, partial: bool | None = None) -> LlmResponse:
+    """A final, non-streamed model response carrying plain text."""
+    return LlmResponse(
+        content=types.Content(role="model", parts=[types.Part(text=text)]),
+        partial=partial,
+    )
+
+
+def _text_of(response: LlmResponse) -> str:
+    parts = response.content.parts if response.content else None
+    return "".join(p.text or "" for p in parts or [])
+
+
 _PROPOSAL = {
     "status": APPROVAL_REQUIRED,
     "action": "publish_result",
@@ -122,13 +143,19 @@ def test_a_proposal_is_restated_verbatim():
 
 
 def test_the_models_own_wording_is_preserved():
+    # The prose and the JSON travel together, in the model's own reply -- so the
+    # caller's AgentTool, which sees only the LAST content, gets both.
     spoken = "I can propose publishing '391.0'. Nothing has been published yet."
-    content = restate_structured_results(
-        _context([_tool_event("publish_result", _PROPOSAL), _text_event(spoken)])
+    altered = attach_structured_results(
+        _context([_tool_event("publish_result", _PROPOSAL)]),
+        _model_reply(spoken),
     )
-    assert content is not None
-    body = "".join(p.text or "" for p in content.parts or [])
+    assert altered is not None
+    body = _text_of(altered)
     assert body.startswith(spoken)
+    assert json.loads(body.split(RESULT_HEADER)[1].strip())["proposal"]["value"] == (
+        "391.0"
+    )
 
 
 def test_an_execution_result_is_restated_too():
@@ -261,3 +288,85 @@ def test_ordinary_peer_prose_is_still_left_alone():
         _context([_tool_event("currency", {"result": "250 EUR is 272.50 USD."})])
     )
     assert content is None
+
+
+# --- One reply, not two -------------------------------------------------------
+#
+# ADK appends whatever an after-agent callback returns as an EXTRA event, so
+# restating there unconditionally showed the user the same answer twice on every
+# HITL turn. The structure is folded into the model's own reply instead, and the
+# after-agent hook emits only what that reply does not already carry.
+
+
+def test_the_after_agent_hook_adds_nothing_once_the_reply_carries_the_json():
+    # The regression. The model's event here is what attach_structured_results
+    # produced, so there is nothing left to append -- and nothing to duplicate.
+    tool_event = _tool_event("publish_result", _PROPOSAL)
+    reply = attach_structured_results(_context([tool_event]), _model_reply("Proposed."))
+    assert reply is not None
+    events = [tool_event, _text_event(_text_of(reply))]
+    assert restate_structured_results(_context(events)) is None
+
+
+def test_a_silent_turn_still_gets_its_results_restated():
+    # The gap the after-agent hook exists for: no model reply to fold into, so
+    # the structure would otherwise never leave this agent.
+    content = restate_structured_results(_context([_tool_event("x", _PROPOSAL)]))
+    assert content is not None
+    assert RESULT_HEADER in "".join(p.text or "" for p in content.parts or [])
+
+
+def test_a_streamed_chunk_is_left_alone():
+    # Each chunk is re-delivered in the aggregated response that follows;
+    # appending here would emit the block once per chunk.
+    assert (
+        attach_structured_results(
+            _context([_tool_event("publish_result", _PROPOSAL)]),
+            _model_reply("Prop", partial=True),
+        )
+        is None
+    )
+
+
+def test_a_tool_call_response_is_left_alone():
+    # Mid-turn: the results are not all in, and the text beside a function call
+    # is not the agent's answer.
+    response = LlmResponse(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(text="Let me publish that."),
+                types.Part(
+                    function_call=types.FunctionCall(name="publish_result", args={})
+                ),
+            ],
+        )
+    )
+    assert (
+        attach_structured_results(
+            _context([_tool_event("publish_result", _PROPOSAL)]), response
+        )
+        is None
+    )
+
+
+def test_an_ordinary_reply_is_returned_unchanged():
+    # The overwhelming majority of turns. Returning None leaves ADK's own
+    # response untouched.
+    assert (
+        attach_structured_results(
+            _context([_tool_event("calculate", {"result": "391.0"})]),
+            _model_reply("391."),
+        )
+        is None
+    )
+
+
+def test_a_question_from_two_hops_down_reaches_the_reply_itself():
+    # The HITL case the user sees: one message, prose then the question's JSON.
+    altered = attach_structured_results(
+        _context([_tool_event("currency", {"result": _peer_reply(_QUESTION, "hm")})]),
+        _model_reply("Which dollars did you mean?"),
+    )
+    assert altered is not None
+    assert json.dumps(_QUESTION, sort_keys=True) in _text_of(altered)

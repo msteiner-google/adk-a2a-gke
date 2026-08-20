@@ -256,10 +256,19 @@ it: the specialist reported its proposal as accurate prose, the caller found no
 proposal, opened no case, and the orchestrator told the user *"I have published
 the result."* Nothing had been published.
 
-`restate_structured_results` is an after-agent callback that emits one final
-event restating any audit-relevant tool result as verbatim JSON. ADK appends it
-after the agent's own events and `AgentTool` returns the *last* content, so the
-structured payload crosses deterministically whatever prose the model produced.
+`attach_structured_results` is an **after-model** callback that appends any
+audit-relevant tool result to the model's own final reply as verbatim JSON,
+before ADK turns that reply into an event. `AgentTool` returns the *last*
+content, so the structured payload crosses deterministically whatever prose the
+model produced — and the prose crosses with it, in the same event.
+
+It started as an after-agent callback that emitted the JSON as an additional
+event, with the model's wording repeated above it so the readable version
+crossed too. That works, and it renders the same answer **twice** in the ADK web
+UI, because ADK *appends* an after-agent callback's content rather than
+replacing the agent's own event. `restate_structured_results` is still attached,
+now as the fallback for a turn that ends without the model speaking, and it
+emits only the results the reply does not already carry.
 
 A second, related trap: ADK wraps a tool result as `{"result": <text>}`, and
 serialising that wrapper escapes the peer's JSON inside a string where no

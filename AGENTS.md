@@ -61,7 +61,7 @@ code path.
 All of these were run in this repo and pass as of the last update to this file.
 
 ```bash
-# Unit tests — 307 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
+# Unit tests — 342 passed. The GEMINI_*_MODEL pins are MANDATORY for hermeticity
 # (see "Importing app hits the network" below).
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite \
 GEMINI_BALANCED_MODEL=gemini-2.5-flash \
@@ -116,7 +116,7 @@ Read the module docstrings; they are thorough. This is the index.
 | `app/agents/base.py` | `AgentSpec` (frozen dataclass: name, description, instruction, tier, tools, peers) and the single `build_agent()`. `TIERS = ("fast","balanced","capable")`. |
 | `app/agents/contracts.py` | **The wire contracts.** One pydantic model per delegatable agent + `PAYLOADS`. The interface both a caller and a specialist agree on. Opt-in per agent: a peer with no model here is delegated to with a single free-text `task` instead (see its module docstring for the tiers). |
 | `app/agents/documents.py` | `read_document` — reads a claim-check reference (`gs://…`) the caller passed in `document_refs`. |
-| `app/agents/reporting.py` | `restate_structured_results` — the after-agent callback that makes a proposal survive the A2A text boundary instead of being paraphrased. |
+| `app/agents/reporting.py` | Makes a proposal survive the A2A text boundary instead of being paraphrased. **Two** callbacks: `attach_structured_results` (after-model) folds the JSON into the model's own reply so a turn stays *one* message; `restate_structured_results` (after-agent) is the fallback, and emits only what that reply does not already carry. |
 | `app/agents/orchestrator/agent.py` | `SPEC` with `peers=("research","math","planner","trades")`, `tier="balanced"`. |
 | `app/agents/research/agent.py` + `tools.py` | Leaf agent, `tier="balanced"`, tool `web_search`. |
 | `app/agents/math/agent.py` + `tools.py` | `tier="balanced"`, `peers=("currency",)`. Tools: `calculate` (AST-based, rejects non-arithmetic) + the gated `publish_result`. **Not a leaf** — it delegates conversions rather than applying a rate itself. |
@@ -494,6 +494,18 @@ These are real traps that have bitten this codebase.
   (`orchestrator -> math -> currency`) reaches the user only if the middle
   agent's model chooses to repeat it, which is the exact dependency that
   callback exists to remove.
+
+- **An after-agent callback's content is an EXTRA event, so restating there
+  duplicates the reply.** ADK appends whatever `after_agent_callback` returns
+  after the agent's own events (`base_agent.py:_handle_after_agent_callback`);
+  it does not replace them. `reporting.py` used to return the model's wording
+  plus the JSON, which rendered the same answer **twice** in the ADK web UI on
+  every HITL turn. The structure is folded into the model's reply by an
+  *after-model* callback instead (that one returns an `LlmResponse` and ADK
+  builds the event from it), and the after-agent hook only emits results the
+  reply does not already contain — the fallback for a turn that ends without the
+  model speaking. Keep it conditional; making it unconditional brings the double
+  reply straight back.
 
 - **`AUDITED_STATUSES` is derived from the contract vocabulary, not written
   out.** It was a literal `{approval_required, published}` when the `trades`

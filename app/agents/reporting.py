@@ -27,19 +27,35 @@ proposal to record, so no approval case was opened, while the model went on to
 tell the user it had published the result. Exactly the failure this repo keeps
 rediscovering: a plausible answer that is not proof the flow ran.
 
-**The fix is to stop asking a model to be a serializer.** This callback runs
-after the agent finishes and, if the turn produced any audit-relevant tool result
-— a proposal awaiting approval, or the confirmation that an approved action ran —
-emits one final event restating those results as verbatim JSON. ADK appends that
-event after the agent's own (``base_agent.py:_handle_after_agent_callback``), and
-``AgentTool`` returns the *last* content — so the caller receives the structured
-payload deterministically, whatever prose the model produced along the way.
+**The fix is to stop asking a model to be a serializer.** If the turn produced
+any audit-relevant tool result — a proposal awaiting approval, the confirmation
+that an approved action ran, or a question only the user can answer — that result
+is restated as verbatim JSON, so the caller receives the structured payload
+deterministically whatever prose the model produced.
 
-The agent's own wording is preserved above the JSON, so a human reading the
-transcript still gets the readable version.
+**Two callbacks, and the split is what stops the reply appearing twice.**
 
-This is attached to every agent by ``build_agent``. It is a no-op for a turn that
-proposed nothing, which is nearly all of them.
+* :func:`attach_structured_results` is an *after-model* callback. It appends the
+  JSON to the model's own final reply **before** that reply becomes an event, so
+  a turn produces exactly one message carrying both the prose and the structure.
+  This is the normal path.
+* :func:`restate_structured_results` is an *after-agent* callback and a pure
+  fallback. ADK appends whatever it returns as an **extra** event
+  (``base_agent.py:_handle_after_agent_callback``), so it emits only the results
+  that are *not already* in what this agent said this invocation — nothing, in
+  the normal path. It exists for the turn that ends without the model speaking
+  at all (a skipped summarisation, an empty final response), where the after-
+  model hook never fires and the structure would otherwise be lost.
+
+An earlier version had the after-agent callback repeat the model's own wording
+above the JSON, on the reasoning that ``AgentTool`` returns only the *last*
+content and the prose would otherwise not cross A2A. It does cross — it is in the
+same event as the JSON now — and the repetition was visible in the ADK web UI as
+the same answer twice, once per event, on exactly the HITL turns this module
+exists to protect.
+
+Both are attached to every agent by ``build_agent``. Both are no-ops for a turn
+that proposed nothing, which is nearly all of them.
 """
 
 from __future__ import annotations
@@ -64,7 +80,9 @@ AUDITED_STATUSES = frozenset({APPROVAL_REQUIRED}) | EFFECT_PERFORMED | NEEDS_USE
 
 if TYPE_CHECKING:
     from google.adk.agents.callback_context import CallbackContext
+    from google.adk.agents.invocation_context import InvocationContext
     from google.adk.events.event import Event
+    from google.adk.models.llm_response import LlmResponse
 
 # Marks the JSON block this callback appends, so a reader (and a future
 # maintainer staring at a transcript) can tell it apart from model prose.
@@ -134,50 +152,156 @@ def _payloads(event: Event) -> list[dict[str, Any]]:
     return found
 
 
+def _line(payload: dict[str, Any]) -> str:
+    """Render one payload in the canonical form used everywhere in this module.
+
+    Canonical because the same string is both what gets emitted and what the
+    fallback searches the transcript for; if the two forms drifted, the fallback
+    would restate a result the model's reply already carries.
+
+    Args:
+        payload: The tool-result payload.
+
+    Returns:
+        Its JSON, keys sorted, with unserialisable values coerced rather than
+        raising inside a callback whose job is to never break the turn.
+    """
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def _block(results: list[dict[str, Any]]) -> str:
+    """Render the labelled JSON block that crosses the A2A boundary.
+
+    Args:
+        results: The payloads to restate, in order.
+
+    Returns:
+        The header followed by one JSON document per line.
+    """
+    return f"{RESULT_HEADER}\n" + "\n".join(_line(result) for result in results)
+
+
+def _audited(ctx: InvocationContext) -> list[dict[str, Any]]:
+    """Return this invocation's audit-relevant tool results, deduplicated.
+
+    Args:
+        ctx: The invocation context to scan.
+
+    Returns:
+        Every distinct payload whose ``status`` is in :data:`AUDITED_STATUSES`,
+        in the order the tools produced them.
+    """
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in ctx.session.events:
+        if event.invocation_id != ctx.invocation_id:
+            continue
+        for payload in _payloads(event):
+            if payload.get("status") not in AUDITED_STATUSES:
+                continue
+            key = _line(payload)
+            if key not in seen:
+                seen.add(key)
+                results.append(payload)
+    return results
+
+
+def _spoken(ctx: InvocationContext) -> str:
+    """Return everything this agent has said so far in this invocation.
+
+    Args:
+        ctx: The invocation context to scan.
+
+    Returns:
+        The concatenated text of this agent's own events, including any block
+        :func:`attach_structured_results` already folded into its reply.
+    """
+    # `ctx.agent` is Optional on InvocationContext; a callback always has one,
+    # but read it defensively rather than asserting inside a hook whose whole
+    # job is to never break the turn.
+    agent_name = getattr(ctx.agent, "name", "")
+    chunks: list[str] = []
+    for event in ctx.session.events:
+        if event.invocation_id != ctx.invocation_id:
+            continue
+        if event.author != agent_name or not event.content or not event.content.parts:
+            continue
+        chunks.extend(part.text for part in event.content.parts if part.text)
+    return "\n".join(chunks)
+
+
+def attach_structured_results(
+    callback_context: CallbackContext,
+    llm_response: LlmResponse,
+) -> LlmResponse | None:
+    """Fold this turn's structured results into the model's own reply.
+
+    Running here rather than after the agent is what keeps the answer to a
+    single message: the JSON is appended to the response *before* ADK turns it
+    into an event, so the user sees one reply and the caller's ``AgentTool``
+    still finds the structure in the last content it receives.
+
+    Args:
+        callback_context: Injected by ADK.
+        llm_response: The response the model just produced.
+
+    Returns:
+        The response with a JSON block appended, or ``None`` to leave it exactly
+        as it was — which covers streamed chunks, tool-call responses, and the
+        overwhelming majority of turns, which restate nothing.
+    """
+    # A streamed chunk is re-delivered in the aggregated response that follows,
+    # so appending here would emit the block once per chunk.
+    if llm_response.partial or llm_response.error_code:
+        return None
+    content = llm_response.content
+    if content is None or not content.parts:
+        return None
+    # A response that calls a tool is mid-turn: the results are not all in yet,
+    # and the text alongside a function call is not the agent's answer.
+    if any(part.function_call for part in content.parts):
+        return None
+    if not any(part.text and not part.thought for part in content.parts):
+        return None
+
+    # ADK exposes no public accessor for the invocation's events from a
+    # callback; this is the same private reach the framework's own callbacks
+    # use. If it breaks on an ADK upgrade, tests/unit/test_reporting.py fails.
+    results = _audited(callback_context._invocation_context)
+    if not results:
+        return None
+
+    return llm_response.model_copy(
+        update={
+            "content": types.Content(
+                role=content.role or "model",
+                parts=[*content.parts, types.Part(text=f"\n{_block(results)}")],
+            )
+        }
+    )
+
+
 def restate_structured_results(
     callback_context: CallbackContext,
 ) -> types.Content | None:
-    """Restate this turn's audit-relevant tool results as verbatim JSON.
+    """Emit any structured result the agent's reply does not already carry.
+
+    The fallback half of this module. In the normal path
+    :func:`attach_structured_results` has already folded the block into the
+    model's own reply, every result is found in the transcript, and this returns
+    ``None`` — which is what stops the same answer being shown twice. It emits
+    only when the model never spoke, or spoke without the block.
 
     Args:
         callback_context: Injected by ADK after the agent finishes.
 
     Returns:
-        Content carrying the agent's own words plus the structured results, or
-        ``None`` when the turn produced none (the common case, in which the
-        agent's reply is left exactly as it was).
+        Content carrying the missing structured results, or ``None`` when there
+        are none (the common case, in which the reply is left as it was).
     """
-    # ADK exposes no public accessor for the invocation's events from a
-    # callback; this is the same private reach the framework's own callbacks
-    # use. If it breaks on an ADK upgrade, tests/unit/test_reporting.py fails.
     ctx = callback_context._invocation_context
-    invocation_id = ctx.invocation_id
-
-    results: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    spoken = ""
-    for event in ctx.session.events:
-        if event.invocation_id != invocation_id:
-            continue
-        for payload in _payloads(event):
-            if payload.get("status") not in AUDITED_STATUSES:
-                continue
-            key = json.dumps(payload, sort_keys=True, default=str)
-            if key not in seen:
-                seen.add(key)
-                results.append(payload)
-        # `ctx.agent` is Optional on InvocationContext; a callback always has
-        # one, but read it defensively rather than asserting inside a hook whose
-        # whole job is to never break the turn.
-        agent_name = getattr(ctx.agent, "name", "")
-        if event.author == agent_name and event.content and event.content.parts:
-            text = "".join(part.text or "" for part in event.content.parts).strip()
-            if text:
-                spoken = text
-
-    if not results:
+    spoken = _spoken(ctx)
+    missing = [result for result in _audited(ctx) if _line(result) not in spoken]
+    if not missing:
         return None
-
-    blocks = "\n".join(json.dumps(result, sort_keys=True) for result in results)
-    body = f"{spoken}\n\n{RESULT_HEADER}\n{blocks}" if spoken else blocks
-    return types.Content(role="model", parts=[types.Part(text=body)])
+    return types.Content(role="model", parts=[types.Part(text=_block(missing))])

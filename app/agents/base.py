@@ -38,7 +38,10 @@ from typing import TYPE_CHECKING
 from google.adk.agents import LlmAgent
 from google.adk.tools.base_tool import BaseTool
 
-from app.agents.reporting import restate_structured_results
+from app.agents.reporting import (
+    attach_structured_results,
+    restate_structured_results,
+)
 
 if TYPE_CHECKING:
     from app.cluster.resolver import AgentResolver
@@ -116,9 +119,13 @@ def build_agent(spec: AgentSpec, models: Models, resolver: AgentResolver) -> Llm
         # `sub_agents` stays empty on purpose -- a peer attached there would be
         # reached with transfer_to_agent, which forwards the transcript.
         tools=[*spec.tools, *resolver.resolve_all()],
-        # Guarantees a proposal survives the A2A text boundary instead of being
-        # paraphrased into uselessness by the model. A no-op for a turn that
-        # proposed nothing -- see app/agents/reporting.py for the measurement
-        # that made this necessary.
+        # Guarantee a proposal survives the A2A text boundary instead of being
+        # paraphrased into uselessness by the model. The after-model hook folds
+        # the JSON into the model's own reply, so the turn stays one message;
+        # the after-agent hook is the fallback for a turn that ends without the
+        # model speaking, and emits only what the reply does not already carry.
+        # Both are no-ops for a turn that proposed nothing -- see
+        # app/agents/reporting.py for the measurement that made this necessary.
+        after_model_callback=attach_structured_results,
         after_agent_callback=restate_structured_results,
     )
