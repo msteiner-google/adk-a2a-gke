@@ -76,10 +76,37 @@ def suspending_agents() -> frozenset[str]:
     )
 
 
+def agent_descriptions() -> dict[str, str]:
+    """Return each registered agent's one-line capability summary, by name.
+
+    This is what a caller's model routes on. A peer is reached by URL, and ADK
+    resolves its agent card **lazily, at first invocation** — long after the
+    LLM had to choose which specialist to hand the sub-task to
+    (``google/adk/agents/remote_a2a_agent.py``: "a parent agent reads the
+    description to build its transfer instruction, which happens before this
+    agent ever runs"). Left to the resolver's own placeholder, every peer is
+    described identically apart from its name, and the choice is made on the
+    bare word ``math`` versus ``trades``. Measured: a currency conversion
+    routed to ``trades`` and to ``research``.
+
+    Taking the description from the registry costs nothing — the specs are
+    already the source of truth for the cards those descriptions end up in —
+    and it is why this lives here rather than in ``app/cluster``: the resolver
+    cannot import ``app.agents`` (``agents.base`` imports the resolver), so
+    ``app/cluster/di.py`` passes this in, exactly as it does for
+    :func:`suspending_agents`.
+
+    Returns:
+        Agent name -> the ``description`` from its :class:`AgentSpec`.
+    """
+    return {name: spec.description for name, spec in AGENTS.items()}
+
+
 __all__ = [
     "AGENTS",
     "DEFAULT_AGENT",
     "AgentSpec",
+    "agent_descriptions",
     "build_agent",
     "suspending_agents",
 ]

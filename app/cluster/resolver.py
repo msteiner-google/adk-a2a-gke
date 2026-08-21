@@ -71,7 +71,7 @@ from google.adk.tools.agent_tool import AgentTool
 from app.cluster.resume import ResumingA2aAgent
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
 
     from app.cluster.config import ClusterConfig, PeerSpec
 
@@ -85,7 +85,10 @@ class AgentResolver:
     """
 
     def __init__(
-        self, config: ClusterConfig, suspending: Iterable[str] | None = None
+        self,
+        config: ClusterConfig,
+        suspending: Iterable[str] | None = None,
+        descriptions: Mapping[str, str] | None = None,
     ) -> None:
         """Initialize the resolver.
 
@@ -96,9 +99,16 @@ class AgentResolver:
                 imported so this module keeps knowing nothing about
                 ``app.agents`` — importing it would cycle through
                 ``agents.base``. A peer not named here is reached as a tool.
+            descriptions: What each peer is *for*, by name — the text a caller's
+                model routes on. Passed in for the same reason as ``suspending``
+                (see :func:`app.agents.agent_descriptions`). A peer missing here
+                falls back to a placeholder naming only its address, which is
+                correct for a third-party agent an operator wired in through
+                ``A2A_PEERS`` and which nothing in this registry describes.
         """
         self._config = config
         self._suspending = frozenset(suspending or ())
+        self._descriptions = dict(descriptions or {})
 
     @property
     def config(self) -> ClusterConfig:
@@ -128,14 +138,20 @@ class AgentResolver:
             peer: The peer to address.
 
         Returns:
-            A ``ResumingA2aAgent`` pointed at the peer's agent card. The card
-            (and the peer's real description/capabilities) is resolved lazily by
-            ADK on first invocation, so this call does no network I/O.
+            A ``ResumingA2aAgent`` pointed at the peer's agent card, described
+            by what it is *for*. The card itself is resolved lazily by ADK on
+            first invocation, so this call does no network I/O.
         """
+        # The description has to be right HERE, not once the card is fetched.
+        # ADK adopts a card's description only `if not self.description`, and
+        # only at first invocation -- by which time the caller's model has
+        # already chosen a peer. A placeholder is therefore not a harmless
+        # default: it is the routing decision, made on the peer's name alone.
         return ResumingA2aAgent(
             name=peer.name,
             agent_card=self.card_url(peer),
-            description=(
+            description=self._descriptions.get(peer.name)
+            or (
                 f"Remote specialist agent '{peer.name}' reachable over A2A at "
                 f"{peer.base_url}."
             ),

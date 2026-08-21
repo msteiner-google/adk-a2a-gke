@@ -98,3 +98,49 @@ def test_no_peers_resolves_to_nothing_in_either_slot():
     resolver = _resolver(config)
     assert resolver.resolve_sub_agents() == []
     assert resolver.resolve_tools() == []
+
+
+# --- What the caller's model routes on ----------------------------------------
+
+
+def test_a_peer_is_described_by_what_it_is_for():
+    # This description IS the routing decision. ADK fetches the peer's real
+    # card lazily, at first invocation -- long after the caller's model had to
+    # choose which specialist to hand the sub-task to -- and it adopts the
+    # card's text only `if not self.description`. So whatever is set here is
+    # what the model sees, permanently.
+    resolver = AgentResolver(
+        _CONFIG, descriptions={"math": "Performs precise arithmetic."}
+    )
+    assert resolver.resolve("math").description == "Performs precise arithmetic."
+
+
+def test_a_peer_nobody_described_still_resolves():
+    # An operator can point A2A_PEERS at an agent this registry knows nothing
+    # about. It gets the placeholder, which is the honest answer.
+    resolver = AgentResolver(_CONFIG, descriptions={"math": "Arithmetic."})
+    assert "research" in resolver.resolve("research").description
+
+
+def test_the_registry_descriptions_actually_reach_the_resolver():
+    # The regression: every peer carried a placeholder naming only its address,
+    # so the model chose between them on the bare words "math" and "trades".
+    # Measured -- a currency conversion routed to `trades`, then to `research`.
+    # This asserts the wiring end to end rather than the placeholder's absence,
+    # because the placeholder is still correct for an unregistered peer.
+    from app.agents import AGENTS, agent_descriptions
+
+    resolver = AgentResolver(_CONFIG, descriptions=agent_descriptions())
+    for name in ("research", "math"):
+        assert resolver.resolve(name).description == AGENTS[name].description
+
+
+def test_the_composition_root_passes_the_descriptions_in():
+    # The resolver cannot read the registry itself (agents.base imports it, so
+    # the reverse import cycles), which means the wiring lives one layer up and
+    # is easy to drop without breaking anything visible. Assert it there.
+    from app.agents import AGENTS
+    from app.cluster.di import ClusterModule
+
+    resolver = ClusterModule().provide_resolver(_CONFIG)
+    assert resolver.resolve("math").description == AGENTS["math"].description

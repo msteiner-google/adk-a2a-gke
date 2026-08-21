@@ -558,6 +558,27 @@ These are real traps that have bitten this codebase.
   `None`, ADK rebuilds the request from raw history, and the peer rejects the
   result with "Message cannot contain both function responses and text".
 
+- **A peer's agent card is fetched too late to route on.** ADK resolves a
+  `RemoteA2aAgent`'s card **lazily, at first invocation**, and adopts its
+  description only `if not self.description` — but the caller's model has to
+  choose a specialist *before* any of them runs. Whatever the resolver sets is
+  therefore what the model sees, permanently, and a placeholder is not a
+  harmless default: it is the routing decision. The resolver's placeholder
+  named only the peer's address, so every peer looked identical apart from its
+  name, and a currency conversion was measured going to `trades` ("trading")
+  and to `research` ("a rate is a fact you look up"). `app/cluster/di.py` now
+  passes `agent_descriptions()` from the registry into `AgentResolver`. The
+  fallback placeholder stays, because it is the honest answer for a
+  third-party peer wired in through `A2A_PEERS` that the registry knows
+  nothing about.
+
+- **A description says what a peer does; only the caller can say what it does
+  _instead of the others_.** Both halves are needed and they live in different
+  files: the capability in each `AgentSpec.description`, the routing table in
+  the orchestrator's instruction. Fixing only the descriptions still leaves
+  overlapping specialists — `trades` and `math` both plausibly own "money" — to
+  be separated by the model's taste on the day.
+
 - **A plausible answer is not proof the flow ran.** Three separate failures
   (a skipped graph node, a graph output that never reached the caller, an A2A
   reply that could not be replayed) all produced confident, sensible replies.
