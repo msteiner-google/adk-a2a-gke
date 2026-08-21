@@ -149,7 +149,10 @@ def test_every_peer_is_callable_as_a_tool():
 def test_the_split_is_derived_from_the_gated_tools():
     # Marking a tool @gated is the single act that wires its agent as a
     # sub-agent everywhere. Anything else is two places to keep in sync.
-    assert suspending_agents() == {"math", "trades"}
+    # `currency` is in this set because of `convert_to_crypto` alone: its fiat
+    # conversion stays ungated, and one gated tool is enough to change how the
+    # whole agent must be reached.
+    assert suspending_agents() == {"math", "trades", "currency"}
 
 
 def test_every_tool_that_asks_for_approval_is_marked_gated():

@@ -76,14 +76,22 @@ PUBLISHED = "published"
 EXECUTED = "executed"
 """A gated read happened (``app/agents/trades/tools.py``)."""
 
+CONVERTED = "converted"
+"""A gated conversion happened (``app/agents/currency/tools.py``).
+
+What is gated here is *issuing the number*, not moving money: a crypto figure
+quoted off a frozen table is a price for an asset that moves by the hour, and
+once it has left this system it is indistinguishable from a live quote. A human
+authorises the quote before it is produced; this status says one did."""
+
 #: Every status meaning "the gated effect actually happened". The caller scans a
 #: specialist's reply for one of these and then checks the values against the
 #: approved proposal (``app.cluster.cases.find_execution``); a status outside
 #: this set is not treated as confirmation, so a new gated action MUST add its
 #: status here or its executions are reported as `approved_not_confirmed`.
 #:
-#: Two spellings rather than one because the status names the effect, and
-#: "published" is not a truthful description of running a query. The set is the
-#: seam that lets each specialist say what it did while the caller stays
-#: generic.
-EFFECT_PERFORMED: frozenset[str] = frozenset({PUBLISHED, EXECUTED})
+#: Three spellings rather than one because the status names the effect, and
+#: "published" is not a truthful description of running a query or of quoting a
+#: price. The set is the seam that lets each specialist say what it did while
+#: the caller stays generic.
+EFFECT_PERFORMED: frozenset[str] = frozenset({PUBLISHED, EXECUTED, CONVERTED})

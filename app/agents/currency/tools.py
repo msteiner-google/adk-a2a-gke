@@ -31,13 +31,38 @@ One anchor per currency makes an inconsistent triangle unrepresentable.
 Replacing this with a real feed means changing :func:`_rate` and the metadata it
 reports. The tool signatures, the vocabulary in ``app/agents/statuses.py`` and
 everything downstream stay as they are.
+
+Crypto is a separate table and a gated tool
+-------------------------------------------
+BTC and ETH live in :data:`_USD_PER_CRYPTO_UNIT`, not in the fiat table, and are
+reachable only through :func:`convert_to_crypto`, which suspends until a human
+authorises the quote. The separation is the gate: adding them to
+:data:`_USD_PER_UNIT` would give :func:`convert_currency` a second, ungated path
+to the same number, and a gate with a way round it is not a gate (see the
+invariant in ``AGENTS.md`` and ``app/agents/gating.py``). :func:`convert_currency`
+therefore recognises crypto terms explicitly and refuses them by name, rather
+than letting them fall through as "unsupported" — a model told the asset is
+unknown tries something else, and a model told to use the gated tool uses it.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from app.agents.statuses import NEEDS_CONFIRMATION, NEEDS_INPUT
+# ToolContext must be imported at RUNTIME, not under TYPE_CHECKING: with
+# `from __future__ import annotations`, ADK builds each tool's declaration with
+# typing.get_type_hints(), which evaluates the annotation. A TYPE_CHECKING-only
+# import raises NameError at request time and breaks every tool in this module.
+from google.adk.tools.tool_context import ToolContext
+
+from app.agents.gating import gated, require_approval
+from app.agents.statuses import (
+    AWAITING_APPROVAL,
+    CONVERTED,
+    NEEDS_CONFIRMATION,
+    NEEDS_INPUT,
+    REFUSED,
+)
 
 #: The day these indicative rates were frozen. Reported with every conversion:
 #: a stale rate that says so is usable, one that stays quiet is not.
@@ -164,6 +189,40 @@ LARGE_AMOUNT_USD = 1_000_000.0
 #: a USD/JPY rate rounded to 2 decimals would be 0.01 and useless.
 _RATE_DECIMALS = 6
 
+#: Value of ONE unit of each crypto asset in USD, on :data:`RATES_AS_OF`. Same
+#: USD anchoring as the fiat table, so the two compose without a second rate
+#: convention -- and deliberately a SEPARATE dict, because membership of
+#: `_USD_PER_UNIT` is what makes a currency reachable through the ungated
+#: `convert_currency`. These numbers are staler than stale: a fiat rate frozen
+#: in January is roughly right in March, and a crypto price frozen in January is
+#: fiction. Everything below treats them accordingly.
+_USD_PER_CRYPTO_UNIT: dict[str, float] = {
+    "BTC": 94_500.0,
+    "ETH": 3_250.0,
+}
+
+#: Full names for the assets above, for the same reason as :data:`_NAMES`.
+_CRYPTO_NAMES: dict[str, str] = {"BTC": "bitcoin", "ETH": "ether"}
+
+#: Every spelling that means a crypto asset here. Unlike :data:`_ALIASES` these
+#: are unambiguous, so they map to a single code -- but they are matched
+#: everywhere a currency term is read, so that `convert_currency` can refuse
+#: them by name instead of reporting them as unknown.
+_CRYPTO_ALIASES: dict[str, str] = {
+    "btc": "BTC",
+    "xbt": "BTC",
+    "bitcoin": "BTC",
+    "\u20bf": "BTC",
+    "eth": "ETH",
+    "ether": "ETH",
+    "ethereum": "ETH",
+    "\u039e": "ETH",
+}
+
+#: Crypto amounts are quoted to 8 decimals (one satoshi). The fiat rule -- 2
+#: decimals, 0 for JPY -- would round any everyday amount of money to 0.00 BTC.
+_CRYPTO_DECIMALS = 8
+
 
 def supported_currencies() -> tuple[str, ...]:
     """Return every currency code this agent can convert, sorted.
@@ -174,16 +233,42 @@ def supported_currencies() -> tuple[str, ...]:
     return tuple(sorted(_USD_PER_UNIT))
 
 
+def supported_crypto_assets() -> tuple[str, ...]:
+    """Return every crypto asset this agent can quote, sorted.
+
+    Returns:
+        The supported crypto symbols.
+    """
+    return tuple(sorted(_USD_PER_CRYPTO_UNIT))
+
+
+def resolve_crypto(term: str) -> str:
+    """Turn what the caller wrote into a crypto symbol, if it is one.
+
+    Args:
+        term: A symbol, ticker or name, e.g. ``"BTC"`` or ``"bitcoin"``.
+
+    Returns:
+        The crypto symbol, or ``""`` when the term is not a crypto asset this
+        agent knows. An empty string means "not crypto", not "not supported":
+        the caller decides which of those two answers applies.
+    """
+    cleaned = term.strip()
+    if cleaned.upper() in _USD_PER_CRYPTO_UNIT:
+        return cleaned.upper()
+    return _CRYPTO_ALIASES.get(cleaned.lower(), "")
+
+
 def _describe(code: str) -> str:
     """Render a code for a human, e.g. ``"USD (United States dollar)"``.
 
     Args:
-        code: An ISO-4217 code present in the rate table.
+        code: An ISO-4217 code, or a crypto symbol, present in a rate table.
 
     Returns:
         The code with its full name, or the bare code if none is known.
     """
-    name = _NAMES.get(code)
+    name = _NAMES.get(code) or _CRYPTO_NAMES.get(code)
     return f"{code} ({name})" if name else code
 
 
@@ -242,6 +327,45 @@ def _quantize(amount: float, currency: str) -> str:
     return f"{amount:.{decimals}f}"
 
 
+def _quantize_crypto(amount: float) -> str:
+    """Render a crypto amount to 8 decimals, as a string.
+
+    Args:
+        amount: The amount denominated in a crypto asset.
+
+    Returns:
+        The amount rendered to :data:`_CRYPTO_DECIMALS` places.
+    """
+    return f"{amount:.{_CRYPTO_DECIMALS}f}"
+
+
+def _crypto_needs_the_gated_tool(field: str, term: str, code: str) -> dict[str, Any]:
+    """Build the refusal that sends a crypto conversion to the gated tool.
+
+    Args:
+        field: Which argument named a crypto asset.
+        term: The word the caller used.
+        code: The asset it resolved to.
+
+    Returns:
+        An ``error`` reply. Nothing has been converted, and the reply names the
+        tool that can do it so the model retries there rather than casting
+        around for another way to produce the number.
+    """
+    return {
+        "status": "error",
+        "error": (
+            f"{term!r} is {_describe(code)}, a crypto asset, and "
+            f"`convert_currency` does not quote crypto. Use the "
+            f"`convert_to_crypto` tool, which requires human authorization "
+            f"before it quotes a price."
+        ),
+        "field": field,
+        "asset": code,
+        "use_tool": CRYPTO_ACTION,
+    }
+
+
 def _ambiguous(field: str, term: str, candidates: tuple[str, ...]) -> dict[str, Any]:
     """Build the reply that asks the user which currency they meant.
 
@@ -298,6 +422,16 @@ def convert_currency(
         A mapping with the converted amount and the rate used, or a
         ``needs_input`` / ``needs_confirmation`` / ``error`` status.
     """
+    # Crypto first, and refused by name. A crypto asset is not in the fiat
+    # table, so without this it would fall out below as "unsupported currency"
+    # -- true, useless, and the kind of dead end a model routes around. More to
+    # the point, this function is ungated: if crypto could ever be converted
+    # here, the authorization on `convert_to_crypto` would be decoration.
+    for field, term in (("from_currency", from_currency), ("to_currency", to_currency)):
+        asset = resolve_crypto(term)
+        if asset:
+            return _crypto_needs_the_gated_tool(field, term.strip(), asset)
+
     source, source_options = resolve_currency(from_currency)
     if source_options:
         return _ambiguous("from_currency", from_currency.strip(), source_options)
@@ -359,7 +493,131 @@ def list_supported_currencies() -> dict[str, str]:
         "status": "ok",
         "supported": ", ".join(_describe(code) for code in supported_currencies()),
         "count": str(len(_USD_PER_UNIT)),
+        "crypto": ", ".join(_describe(code) for code in supported_crypto_assets()),
+        "crypto_requires_approval": "true",
         "rate_source": RATE_SOURCE,
         "as_of": RATES_AS_OF,
         "threshold_usd": f"{LARGE_AMOUNT_USD:,.2f}",
+    }
+
+
+# --- The gated action ---------------------------------------------------------
+
+CRYPTO_ACTION = "convert_to_crypto"
+"""Names the effect in a proposal, so a reviewer sees what they are approving."""
+
+
+@gated
+def convert_to_crypto(
+    amount: float, from_currency: str, to_asset: str, tool_context: ToolContext
+) -> dict[str, Any]:
+    """Quote an amount of money in BTC or ETH, once a human has authorised it.
+
+    The first call quotes nothing: it suspends the task and puts the exact
+    conversion in front of a reviewer. ADK re-executes this function with the
+    same arguments once the decision arrives, and only then is a number
+    produced. A model cannot fabricate the decision, so it cannot reach the
+    quote on its own.
+
+    Validation happens BEFORE the gate, deliberately. An ambiguous source
+    currency comes back as ``needs_input`` without anyone being asked to
+    approve anything -- nobody can authorise a conversion whose meaning is
+    still open, and a reviewer shown ``'dollars'`` would be approving one of
+    six different amounts.
+
+    Args:
+        amount: How much to convert, in ``from_currency``.
+        from_currency: ISO-4217 code, or the user's own word, to convert from.
+            Must be a fiat currency: this tool goes one way, into crypto.
+        to_asset: The crypto asset to quote in -- ``BTC`` or ``ETH``, or a name
+            like ``bitcoin``.
+        tool_context: Injected by ADK. Carries the authorization decision.
+
+    Returns:
+        ``status='needs_input'`` or ``status='error'`` if the request cannot be
+        pinned down, ``status='awaiting_approval'`` while suspended,
+        ``status='refused'`` if a human declined, or ``status='converted'``
+        with the quote.
+    """
+    asset = resolve_crypto(to_asset)
+    if not asset:
+        return {
+            "status": "error",
+            "error": (
+                f"Unsupported crypto asset: {to_asset.strip()!r}. "
+                f"Supported: {', '.join(supported_crypto_assets())}."
+            ),
+            "supported": ", ".join(supported_crypto_assets()),
+        }
+
+    if resolve_crypto(from_currency):
+        return {
+            "status": "error",
+            "error": (
+                "This tool converts money into crypto, not crypto into "
+                "anything. Give it a fiat amount and the asset to quote in."
+            ),
+            "field": "from_currency",
+        }
+
+    source, source_options = resolve_currency(from_currency)
+    if source_options:
+        return _ambiguous("from_currency", from_currency.strip(), source_options)
+    if not source:
+        return {
+            "status": "error",
+            "error": f"Unsupported currency: {from_currency.strip()!r}.",
+            "supported": ", ".join(supported_currencies()),
+        }
+
+    # Canonicalise BEFORE proposing, and propose exactly what will be reported.
+    # `require_approval`'s docstring records the failure this avoids twice over:
+    # a case recorded from the model's raw arguments does not match a result
+    # computed from normalised ones, and the caller then correctly refuses to
+    # confirm a perfectly good execution.
+    usd_value = amount * _USD_PER_UNIT[source]
+    quoted = _quantize_crypto(usd_value / _USD_PER_CRYPTO_UNIT[asset])
+    spent = _quantize(amount, source)
+    rate = _USD_PER_CRYPTO_UNIT[asset] / _USD_PER_UNIT[source]
+
+    decision = require_approval(
+        tool_context,
+        summary=(
+            f"Quote {spent} {source} as {quoted} {asset}, at a "
+            f"{RATE_SOURCE} rate frozen on {RATES_AS_OF} "
+            f"(1 {asset} = {rate:,.2f} {source})."
+        ),
+        proposal={
+            "action": CRYPTO_ACTION,
+            "amount": spent,
+            "from_currency": source,
+            "to_asset": asset,
+            "converted": quoted,
+        },
+    )
+    if decision.pending:
+        return {"status": AWAITING_APPROVAL, "action": CRYPTO_ACTION}
+    if not decision.granted:
+        return {"status": REFUSED, "action": CRYPTO_ACTION, "note": decision.note}
+
+    # `status` must stay a member of statuses.EFFECT_PERFORMED: it is what the
+    # caller scans for to confirm the approved action actually ran.
+    return {
+        "status": CONVERTED,
+        "action": CRYPTO_ACTION,
+        "amount": spent,
+        "from_currency": source,
+        "to_asset": asset,
+        "converted": quoted,
+        "rate": f"{rate:.{_RATE_DECIMALS}f}",
+        "rate_basis": f"{source} per 1 {asset}",
+        "rate_source": RATE_SOURCE,
+        "as_of": RATES_AS_OF,
+        "approved_by": decision.approved_by,
+        "note": decision.note,
+        "warning": (
+            f"Crypto prices move by the hour and this one was frozen on "
+            f"{RATES_AS_OF}. It is an illustration, not a quote anyone can "
+            f"trade on."
+        ),
     }

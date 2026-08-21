@@ -25,20 +25,32 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from google.adk.tools.tool_confirmation import ToolConfirmation
+from google.adk.tools.tool_context import ToolContext
 
 from app.agents import AGENTS, build_agent, suspending_agents
 from app.agents.currency.tools import (
     RATES_AS_OF,
     convert_currency,
+    convert_to_crypto,
     list_supported_currencies,
     resolve_currency,
+    supported_crypto_assets,
     supported_currencies,
 )
 from app.agents.reporting import AUDITED_STATUSES
-from app.agents.statuses import NEEDS_CONFIRMATION, NEEDS_INPUT
+from app.agents.statuses import (
+    AWAITING_APPROVAL,
+    CONVERTED,
+    EFFECT_PERFORMED,
+    NEEDS_CONFIRMATION,
+    NEEDS_INPUT,
+    REFUSED,
+)
 from app.cluster.config import ClusterConfig, PeerSpec
 from app.cluster.resolver import AgentResolver
 from app.shared.config import Models
+from tests.unit.conftest import FakeToolContext
 
 _FAKE_MODELS = cast(
     Models,
@@ -158,30 +170,37 @@ def test_the_currency_agent_is_a_leaf_with_its_own_tools():
     names = {
         getattr(t, "name", None) or getattr(t, "__name__", "?") for t in agent.tools
     }
-    assert names == {"convert_currency", "list_supported_currencies"}
+    assert names == {
+        "convert_currency",
+        "convert_to_crypto",
+        "list_supported_currencies",
+    }
 
 
-def test_math_reaches_currency_as_a_tool_not_a_sub_agent():
-    # currency owns no gated tool, so it never suspends -- and math NEEDS its
-    # answer back to finish the sum. As a sub-agent it could not give one:
-    # transfer_to_agent ends the caller's invocation. Measured -- math handed
-    # off, currency converted, and the total was never computed or published.
+def test_math_still_gets_currency_s_answer_back_now_that_it_can_suspend():
+    # currency owns a gated tool (`convert_to_crypto`), so it has to be a
+    # sub-agent or the authorization request it raises is swallowed. That used
+    # to be mutually exclusive with math finishing the sum: transfer_to_agent
+    # ended the caller's invocation, so math never saw the converted number.
+    # Task-mode delegation is what makes both true at once -- ADK wraps the
+    # sub-agent in a _TaskAgentTool, so the pause propagates AND the answer
+    # comes back. Assert both halves: losing either is silent.
     agent = build_agent(
         AGENTS["math"],
         _FAKE_MODELS,
         AgentResolver(_MATH_CONFIG, suspending=suspending_agents()),
     )
-    assert agent.sub_agents == []
+    assert {a.name for a in agent.sub_agents} == {"currency"}
     tool_names = {
         getattr(t, "name", None) or getattr(t, "__name__", "?") for t in agent.tools
     }
     assert "currency" in tool_names
 
 
-def test_currency_is_not_wired_as_a_suspending_peer():
-    # The rule that decides the slot above. If currency ever gains a gated
-    # tool this flips, and math must become unable to use its answer directly.
-    assert "currency" not in suspending_agents()
+def test_currency_is_wired_as_a_suspending_peer():
+    # The rule that decides the slot above, and why it flipped: a gated crypto
+    # quote must be able to stop and ask a human two hops up.
+    assert "currency" in suspending_agents()
 
 
 # --- Refusing rather than guessing --------------------------------------------
@@ -325,3 +344,153 @@ def test_a_same_currency_call_still_checks_the_amount():
     ok = convert_currency(10.0, "USD", "USD")
     assert ok["status"] == "ok"
     assert ok["converted"] == "10.00"
+
+
+# --- The gated crypto quote ---------------------------------------------------
+#
+# The property is the same one `test_two_phase_approval.py` pins for
+# `publish_result`: the number is unreachable without a human decision, as a
+# fact about the code rather than an instruction a model is asked to respect.
+# What is specific to this agent is the bypass -- `convert_currency` sits right
+# next door and would otherwise quote the same asset with nobody asked.
+
+
+def _crypto(
+    ctx: FakeToolContext,
+    amount: float = 10_000.0,
+    from_currency: str = "EUR",
+    to_asset: str = "BTC",
+):
+    return convert_to_crypto(amount, from_currency, to_asset, cast(ToolContext, ctx))
+
+
+def test_asking_for_a_crypto_quote_produces_no_quote():
+    # Phase one must be inert. A number here would mean the gate is decorative.
+    out = _crypto(FakeToolContext())
+    assert out["status"] == AWAITING_APPROVAL
+    assert "converted" not in out
+
+
+def test_the_crypto_request_describes_exactly_what_would_be_quoted():
+    ctx = FakeToolContext()
+    _crypto(ctx)
+    assert ctx.requested is not None
+    # The reviewer sees the asset, both amounts and the age of the rate -- a
+    # hint that said only "convert some money" would be a signature on nothing.
+    assert "BTC" in ctx.requested.hint
+    assert RATES_AS_OF in ctx.requested.hint
+
+
+def test_a_refused_crypto_quote_returns_no_number():
+    out = _crypto(
+        FakeToolContext(ToolConfirmation(confirmed=False, payload={"approved_by": "a"}))
+    )
+    assert out["status"] == REFUSED
+    assert "converted" not in out
+
+
+def test_an_approved_crypto_quote_is_produced_and_attributed():
+    out = _crypto(
+        FakeToolContext(
+            ToolConfirmation(
+                confirmed=True, payload={"approved_by": "compliance@bnp", "note": "ok"}
+            )
+        )
+    )
+    assert out["status"] == CONVERTED
+    assert out["to_asset"] == "BTC"
+    assert out["approved_by"] == "compliance@bnp"
+    # 10,000 EUR at 1.09 USD/EUR = 10,900 USD, over 94,500 USD per BTC.
+    assert out["converted"] == f"{10_000 * 1.09 / 94_500:.8f}"
+    assert out["as_of"] == RATES_AS_OF
+    assert out["warning"]
+
+
+def test_the_proposal_matches_what_is_reported():
+    # The gotcha this repo has hit twice: a case recorded from the model's raw
+    # arguments cannot be matched against a result computed from normalised
+    # ones, and `find_execution` then reports a perfectly good execution as
+    # `approved_not_confirmed`. Same values, same spelling, both times.
+    asked = FakeToolContext()
+    _crypto(asked)
+    assert asked.requested is not None
+    proposal = cast(dict[str, str], asked.requested.payload)
+
+    granted = _crypto(
+        FakeToolContext(ToolConfirmation(confirmed=True, payload={"approved_by": "a"}))
+    )
+    for field in ("amount", "from_currency", "to_asset", "converted"):
+        assert proposal[field] == granted[field]
+
+
+def test_a_crypto_success_is_confirmable_as_an_execution():
+    # A gated action reporting a status outside EFFECT_PERFORMED runs perfectly
+    # and is reported as unconfirmed -- a vocabulary bug wearing a model bug's
+    # clothes.
+    assert CONVERTED in EFFECT_PERFORMED
+
+
+def test_the_ungated_tool_cannot_quote_crypto():
+    # The bypass. `convert_currency` takes no ToolContext and can never ask
+    # anyone, so if it converted crypto the authorization next door would be
+    # decoration. It must refuse from BOTH sides.
+    into = convert_currency(100.0, "EUR", "BTC")
+    out_of = convert_currency(1.0, "bitcoin", "EUR")
+    assert into["status"] == "error"
+    assert out_of["status"] == "error"
+    assert "converted" not in into
+    assert "converted" not in out_of
+
+
+def test_refusing_crypto_names_the_tool_that_can_do_it():
+    # Reported as "unsupported currency" instead, a model treats it as a dead
+    # end and looks for another way to produce the number -- which is how a
+    # gated action gets answered from memory.
+    out = convert_currency(100.0, "EUR", "ETH")
+    assert out["use_tool"] == "convert_to_crypto"
+
+
+def test_crypto_is_not_in_the_fiat_rate_table():
+    # Membership of that table IS reachability from the ungated tool, so this
+    # is the structural half of the test above.
+    assert not set(supported_crypto_assets()) & set(supported_currencies())
+
+
+def test_an_ambiguous_currency_is_settled_before_anyone_is_asked_to_approve():
+    # Nobody can authorise a conversion whose meaning is still open: a reviewer
+    # shown "10000 dollars" would be approving one of six different amounts.
+    ctx = FakeToolContext()
+    out = _crypto(ctx, from_currency="dollars")
+    assert out["status"] == NEEDS_INPUT
+    assert ctx.requested is None
+
+
+def test_an_unknown_asset_is_refused_before_anyone_is_asked():
+    ctx = FakeToolContext()
+    out = _crypto(ctx, to_asset="DOGE")
+    assert out["status"] == "error"
+    assert ctx.requested is None
+
+
+def test_the_quote_goes_one_way_only():
+    # Selling crypto is a different thing to price and nobody asked for it.
+    ctx = FakeToolContext()
+    out = _crypto(ctx, from_currency="BTC", to_asset="ETH")
+    assert out["status"] == "error"
+    assert ctx.requested is None
+
+
+def test_the_gated_tool_s_declaration_can_be_built():
+    # The ToolContext trap: with `from __future__ import annotations`, ADK
+    # builds each declaration via typing.get_type_hints(), which evaluates the
+    # annotation. A TYPE_CHECKING-only import of ToolContext raises NameError
+    # at REQUEST time and takes every tool in the module down with it -- so it
+    # cannot be caught by importing the module, only by doing this.
+    from google.adk.tools.function_tool import FunctionTool
+
+    declaration = FunctionTool(convert_to_crypto)._get_declaration()
+    assert declaration is not None
+    schema = declaration.parameters_json_schema
+    assert isinstance(schema, dict)
+    # tool_context is injected by ADK, never asked of the model.
+    assert set(schema["required"]) == {"amount", "from_currency", "to_asset"}

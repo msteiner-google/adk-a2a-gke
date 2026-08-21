@@ -242,7 +242,8 @@ compares them against a normalised result. Measured twice: `391000000.0` against
 
 **Say what your effect was, in the vocabulary the caller scans for.**
 `app/agents/statuses.py` defines it: `PUBLISHED` for a gated write, `EXECUTED`
-for a gated read, and `EFFECT_PERFORMED` as the set of both.
+for a gated read, `CONVERTED` for a gated quote, and `EFFECT_PERFORMED` as the
+set of all three.
 `cases.find_execution` accepts a status in that set and nothing else. A new
 action whose success status is missing from it runs correctly and is then
 reported as `approved_not_confirmed` — a vocabulary bug that presents as a model
@@ -273,6 +274,31 @@ Same shape as `publish_result`, plus three things worth copying:
   `status: error`, so the case stays approved and re-drivable rather than being
   closed as done.
 
+### The third worked example: a gated quote, two hops down
+
+`app/agents/currency/tools.py` gates `convert_to_crypto`. Nothing moves and
+nothing is written — what is gated is *issuing the number*. A BTC price taken
+from a table frozen months ago is indistinguishable from a live quote once it
+has left this system, so a human signs off before it is produced.
+
+It adds two things the first two examples do not have:
+
+- **The ungated neighbour has to be closed off.** `convert_currency` sits in
+  the same module and would quote the same asset with nobody asked. Crypto
+  therefore lives in its own rate table (`_USD_PER_CRYPTO_UNIT`), because
+  membership of the fiat table *is* reachability from the ungated tool, and
+  `convert_currency` refuses a crypto term **by name** rather than letting it
+  fall through as "unsupported" — a model told the asset is unknown looks for
+  another way to produce the number, which is how a gated action ends up
+  answered from memory. `tests/unit/test_currency.py` asserts both directions.
+- **The authorization travels two hops.** `currency` is reached by `math`,
+  which is reached by the orchestrator, so the suspension propagates up a chain
+  of two A2A tasks before it reaches a person. A2A spec 7.6.2 describes exactly
+  this ("a chain of Tasks in `TASK_STATE_AUTH_REQUIRED`") and no new machinery
+  was needed for it — but note it is the marker on the tool, not the depth,
+  that wires each hop: adding `@gated` here is what moved `currency` from
+  `math`'s tool list into its sub-agents.
+
 ## Asking the user is not the same as approving
 
 There is a second, lighter escalation in this cluster and it deliberately does
@@ -283,8 +309,11 @@ happened, and only the user can settle this.
 
 They are not approval cases, for three reasons worth being explicit about:
 
-- **There is no effect to gate.** Converting has no side effect, so re-running
-  it after the user answers costs nothing. An approval case buys its complexity
+- **There is no effect to gate.** A fiat conversion has no side effect, so
+  re-running it after the user answers costs nothing. (The same agent's crypto
+  quote *is* gated — which makes the contrast concrete rather than theoretical:
+  one tool asks the user what they meant, the other asks an approver whether it
+  may answer at all, and they are not interchangeable.) An approval case buys its complexity
   by making an irreversible action safe; there is nothing here to make safe.
 - **The answer is an input, not a decision.** "US dollars, not Canadian" belongs
   in the next request, not in a `decided_by` column. Recording it as an approval

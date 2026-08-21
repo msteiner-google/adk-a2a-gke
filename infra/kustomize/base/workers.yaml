@@ -339,7 +339,14 @@ spec:
 # NetworkPolicy, and this file stays identical in shape to every other worker.
 #
 # It holds a hardcoded rate table and calls nothing, so it needs no IAM beyond
-# the shared baseline and no state at all.
+# the shared baseline.
+#
+# `convert_to_crypto` being gated does NOT make this pod stateful, which is
+# worth stating because it is the natural assumption. An approval case is
+# recorded by the agent that RELAYED the request onward -- app/fast_api_app.py
+# `record_request` returns early when the suspended tool is the pod's own -- so
+# a crypto approval is filed by `math`, and again by the orchestrator. What
+# this pod holds is the suspended A2A task itself, in the task store.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
